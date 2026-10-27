@@ -1,0 +1,429 @@
+import Foundation
+
+/// Live UI snapshot delivered through the frame-coalesced timeline path.
+struct ChatStreamingSnapshot: Sendable, Equatable {
+    var targetId: Int64
+    var text: String
+    var thinking: String
+    var toolActivity: ToolActivityPayload?
+    var isFinal: Bool
+}
+
+/// Throttles durable checkpoint writes during streaming while keeping in-memory
+/// state immediate. Checkpoints live outside observed message tables, so a token
+/// delta does not invalidate the full timeline and conversation list.
+struct ChatStreamingPersistenceCoordinator {
+    private let flushIntervalNs: UInt64 = 100_000_000
+    private var lastFlushNs: UInt64 = 0
+    private var latestText: String = ""
+    private var latestThinking: String = ""
+    private var lastActivityCheckpointMs: Int64 = 0
+
+    mutating func shouldCheckpointActivity(at time: Int64, terminal: Bool) -> Bool {
+        guard terminal || time - lastActivityCheckpointMs >= 1_000 else { return false }
+        lastActivityCheckpointMs = time
+        return true
+    }
+
+    mutating func apply(
+        text: String?,
+        thinking: String?,
+        force: Bool,
+        persist: (_ text: String, _ thinking: String) throws -> Void
+    ) rethrows {
+        if let text {
+            latestText = text
+        }
+        if let thinking {
+            latestThinking = thinking
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if force || now &- lastFlushNs >= flushIntervalNs {
+            try persist(latestText, latestThinking)
+            lastFlushNs = now
+        }
+    }
+
+    var text: String { latestText }
+    var thinking: String { latestThinking }
+}
+
+enum ChatStreamPersistenceKind {
+    case message(messageId: Int64)
+    case variant(variantId: Int64, snapshotMessageId: Int64)
+}
+
+/// Persistence + snapshot identity for one provider streaming session.
+struct ChatStreamSessionTarget {
+    let snapshotMessageId: Int64
+    private let conversations: ConversationRepository
+    private let kind: ChatStreamPersistenceKind
+
+    init(conversations: ConversationRepository, kind: ChatStreamPersistenceKind) {
+        self.conversations = conversations
+        self.kind = kind
+        switch kind {
+        case let .message(messageId):
+            snapshotMessageId = messageId
+        case let .variant(_, snapshotId):
+            snapshotMessageId = snapshotId
+        }
+    }
+
+    /// Recovery writes must never replace the original execution error.
+    func recover(operation: String, _ write: () throws -> Void) {
+        do {
+            try write()
+        } catch {
+            let ids = checkpointIDs
+            var metadata = ["operation": operation, "snapshotMessageId": String(snapshotMessageId)]
+            if let id = ids.messageId { metadata["messageId"] = String(id) }
+            if let id = ids.variantId { metadata["variantId"] = String(id) }
+            DiagnosticsLogger.log(
+                "Stream failure recovery persistence failed",
+                category: .chat,
+                metadata: metadata,
+                error: error
+            )
+        }
+    }
+
+    func persist(text: String, thinking: String) throws {
+        switch kind {
+        case let .message(messageId):
+            try conversations.updateMessageText(messageId: messageId, text: text)
+            if !thinking.isEmpty {
+                try conversations.saveThinking(messageId: messageId, stream: thinking)
+            }
+        case let .variant(variantId, _):
+            try conversations.updateMessageVariantText(variantId: variantId, text: text)
+            if !thinking.isEmpty {
+                try conversations.saveMessageVariantThinking(variantId: variantId, stream: thinking)
+            }
+        }
+    }
+
+    func persistCheckpoint(text: String, thinking: String) throws {
+        let ids = checkpointIDs
+        guard (ids.messageId ?? ids.variantId ?? -1) >= 0 else { return }
+        try conversations.saveStreamCheckpoint(
+            messageId: ids.messageId,
+            variantId: ids.variantId,
+            text: text,
+            thinking: thinking
+        )
+    }
+
+    func commitCheckpoint(text: String, thinking: String) throws {
+        let ids = checkpointIDs
+        guard (ids.messageId ?? ids.variantId ?? -1) >= 0 else { return }
+        try conversations.commitStreamCheckpoint(
+            messageId: ids.messageId,
+            variantId: ids.variantId,
+            text: text,
+            thinking: thinking
+        )
+    }
+
+    func discardCheckpoint() throws {
+        let ids = checkpointIDs
+        guard (ids.messageId ?? ids.variantId ?? -1) >= 0 else { return }
+        try conversations.deleteStreamCheckpoint(messageId: ids.messageId, variantId: ids.variantId)
+    }
+
+    private var checkpointIDs: (messageId: Int64?, variantId: Int64?) {
+        switch kind {
+        case let .message(messageId): (messageId, nil)
+        case let .variant(variantId, _): (nil, variantId)
+        }
+    }
+
+    func writeErrorPlaceholder(_ error: Error) throws {
+        let placeholder = UserFacingErrorFormatter.placeholder(for: error)
+        switch kind {
+        case let .message(messageId):
+            try conversations.updateMessageText(messageId: messageId, text: placeholder)
+        case let .variant(variantId, _):
+            try conversations.updateMessageVariantText(variantId: variantId, text: placeholder)
+        }
+    }
+
+    func persistToolActivity(_ payload: ToolActivityPayload) throws {
+        switch kind {
+        case let .message(messageId):
+            try conversations.saveToolActivity(messageId: messageId, variantId: nil, payload: payload)
+        case let .variant(variantId, _):
+            try conversations.saveToolActivity(messageId: nil, variantId: variantId, payload: payload)
+        }
+    }
+
+    func persistAttachments(_ paths: [String]) throws {
+        guard !paths.isEmpty else { return }
+        switch kind {
+        case let .message(messageId):
+            try conversations.appendAttachments(messageId: messageId, paths: paths)
+        case let .variant(variantId, _):
+            try conversations.appendAttachments(variantId: variantId, paths: paths)
+        }
+    }
+}
+
+struct ChatStreamSessionResult {
+    var text: String
+    var reasoningText: String
+    var usage: ProviderUsage?
+    var usageSamples: [ProviderUsage]?
+    var toolCalls: [ToolCall]
+    var toolActivity: ToolActivityPayload?
+}
+
+enum ChatStreamSession {
+    static func run(
+        stream: AsyncThrowingStream<ProviderStreamEvent, Error>,
+        conversations: ConversationRepository,
+        kind: ChatStreamPersistenceKind,
+        onStreamEvent: (@Sendable (ProviderStreamEvent) -> Void)?,
+        onStreamingSnapshot: (@Sendable (ChatStreamingSnapshot) -> Void)?
+    ) async throws -> ChatStreamSessionResult {
+        let target = ChatStreamSessionTarget(conversations: conversations, kind: kind)
+        var fullText = ""
+        var reasoningText = ""
+        var finalUsage: ProviderUsage?
+        var finalUsageSamples: [ProviderUsage]?
+        var finalToolCalls: [ToolCall] = []
+        var toolActivity = ToolActivityPayload()
+        var coordinator = ChatStreamingPersistenceCoordinator()
+        do {
+            for try await event in stream {
+                try Task.checkCancellation()
+                try consumeStreamEvent(
+                    event,
+                    target: target,
+                    fullText: &fullText,
+                    reasoningText: &reasoningText,
+                    finalUsage: &finalUsage,
+                    finalUsageSamples: &finalUsageSamples,
+                    finalToolCalls: &finalToolCalls,
+                    toolActivity: &toolActivity,
+                    coordinator: &coordinator,
+                    onStreamEvent: onStreamEvent,
+                    onStreamingSnapshot: onStreamingSnapshot
+                )
+            }
+            // AsyncThrowingStream can end normally when its consumer is cancelled.
+            // Keep cancellation on the interruption path so running tools are closed.
+            try Task.checkCancellation()
+        } catch {
+            toolActivity.failRunning(message: L10n.text("ツールの実行が中断されました"))
+            if toolActivity.hasPersistableContent {
+                target.recover(operation: "persistToolActivity") { try target.persistToolActivity(toolActivity) }
+            }
+            let errorText = UserFacingErrorFormatter.placeholder(for: error)
+            let visibleText = fullText.isEmpty ? errorText : fullText + "\n\n" + errorText
+            if fullText.isEmpty, reasoningText.isEmpty {
+                target.recover(operation: "writeErrorPlaceholder") { try target.writeErrorPlaceholder(error) }
+                target.recover(operation: "discardCheckpoint") { try target.discardCheckpoint() }
+            } else {
+                target.recover(operation: "commitCheckpoint") {
+                    try target.commitCheckpoint(text: visibleText, thinking: reasoningText)
+                }
+            }
+            coordinator.apply(text: visibleText, thinking: nil, force: false) { _, _ in }
+            publishStreamingSnapshot(
+                targetId: target.snapshotMessageId,
+                coordinator: coordinator,
+                toolActivity: toolActivity,
+                isFinal: true,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+            throw error
+        }
+
+        try target.commitCheckpoint(text: fullText, thinking: reasoningText)
+        if toolActivity.hasPersistableContent {
+            try target.persistToolActivity(toolActivity)
+        }
+        publishStreamingSnapshot(
+            targetId: target.snapshotMessageId,
+            coordinator: coordinator,
+            toolActivity: toolActivity,
+            isFinal: true,
+            onStreamingSnapshot: onStreamingSnapshot
+        )
+
+        return ChatStreamSessionResult(
+            text: fullText,
+            reasoningText: reasoningText,
+            usage: finalUsage,
+            usageSamples: finalUsageSamples,
+            toolCalls: finalToolCalls,
+            toolActivity: toolActivity.hasPersistableContent ? toolActivity : nil
+        )
+    }
+
+    private static func consumeStreamEvent(
+        _ event: ProviderStreamEvent,
+        target: ChatStreamSessionTarget,
+        fullText: inout String,
+        reasoningText: inout String,
+        finalUsage: inout ProviderUsage?,
+        finalUsageSamples: inout [ProviderUsage]?,
+        finalToolCalls: inout [ToolCall],
+        toolActivity: inout ToolActivityPayload,
+        coordinator: inout ChatStreamingPersistenceCoordinator,
+        onStreamEvent: (@Sendable (ProviderStreamEvent) -> Void)?,
+        onStreamingSnapshot: (@Sendable (ChatStreamingSnapshot) -> Void)?
+    ) throws {
+        onStreamEvent?(event)
+        switch event {
+        case .answerStart:
+            fullText = ""
+            try publishBufferedState(
+                target: target,
+                coordinator: &coordinator,
+                fullText: fullText,
+                reasoningText: reasoningText,
+                toolActivity: toolActivity,
+                force: true,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .textDelta(delta):
+            fullText += delta
+            try publishBufferedState(
+                target: target,
+                coordinator: &coordinator,
+                fullText: fullText,
+                reasoningText: reasoningText,
+                toolActivity: toolActivity,
+                force: false,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .textSnapshot(text):
+            fullText = text
+            try publishBufferedState(
+                target: target,
+                coordinator: &coordinator,
+                fullText: fullText,
+                reasoningText: reasoningText,
+                toolActivity: toolActivity,
+                force: false,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .reasoningDelta(delta):
+            reasoningText += delta
+            try publishBufferedState(
+                target: target,
+                coordinator: &coordinator,
+                fullText: fullText,
+                reasoningText: reasoningText,
+                toolActivity: toolActivity,
+                force: false,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .toolActivity(event):
+            toolActivity.apply(event)
+            if (event.subagent != nil || event.ownerSubagentID != nil),
+               coordinator.shouldCheckpointActivity(at: event.createdAtMs, terminal: event.phase == .finished) {
+                try target.persistToolActivity(toolActivity)
+            }
+            if event.ownerSubagentID == nil, event.phase == .finished, let result = event.result {
+                try target.persistAttachments(result.artifacts.map(\.path))
+            }
+            publishStreamingSnapshot(
+                targetId: target.snapshotMessageId,
+                coordinator: coordinator,
+                toolActivity: toolActivity,
+                isFinal: false,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .rotation(notice):
+            toolActivity.rotationNotices.append(notice)
+            publishStreamingSnapshot(
+                targetId: target.snapshotMessageId,
+                coordinator: coordinator,
+                toolActivity: toolActivity,
+                isFinal: false,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        case let .executionSnapshot(execution):
+            toolActivity.piExecution = execution
+            if let providerTranscript = providerTranscript(from: execution) {
+                toolActivity.providerTranscript = providerTranscript
+            }
+            try target.persistToolActivity(toolActivity)
+        case let .completed(response):
+            for run in response.subagents ?? [] { toolActivity.applySubagent(run) }
+            finalUsage = response.usage ?? finalUsage
+            finalUsageSamples = response.usageSamples ?? finalUsageSamples
+            finalToolCalls = response.toolCalls
+            toolActivity.piExecution = response.piExecution
+            if let providerTranscript = response.providerTranscript {
+                toolActivity.providerTranscript = providerTranscript
+            }
+            // Pi's completed response is built from the last assistant message.
+            // Earlier assistant turns can contain user-facing progress text before
+            // tool calls, so completion authoritatively replaces the live buffer.
+            fullText = response.text
+            if let reasoning = response.reasoningSummary, !reasoning.isEmpty {
+                reasoningText = reasoning
+            }
+            try publishBufferedState(
+                target: target,
+                coordinator: &coordinator,
+                fullText: fullText,
+                reasoningText: reasoningText,
+                toolActivity: toolActivity,
+                force: true,
+                onStreamingSnapshot: onStreamingSnapshot
+            )
+        }
+    }
+
+    private static func providerTranscript(from execution: JSONValue) -> [ProviderRequestMessage]? {
+        guard case let .object(object) = execution,
+              let value = object["providerTranscript"],
+              case .array = value,
+              let data = try? JSONEncoder().encode(value)
+        else {
+            return nil
+        }
+        return try? JSONDecoder().decode([ProviderRequestMessage].self, from: data)
+    }
+
+    private static func publishBufferedState(
+        target: ChatStreamSessionTarget,
+        coordinator: inout ChatStreamingPersistenceCoordinator,
+        fullText: String,
+        reasoningText: String,
+        toolActivity: ToolActivityPayload,
+        force: Bool,
+        onStreamingSnapshot: (@Sendable (ChatStreamingSnapshot) -> Void)?
+    ) throws {
+        try coordinator.apply(text: fullText, thinking: reasoningText, force: force, persist: target.persistCheckpoint)
+        publishStreamingSnapshot(
+            targetId: target.snapshotMessageId,
+            coordinator: coordinator,
+            toolActivity: toolActivity,
+            isFinal: false,
+            onStreamingSnapshot: onStreamingSnapshot
+        )
+    }
+
+    private static func publishStreamingSnapshot(
+        targetId: Int64,
+        coordinator: ChatStreamingPersistenceCoordinator,
+        toolActivity: ToolActivityPayload?,
+        isFinal: Bool,
+        onStreamingSnapshot: (@Sendable (ChatStreamingSnapshot) -> Void)?
+    ) {
+        onStreamingSnapshot?(
+            ChatStreamingSnapshot(
+                targetId: targetId,
+                text: coordinator.text,
+                thinking: coordinator.thinking,
+                toolActivity: toolActivity,
+                isFinal: isFinal
+            )
+        )
+    }
+}

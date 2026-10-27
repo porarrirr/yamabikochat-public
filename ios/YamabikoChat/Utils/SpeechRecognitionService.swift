@@ -1,0 +1,266 @@
+import Foundation
+import Combine
+import Speech
+import AVFoundation
+import Accelerate
+
+enum SpeechRecognitionError: LocalizedError {
+    case notAvailable
+    case permissionDenied
+    case recognitionFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notAvailable:
+            return L10n.text("音声認識はこのデバイスでは利用できません。")
+        case .permissionDenied:
+            return L10n.text("音声認識またはマイクの使用が許可されていません。設定から許可してください。")
+        case .recognitionFailed(let message):
+            return L10n.format("音声認識エラー: %@", message)
+        }
+    }
+}
+
+struct SpeechRecognitionSessionState {
+    private(set) var activeID: UUID?
+
+    mutating func begin() -> UUID {
+        let id = UUID()
+        activeID = id
+        return id
+    }
+
+    mutating func end() {
+        activeID = nil
+    }
+
+    func isActive(_ id: UUID) -> Bool {
+        activeID == id
+    }
+}
+
+struct SpeechAudioLevelHistory {
+    static let capacity = 34
+
+    private(set) var values = Array(repeating: Float.zero, count: capacity)
+
+    mutating func reset() {
+        values = Array(repeating: .zero, count: Self.capacity)
+    }
+
+    mutating func append(_ level: Float) {
+        values.removeFirst()
+        values.append(min(max(level, 0), 1))
+    }
+}
+
+@MainActor
+final class SpeechRecognitionService: ObservableObject {
+    @Published private(set) var isRecording = false
+    @Published private(set) var audioLevels = SpeechAudioLevelHistory().values
+    @Published var error: SpeechRecognitionError?
+
+    var onTranscription: ((String) -> Void)?
+
+    private let audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var speechRecognizer: SFSpeechRecognizer?
+    private var pendingStartTask: Task<Void, Never>?
+    private var hasInstalledInputTap = false
+    private var sessionState = SpeechRecognitionSessionState()
+    private var audioLevelHistory = SpeechAudioLevelHistory()
+
+    init() {
+        speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
+    }
+
+    func toggleRecording() {
+        if isRecording || pendingStartTask != nil {
+            stopRecording()
+        } else {
+            startRecording()
+        }
+    }
+
+    func startRecording() {
+        guard !isRecording else { return }
+        guard let speechRecognizer, speechRecognizer.isAvailable else {
+            error = .notAvailable
+            DiagnosticsLogger.log(
+                "Speech recognizer not available",
+                category: .app,
+                error: error
+            )
+            return
+        }
+
+        error = nil
+        pendingStartTask?.cancel()
+
+        pendingStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.pendingStartTask = nil
+            }
+
+            let micStatus = await withCheckedContinuation { continuation in
+                AVAudioApplication.requestRecordPermission { granted in
+                    continuation.resume(returning: granted)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            guard micStatus else {
+                self.error = .permissionDenied
+                DiagnosticsLogger.log("Microphone permission denied", category: .app, error: self.error)
+                return
+            }
+
+            let speechStatus = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    continuation.resume(returning: status)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            guard speechStatus == .authorized else {
+                self.error = .permissionDenied
+                DiagnosticsLogger.log("Speech recognition permission denied", category: .app, error: self.error)
+                return
+            }
+            guard !Task.isCancelled else { return }
+
+            self.beginRecognition(speechRecognizer: speechRecognizer)
+        }
+    }
+
+    func stopRecording() {
+        stopRecording(cancelPendingStart: true)
+    }
+
+    private func stopRecording(cancelPendingStart: Bool) {
+        if cancelPendingStart {
+            pendingStartTask?.cancel()
+            pendingStartTask = nil
+        }
+
+        // Invalidate the session before cancelling. SFSpeechRecognizer can report
+        // cancellation as "No speech detected" even after partial text was delivered.
+        sessionState.end()
+        audioEngine.stop()
+        if hasInstalledInputTap {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            hasInstalledInputTap = false
+        }
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        isRecording = false
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+        } catch {
+            DiagnosticsLogger.log(
+                "Audio session deactivation failed",
+                category: .app,
+                error: error
+            )
+        }
+    }
+
+    private func beginRecognition(speechRecognizer: SFSpeechRecognizer) {
+        // Stop any existing session
+        if audioEngine.isRunning {
+            stopRecording(cancelPendingStart: false)
+        }
+
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            self.error = .recognitionFailed(error.localizedDescription)
+            DiagnosticsLogger.log("Audio session setup failed", category: .app, error: error)
+            return
+        }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if speechRecognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
+        recognitionRequest = request
+        let sessionID = sessionState.begin()
+        audioLevelHistory.reset()
+        audioLevels = audioLevelHistory.values
+
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.sessionState.isActive(sessionID) else {
+                    // A callback from a manually stopped or superseded session.
+                    return
+                }
+
+                if let result {
+                    let text = result.bestTranscription.formattedString
+                    self.onTranscription?(text)
+
+                    if result.isFinal {
+                        self.stopRecording()
+                        return
+                    }
+                }
+
+                if let error {
+                    self.error = .recognitionFailed(error.localizedDescription)
+                    DiagnosticsLogger.log("Speech recognition failed", category: .app, error: error)
+                    self.stopRecording()
+                }
+            }
+        }
+
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            request.append(buffer)
+            let level = Self.normalizedAudioLevel(from: buffer)
+            Task { @MainActor [weak self] in
+                guard let self, self.sessionState.isActive(sessionID) else { return }
+                self.audioLevelHistory.append(level)
+                self.audioLevels = self.audioLevelHistory.values
+            }
+        }
+        hasInstalledInputTap = true
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            isRecording = true
+        } catch {
+            self.error = .recognitionFailed(error.localizedDescription)
+            DiagnosticsLogger.log("Audio engine start failed", category: .app, error: error)
+            stopRecording(cancelPendingStart: false)
+        }
+    }
+
+    nonisolated private static func normalizedAudioLevel(from buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData?.pointee,
+              buffer.frameLength > 0 else {
+            return 0
+        }
+
+        var meanSquare: Float = 0
+        vDSP_measqv(
+            channelData,
+            1,
+            &meanSquare,
+            vDSP_Length(buffer.frameLength)
+        )
+        let rootMeanSquare = sqrt(max(meanSquare, 0.000_000_1))
+        let decibels = 20 * log10(rootMeanSquare)
+        return min(max((decibels + 55) / 50, 0), 1)
+    }
+}

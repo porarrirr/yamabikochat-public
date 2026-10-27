@@ -1,0 +1,49 @@
+# Xcode and generated dependencies
+DerivedData/
+.build/
+build/
+dist/
+Pods/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.xcarchive
+*.xcresult
+*.dSYM/
+*.dSYM.zip
+*.app/
+*.ipa
+/ios/Vendor/
+/ios/PiRuntime/bundle/
+/ios/YamabikoChat.xcodeproj/
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.p12
+*.p8
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Editor and temporary files
+.idea/
+.vscode/
+.DS_Store
+._*
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*~

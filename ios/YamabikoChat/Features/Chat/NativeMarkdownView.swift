@@ -1,0 +1,1670 @@
+import Foundation
+import Darwin
+import CryptoKit
+import Markdown
+import SwiftUI
+import UIKit
+
+private struct AskChatWithSelectionEnvironmentKey: EnvironmentKey {
+    static let defaultValue: (String) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var onAskChatWithSelection: (String) -> Void {
+        get { self[AskChatWithSelectionEnvironmentKey.self] }
+        set { self[AskChatWithSelectionEnvironmentKey.self] = newValue }
+    }
+}
+
+private struct ChatFileURLsKey: EnvironmentKey {
+    static let defaultValue: [URL] = []
+}
+
+private struct ChatOpenFileKey: EnvironmentKey {
+    static let defaultValue: (URL) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var chatFileURLs: [URL] {
+        get { self[ChatFileURLsKey.self] }
+        set { self[ChatFileURLsKey.self] = newValue }
+    }
+
+    var onOpenChatFile: (URL) -> Void {
+        get { self[ChatOpenFileKey.self] }
+        set { self[ChatOpenFileKey.self] = newValue }
+    }
+}
+
+/// Only references to files attached to this response become local links.
+/// Ambiguous filenames stay as text; full logical paths can still resolve them.
+struct ChatFileLinkPresentation {
+    private let destinations: [String: Set<URL>]
+
+    init(urls: [URL]) {
+        var destinations: [String: Set<URL>] = [:]
+        for url in urls where url.isFileURL {
+            var aliases = [url.path, url.absoluteString, url.lastPathComponent]
+            let components = url.pathComponents
+            if let root = components.lastIndex(of: "GeneratedFiles"), components.count > root + 2 {
+                let logicalPath = components.dropFirst(root + 2).joined(separator: "/")
+                aliases += [logicalPath, "./" + logicalPath, "/workspace/" + logicalPath]
+            }
+            for alias in aliases where !alias.isEmpty {
+                destinations[alias, default: []].insert(url)
+            }
+        }
+        self.destinations = destinations
+    }
+
+    func destination(for reference: String) -> URL? {
+        guard let matches = destinations[reference], matches.count == 1 else { return nil }
+        return matches.first
+    }
+
+    func linkify(_ source: AttributedString) -> AttributedString {
+        guard !destinations.isEmpty else { return source }
+        var result = source
+        // Resolve explicit Markdown links before scanning ordinary and inline-code text.
+        for run in source.runs {
+            if let link = run.link, let destination = destination(for: link.relativeString) {
+                result[run.range].link = destination
+            }
+        }
+        let aliases = destinations.keys.filter { destinations[$0]?.count == 1 }
+            .sorted { $0.count > $1.count }
+        guard !aliases.isEmpty else { return result }
+        let pattern = "(?<![A-Za-z0-9_./%:-])(?:" + aliases.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+            + ")(?![A-Za-z0-9_./%-])"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
+        let text = String(source.characters)
+        for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let range = Range(match.range, in: text),
+                  let destination = destination(for: String(text[range])),
+                  let lower = AttributedString.Index(range.lowerBound, within: result),
+                  let upper = AttributedString.Index(range.upperBound, within: result)
+            else { continue }
+            let attributedRange = lower..<upper
+            // Existing web links retain their destination even when the label names a file.
+            guard result[attributedRange].runs.allSatisfy({ $0.link == nil || $0.link == destination }) else { continue }
+            result[attributedRange].link = destination
+            for run in Array(result[attributedRange].runs) {
+                if var intent = run.inlinePresentationIntent, intent.contains(.code) {
+                    intent.remove(.code)
+                    result[run.range].inlinePresentationIntent = intent.isEmpty ? nil : intent
+                }
+            }
+        }
+        return result
+    }
+}
+
+enum NativeMarkdownBlock: Identifiable, Equatable, Sendable {
+    case paragraph(id: String, text: AttributedString)
+    case heading(id: String, level: Int, text: AttributedString)
+    case code(id: String, language: String?, code: String)
+    case mermaid(id: String, source: String)
+    case math(id: String, markdown: String)
+    case quote(id: String, blocks: [NativeMarkdownBlock])
+    case list(id: String, ordered: Bool, start: Int, rows: [AttributedString])
+    case table(id: String, rows: [[AttributedString]])
+    case divider(id: String)
+
+    var id: String {
+        switch self {
+        case let .paragraph(id, _), let .heading(id, _, _), let .code(id, _, _), let .mermaid(id, _), let .math(id, _),
+             let .quote(id, _), let .list(id, _, _, _), let .table(id, _),
+             let .divider(id): id
+        }
+    }
+
+    var renderID: String {
+        let kind: String
+        switch self {
+        case .paragraph: kind = "paragraph"
+        case let .heading(_, level, _): kind = "heading-\(level)"
+        case .code: kind = "code"
+        case .mermaid: kind = "mermaid"
+        case .math: kind = "math"
+        case .quote: kind = "quote"
+        case let .list(_, ordered, _, _): kind = ordered ? "ordered-list" : "unordered-list"
+        case .table: kind = "table"
+        case .divider: kind = "divider"
+        }
+        return "\(id):\(kind)"
+    }
+}
+
+enum NativeMarkdownParser {
+    // NSRegularExpression is immutable and safe to reuse across parser tasks.
+    private static let bareURLRegex = try! NSRegularExpression(
+        pattern: #"https?://[^\s<>\[\]{}\"']+"#,
+        options: .caseInsensitive
+    )
+    private static let inlineMathRegex = try! NSRegularExpression(
+        pattern: #"(?<![\\$])\$(?![\s$])(?:\\.|[^\n$])+(?<!\s)(?<!\\)\$(?![A-Za-z0-9$])"#
+    )
+
+    static func parse(
+        _ source: String,
+        rendersMath: Bool = true,
+        baseUTF8Offset: Int = 0
+    ) -> [NativeMarkdownBlock] {
+        let document = Document(parsing: source)
+        return blocks(in: document, source: source, rendersMath: rendersMath, baseUTF8Offset: baseUTF8Offset)
+    }
+
+    fileprivate static func blocks(
+        in document: Markdown.Document,
+        source: String,
+        rendersMath: Bool,
+        baseUTF8Offset: Int
+    ) -> [NativeMarkdownBlock] {
+        let offsets = SourceOffsetMap(source: source, baseUTF8Offset: baseUTF8Offset)
+        return parseChildren(of: document, path: "root", rendersMath: rendersMath, offsets: offsets)
+    }
+
+    private static func parseChildren(
+        of parent: Markup,
+        path: String,
+        rendersMath: Bool,
+        offsets: SourceOffsetMap
+    ) -> [NativeMarkdownBlock] {
+        let children = Array(parent.children)
+        var result: [NativeMarkdownBlock] = []
+        var index = 0
+        while index < children.count {
+            let child = children[index]
+            let path = offsets.blockID(for: child, fallbackPath: "\(path)-\(index)")
+            // CommonMark can split display math at blank lines or interpret an
+            // equals line inside a matrix as a Setext heading. Rejoin the source
+            // before rendering, even when preceding prose contains inline math.
+            if rendersMath, child is Paragraph || child is Heading,
+               let source = offsets.sourceText(for: child),
+               let closing = unclosedDisplayMathDelimiter(source) {
+                var end = index + 1
+                while end < children.count {
+                    if let combined = offsets.sourceText(from: child, through: children[end]),
+                       combined.contains(closing), unclosedDisplayMathDelimiter(combined) == nil,
+                       containsMath(combined) {
+                        result.append(.math(id: path, markdown: combined))
+                        index = end + 1
+                        break
+                    }
+                    end += 1
+                }
+                if index == end + 1 { continue }
+            }
+            result += parseBlock(child, path: path, rendersMath: rendersMath, offsets: offsets)
+            index += 1
+        }
+        return result
+    }
+
+    fileprivate static func unclosedDisplayMathDelimiter(_ source: String) -> String? {
+        guard source.contains(#"\["#) || source.contains("$$") else { return nil }
+        let normalized = MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(source)
+        var closing: String?
+        _ = MathMarkdownNormalizer.transformOutsideCode(normalized) { segment in
+            var cursor = segment.startIndex
+            while cursor < segment.endIndex {
+                let remaining = segment[cursor...]
+                if let delimiter = closing, remaining.hasPrefix(delimiter) {
+                    closing = nil
+                    cursor = segment.index(cursor, offsetBy: delimiter.count)
+                } else if closing == nil, remaining.hasPrefix(#"\["#) || remaining.hasPrefix("$$") {
+                    closing = remaining.hasPrefix("$$") ? "$$" : #"\]"#
+                    cursor = segment.index(cursor, offsetBy: 2)
+                } else if remaining.hasPrefix(#"\"#) {
+                    // Skip an escaped character, including an escaped delimiter.
+                    cursor = segment.index(after: cursor)
+                    if cursor < segment.endIndex { cursor = segment.index(after: cursor) }
+                } else {
+                    cursor = segment.index(after: cursor)
+                }
+            }
+            return segment
+        }
+        return closing
+    }
+
+    private static func parseBlock(
+        _ markup: Markup,
+        path: String,
+        rendersMath: Bool,
+        offsets: SourceOffsetMap
+    ) -> [NativeMarkdownBlock] {
+        // These blocks otherwise flatten inline content or recursively parse
+        // source with quote prefixes. Preserve the complete original Markdown
+        // so the shared renderer can retain both structure and TeX.
+        if rendersMath, markup is OrderedList || markup is UnorderedList
+            || markup is Heading || markup is Markdown.Table || markup is BlockQuote,
+           let source = offsets.sourceText(for: markup), containsMath(source) {
+            return [.math(id: path, markdown: source)]
+        }
+        if let paragraph = markup as? Paragraph {
+            if rendersMath, let source = offsets.sourceText(for: paragraph), containsMath(source) {
+                return [.math(id: path, markdown: source)]
+            }
+            return [.paragraph(id: path, text: inlineText(paragraph))]
+        }
+        if let heading = markup as? Heading {
+            return [.heading(id: path, level: heading.level, text: inlineText(heading))]
+        }
+        if let code = markup as? CodeBlock {
+            if code.language?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare("mermaid") == .orderedSame {
+                return [.mermaid(id: path, source: code.code)]
+            }
+            return [.code(id: path, language: code.language, code: code.code)]
+        }
+        if let quote = markup as? BlockQuote {
+            return [.quote(
+                id: path,
+                blocks: parseChildren(of: quote, path: path, rendersMath: rendersMath, offsets: offsets)
+            )]
+        }
+        if let list = markup as? OrderedList {
+            return [.list(
+                id: path,
+                ordered: true,
+                start: Int(list.startIndex),
+                rows: list.children.map(flattenInlineText)
+            )]
+        }
+        if let list = markup as? UnorderedList {
+            return [.list(
+                id: path,
+                ordered: false,
+                start: 1,
+                rows: list.children.map(flattenInlineText)
+            )]
+        }
+        if let table = markup as? Markdown.Table {
+            let header = table.head.children.compactMap { child -> AttributedString? in
+                guard let cell = child as? Markdown.Table.Cell else { return nil }
+                return flattenInlineText(cell)
+            }
+            let body = table.body.children.compactMap { row -> [AttributedString]? in
+                guard let row = row as? Markdown.Table.Row else { return nil }
+                return row.children.compactMap { child -> AttributedString? in
+                    guard let cell = child as? Markdown.Table.Cell else { return nil }
+                    return flattenInlineText(cell)
+                }
+            }
+            return [.table(id: path, rows: [header] + body)]
+        }
+        if markup is ThematicBreak {
+            return [.divider(id: path)]
+        }
+        if let html = markup as? HTMLBlock {
+            return [.code(id: path, language: "html", code: html.rawHTML)]
+        }
+        return parseChildren(of: markup, path: path, rendersMath: rendersMath, offsets: offsets)
+    }
+
+    fileprivate struct SourceOffsetMap {
+        let source: String
+        let lineStartUTF8Offsets: [Int]
+        let baseUTF8Offset: Int
+
+        init(source: String, baseUTF8Offset: Int) {
+            self.source = source
+            var starts = [0]
+            for (index, byte) in source.utf8.enumerated() where byte == 0x0A {
+                starts.append(index + 1)
+            }
+            lineStartUTF8Offsets = starts
+            self.baseUTF8Offset = baseUTF8Offset
+        }
+
+        func sourceText(for markup: Markup) -> String? {
+            sourceText(from: markup, through: markup)
+        }
+
+        func sourceText(from first: Markup, through last: Markup) -> String? {
+            guard let start = first.range?.lowerBound, let end = last.range?.upperBound,
+                  let lower = utf8Offset(for: start), let upper = utf8Offset(for: end),
+                  lower <= upper, upper <= source.utf8.count else { return nil }
+            return String(decoding: source.utf8.dropFirst(lower).prefix(upper - lower), as: UTF8.self)
+        }
+
+        func blockID(for markup: Markup, fallbackPath: String) -> String {
+            guard let location = markup.range?.lowerBound,
+                  let offset = utf8Offset(for: location)
+            else {
+                return "block-\(baseUTF8Offset)-\(fallbackPath)"
+            }
+            return "block-\(baseUTF8Offset + offset)"
+        }
+
+        func utf8Offset(for location: SourceLocation) -> Int? {
+            guard location.line > 0,
+                  location.line <= lineStartUTF8Offsets.count
+            else { return nil }
+            return lineStartUTF8Offsets[location.line - 1] + max(0, location.column - 1)
+        }
+    }
+
+    private static func containsMath(_ value: String) -> Bool {
+        var mathSource = ""
+        _ = MathMarkdownNormalizer.transformOutsideCode(value) { segment in
+            mathSource += segment
+            return segment
+        }
+        return containsMathOutsideCode(mathSource)
+    }
+
+    private static func containsMathOutsideCode(_ value: String) -> Bool {
+        guard value.utf8.contains(0x24) || value.utf8.contains(0x5C) else { return false }
+        return hasOrderedPair(opening: "$$", closing: "$$", in: value)
+            || inlineMathRegex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+            || hasOrderedPair(opening: "\\[", closing: "\\]", in: value)
+            || hasOrderedPair(opening: "\\(", closing: "\\)", in: value)
+    }
+
+    private static func hasOrderedPair(opening: String, closing: String, in value: String) -> Bool {
+        guard let openingRange = value.range(of: opening) else { return false }
+        return value[openingRange.upperBound...].range(of: closing) != nil
+    }
+
+    private static func flattenInlineText(_ markup: Markup) -> AttributedString {
+        if let inline = markup as? InlineContainer {
+            return inlineText(inline)
+        }
+        var result = AttributedString()
+        for (index, child) in markup.children.enumerated() {
+            result.append(flattenInlineText(child))
+            if index < markup.childCount - 1 {
+                result.append(AttributedString("\n"))
+            }
+        }
+        return result
+    }
+
+    private static func inlineText(_ container: InlineContainer) -> AttributedString {
+        var result = AttributedString()
+        for child in container.children {
+            result.append(inlineText(child))
+        }
+        return result
+    }
+
+    private static func inlineText(_ markup: Markup) -> AttributedString {
+        if let text = markup as? Markdown.Text {
+            return linkifiedText(text.string)
+        }
+        if let code = markup as? InlineCode {
+            var value = AttributedString(code.code)
+            value.inlinePresentationIntent = .code
+            return value
+        }
+        if let html = markup as? InlineHTML {
+            return AttributedString(html.rawHTML)
+        }
+        if markup is SoftBreak {
+            return AttributedString("\n")
+        }
+        if markup is LineBreak {
+            return AttributedString("\n")
+        }
+
+        var value = AttributedString()
+        for child in markup.children {
+            value.append(inlineText(child))
+        }
+        if markup is Strong {
+            value.inlinePresentationIntent = .stronglyEmphasized
+        } else if markup is Emphasis {
+            value.inlinePresentationIntent = .emphasized
+        } else if markup is Strikethrough {
+            value.inlinePresentationIntent = .strikethrough
+        } else if let link = markup as? Markdown.Link,
+                  let destination = link.destination,
+                  let url = URL(string: destination) {
+            if !String(value.characters).hasSuffix("↗") {
+                value.append(AttributedString("↗"))
+            }
+            value.link = url
+        }
+        return value
+    }
+
+    /// Markdown parsers preserve a model-emitted bare URL as ordinary text. Keep
+    /// the original destination while presenting a compact, readable link label.
+    private static func linkifiedText(_ source: String) -> AttributedString {
+        // Most Markdown text nodes are short ordinary words. Avoid Foundation
+        // bridging and a regular-expression search when no URL is possible.
+        guard source.utf8.contains(0x3A) else { return AttributedString(source) }
+        var result = AttributedString()
+        var remaining = source[...]
+
+        for resultMatch in bareURLRegex.matches(in: source, range: NSRange(source.startIndex..., in: source)) {
+            guard let match = Range(resultMatch.range, in: source) else { continue }
+            result.append(AttributedString(String(remaining[..<match.lowerBound])))
+
+            let matchedText = String(remaining[match])
+            let trimmedURL = matchedText.trimmingTrailingLinkPunctuation()
+            guard let url = URL(string: trimmedURL),
+                  let host = url.host,
+                  !host.isEmpty else {
+                result.append(AttributedString(matchedText))
+                remaining = remaining[match.upperBound...]
+                continue
+            }
+
+            let displayHost = host.replacingOccurrences(
+                of: "www.",
+                with: "",
+                options: [.anchored, .caseInsensitive]
+            )
+            var link = AttributedString("\(displayHost)↗")
+            link.link = url
+            result.append(link)
+            result.append(AttributedString(String(matchedText.dropFirst(trimmedURL.count))))
+            remaining = remaining[match.upperBound...]
+        }
+
+        result.append(AttributedString(String(remaining)))
+        return result
+    }
+}
+
+private extension String {
+    func trimmingTrailingLinkPunctuation() -> String {
+        let punctuation = CharacterSet(charactersIn: ".,!?;:。、！？；：)]}」』》〉")
+        var value = self
+        while let scalar = value.unicodeScalars.last, punctuation.contains(scalar) {
+            value.removeLast()
+        }
+        return value
+    }
+}
+
+private actor NativeMarkdownBlockCache {
+    static let shared = NativeMarkdownBlockCache()
+
+    private var values: [String: [NativeMarkdownBlock]] = [:]
+    private var order: [String] = []
+    private let capacity = 256
+
+    func blocks(for source: String, rendersMath: Bool, baseUTF8Offset: Int = 0) -> [NativeMarkdownBlock] {
+        let digest = SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
+        let key = "\(rendersMath ? 1 : 0):\(baseUTF8Offset):\(digest)"
+        if let cached = values[key] {
+            touch(key)
+            return cached
+        }
+        let parsed = NativeMarkdownParser.parse(
+            source,
+            rendersMath: rendersMath,
+            baseUTF8Offset: baseUTF8Offset
+        )
+        values[key] = parsed
+        order.append(key)
+        if order.count > capacity {
+            values.removeValue(forKey: order.removeFirst())
+        }
+        return parsed
+    }
+
+    private func touch(_ key: String) {
+        if let index = order.firstIndex(of: key) {
+            order.remove(at: index)
+        }
+        order.append(key)
+    }
+}
+
+@MainActor
+final class NativeMarkdownIncrementalParser {
+    private var stablePrefixUTF8Count = 0
+    private var stableBlocks: [NativeMarkdownBlock] = []
+    private var partialList: NativeMarkdownBlock?
+    private var lastSource: String?
+    private var lastBlocks: [NativeMarkdownBlock] = []
+    private var needsDocumentContext = false
+    private var awaitingReferenceColon = false
+
+    #if DEBUG
+    private(set) var parsedUTF8ByteCount = 0
+    #endif
+
+    func streamingBlocks(for source: String) -> [NativeMarkdownBlock] {
+        var appendedUTF8Offset = 0
+        if let lastSource {
+            // A replacement can join a new list to an earlier confirmed list,
+            // even when the confirmed prefix itself is unchanged. Only appends
+            // may reuse it. Compare bytes so normalized Unicode cannot shift IDs.
+            if Self.hasExactUTF8Prefix(lastSource, in: source) {
+                appendedUTF8Offset = lastSource.utf8.count
+                if source.utf8.count == appendedUTF8Offset { return lastBlocks }
+            } else {
+                reset()
+            }
+        }
+
+        // Only a reference DEFINITION can change links in confirmed paragraphs.
+        // Inline citations, images and array syntax do not require a full parse.
+        // Detect a closing label followed by ':' conservatively (even in code),
+        // retaining the state across deltas. When a late definition arrives,
+        // discard the confirmed prefix before parsing so earlier links resolve.
+        let appendedStart = source.utf8.index(source.utf8.startIndex, offsetBy: appendedUTF8Offset)
+        if !needsDocumentContext {
+            for byte in source.utf8[appendedStart...] {
+                if byte == 0x3A, awaitingReferenceColon {
+                    needsDocumentContext = true
+                    break
+                }
+                if byte == 0x5D { awaitingReferenceColon = true }
+                else if byte != 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D {
+                    awaitingReferenceColon = false
+                }
+            }
+        }
+        if needsDocumentContext {
+            stablePrefixUTF8Count = 0
+            stableBlocks = []
+            partialList = nil
+        }
+        let tailStart = source.utf8.index(source.utf8.startIndex, offsetBy: stablePrefixUTF8Count)
+        let tail = String(source[tailStart...])
+        #if DEBUG
+        parsedUTF8ByteCount += tail.utf8.count
+        #endif
+        let document = Document(parsing: tail)
+        var tailBlocks = NativeMarkdownParser.blocks(
+            in: document,
+            source: tail,
+            rendersMath: true,
+            baseUTF8Offset: stablePrefixUTF8Count
+        )
+        if let partialList {
+            guard case let .list(id, ordered, start, confirmedRows) = partialList,
+                  case let .list(_, tailOrdered, _, rows) = tailBlocks.first,
+                  ordered == tailOrdered else {
+                reset()
+                return streamingBlocks(for: source)
+            }
+            tailBlocks[0] = .list(id: id, ordered: ordered, start: start, rows: confirmedRows + rows)
+        }
+        lastSource = source
+        lastBlocks = stableBlocks + tailBlocks
+
+        // Retain TWO blocks: an incomplete last line such as "#" can become
+        // "#text" and merge back into the preceding list/quote on the next token.
+        // Keep indentation before the boundary block, too (not just its AST range).
+        // A display equation may span multiple CommonMark blocks. Never freeze
+        // an unfinished equation, or split a rejoined math block at an AST boundary.
+        let canConfirmTail = !needsDocumentContext
+            && NativeMarkdownParser.unclosedDisplayMathDelimiter(tail) == nil
+        if canConfirmTail,
+           let proposedBoundary = Self.tailBoundary(in: document, source: tail, retainingBlocks: 2),
+           let boundary = Self.mathSafeBoundary(proposedBoundary, blocks: tailBlocks, baseUTF8Offset: stablePrefixUTF8Count) {
+            let absoluteBoundary = stablePrefixUTF8Count + boundary
+            stableBlocks.append(contentsOf: tailBlocks.filter { block in
+                guard let offset = Int(block.id.dropFirst("block-".count)) else { return false }
+                return offset < absoluteBoundary
+            })
+            stablePrefixUTF8Count = absoluteBoundary
+            partialList = nil
+        } else if canConfirmTail,
+                  let boundary = Self.listTailBoundary(in: document, source: tail),
+                  case let .list(id, ordered, start, rows) = tailBlocks.last {
+            // A normal bulleted/numbered answer is one growing Markdown block.
+            // Keep its last TWO items in the parse tail, just as we retain two
+            // blocks above. Earlier single-paragraph items cannot be changed by
+            // appends; reference definitions and replacements invalidate them.
+            stableBlocks.append(contentsOf: tailBlocks.dropLast())
+            partialList = .list(id: id, ordered: ordered, start: start, rows: Array(rows.dropLast(2)))
+            stablePrefixUTF8Count += boundary
+        }
+        return lastBlocks
+    }
+
+    func reset() {
+        stablePrefixUTF8Count = 0
+        stableBlocks = []
+        partialList = nil
+        lastSource = nil
+        lastBlocks = []
+        needsDocumentContext = false
+        awaitingReferenceColon = false
+    }
+
+    private static func hasExactUTF8Prefix(_ prefix: String, in source: String) -> Bool {
+        // String.hasPrefix uses Unicode equivalence, but block IDs use byte
+        // offsets. Compare contiguous UTF-8 buffers without per-byte Swift
+        // collection traversal; retain the collection path for bridged strings.
+        if let comparison = source.utf8.withContiguousStorageIfAvailable({ bytes in
+            prefix.utf8.withContiguousStorageIfAvailable { prefixBytes in
+                guard prefixBytes.count <= bytes.count else { return false }
+                guard !prefixBytes.isEmpty else { return true }
+                return memcmp(bytes.baseAddress!, prefixBytes.baseAddress!, prefixBytes.count) == 0
+            }
+        }), let matches = comparison {
+            return matches
+        }
+        return source.utf8.starts(with: prefix.utf8)
+    }
+
+    private static func mathSafeBoundary(_ boundary: Int, blocks: [NativeMarkdownBlock], baseUTF8Offset: Int) -> Int? {
+        var boundary = boundary
+        for block in blocks {
+            guard case let .math(id, markdown) = block,
+                  let absoluteStart = Int(id.dropFirst("block-".count)) else { continue }
+            let start = absoluteStart - baseUTF8Offset
+            if start < boundary, start + markdown.utf8.count > boundary {
+                boundary = start
+            }
+        }
+        return boundary > 0 ? boundary : nil
+    }
+
+    private static func tailBoundary(in document: Markdown.Document, source: String, retainingBlocks: Int) -> Int? {
+        guard document.childCount > retainingBlocks,
+              let block = document.child(at: document.childCount - retainingBlocks),
+              let location = block.range?.lowerBound
+        else { return nil }
+        let offsets = NativeMarkdownParser.SourceOffsetMap(source: source, baseUTF8Offset: 0)
+        guard offsets.lineStartUTF8Offsets.indices.contains(location.line - 1) else { return nil }
+        let boundary = offsets.lineStartUTF8Offsets[location.line - 1]
+        return boundary > 0 ? boundary : nil
+    }
+
+    private static func listTailBoundary(in document: Markdown.Document, source: String) -> Int? {
+        guard document.childCount > 0, let list = document.child(at: document.childCount - 1),
+              list is OrderedList || list is UnorderedList,
+              list.childCount > 2 else { return nil }
+        // Complex items retain the full parser's context. Only advance past
+        // simple rows, keeping nested content/fences/continuations in the tail.
+        for item in list.children.prefix(list.childCount - 2) {
+            guard item.childCount == 1, item.child(at: 0) is Paragraph else { return nil }
+        }
+        guard let location = list.child(at: list.childCount - 2)?.range?.lowerBound else { return nil }
+        let offsets = NativeMarkdownParser.SourceOffsetMap(source: source, baseUTF8Offset: 0)
+        guard offsets.lineStartUTF8Offsets.indices.contains(location.line - 1) else { return nil }
+        let boundary = offsets.lineStartUTF8Offsets[location.line - 1]
+        return boundary > 0 ? boundary : nil
+    }
+}
+
+// The timeline row owns this cache, so recycling a hosting cell does not discard
+// the final presentation or require a raw-text sizing pass on every revisit.
+final class NativeMarkdownPresentationCache {
+    private struct Key: Hashable {
+        let source: String
+        let rendersMath: Bool
+    }
+
+    private var entries: [Key: [NativeMarkdownBlock]] = [:]
+    private var order: [Key] = []
+
+    func blocks(for source: String, rendersMath: Bool) -> [NativeMarkdownBlock]? {
+        entries[Key(source: source, rendersMath: rendersMath)]
+    }
+
+    func insert(_ blocks: [NativeMarkdownBlock], for source: String, rendersMath: Bool) {
+        let key = Key(source: source, rendersMath: rendersMath)
+        order.removeAll { $0 == key }
+        order.append(key)
+        entries[key] = blocks
+        if order.count > 8 {
+            entries.removeValue(forKey: order.removeFirst())
+        }
+    }
+}
+
+private struct MarkdownPresentationCacheKey: EnvironmentKey {
+    static let defaultValue: NativeMarkdownPresentationCache? = nil
+}
+
+extension EnvironmentValues {
+    var markdownPresentationCache: NativeMarkdownPresentationCache? {
+        get { self[MarkdownPresentationCacheKey.self] }
+        set { self[MarkdownPresentationCacheKey.self] = newValue }
+    }
+}
+
+struct NativeMarkdownView: View {
+    let markdownText: String
+    var isStreaming = false
+    var preparsedBlocks: [NativeMarkdownBlock]? = nil
+    var onFinalParse: (() -> Void)? = nil
+    var onOpenMermaid: ((_ blockID: String, _ source: String) -> Void)? = nil
+
+    @State private var blocks: [NativeMarkdownBlock] = []
+    @State private var parsedRequest: ParseRequest?
+    @State private var incrementalParser = NativeMarkdownIncrementalParser()
+    @Environment(\.markdownPresentationCache) private var presentationCache
+
+    private struct ParseRequest: Hashable {
+        let source: String
+        let isStreaming: Bool
+    }
+
+    private var parseRequest: ParseRequest {
+        ParseRequest(
+            source: markdownText,
+            isStreaming: isStreaming
+        )
+    }
+
+    var body: some View {
+        let hasCompletedFinalParse = !isStreaming && parsedRequest == parseRequest
+        let cachedBlocks = isStreaming ? nil : presentationCache?.blocks(
+            for: markdownText, rendersMath: true
+        )
+        // State can outlive a content replacement. Never draw another source's
+        // blocks while the new source is waiting for its asynchronous parse.
+        // Completing a stream changes the request mode, not its source. Keep
+        // that source's existing layout until the final parse is ready.
+        let hasParsedSource = parsedRequest?.source == markdownText
+        let currentBlocks = hasParsedSource ? blocks : []
+        let renderedBlocks = hasCompletedFinalParse ? blocks : (cachedBlocks ?? preparsedBlocks ?? currentBlocks)
+        VStack(alignment: .leading, spacing: 12) {
+            if NativeMarkdownPresentationPolicy.showsInitialRawText(
+                hasParsedRequest: cachedBlocks != nil || preparsedBlocks != nil || hasParsedSource,
+                hasRenderedBlocks: !renderedBlocks.isEmpty,
+                sourceIsEmpty: markdownText.isEmpty
+            ) {
+                NativeMarkdownMathPlaceholder(markdownText: markdownText)
+            } else {
+                ForEach(NativeMarkdownRenderGroup.groups(
+                    for: renderedBlocks,
+                    isolatesSelectableBlocks: isStreaming
+                )) { group in
+                    switch group {
+                    case let .selectableText(_, blocks):
+                        NativeMarkdownSelectableGroup(blocks: blocks).equatable()
+                    case let .standalone(block):
+                        NativeMarkdownBlockView(
+                            block: block,
+                            isStreaming: isStreaming,
+                            onOpenMermaid: onOpenMermaid,
+                            onContentLayoutChange: onFinalParse
+                        )
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .task(id: parseRequest) {
+            let request = parseRequest
+            guard parsedRequest != request else { return }
+            if !request.isStreaming,
+               presentationCache?.blocks(for: request.source, rendersMath: true) != nil {
+                return
+            }
+            // Streaming blocks are already published atomically with the snapshot.
+            // Do not mirror them into @State: that second mutation schedules another
+            // hosting-cell layout pass for the same frame and visibly bumps paragraphs.
+            if request.isStreaming, preparsedBlocks != nil { return }
+            let source = request.source
+            let result: [NativeMarkdownBlock]
+            if request.isStreaming {
+                result = incrementalParser.streamingBlocks(for: source)
+            } else {
+                result = await NativeMarkdownBlockCache.shared.blocks(
+                    for: source,
+                    rendersMath: true
+                )
+                incrementalParser.reset()
+            }
+            guard !Task.isCancelled, request == parseRequest else { return }
+            if !request.isStreaming {
+                presentationCache?.insert(result, for: source, rendersMath: true)
+            }
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                blocks = result
+                parsedRequest = request
+            }
+            guard !request.isStreaming else { return }
+            await Task.yield()
+            await Task.yield()
+            guard !Task.isCancelled, request == parseRequest, !isStreaming else { return }
+            onFinalParse?()
+        }
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+    }
+}
+
+/// Confirmed blocks do not need to rebuild their fragments when another block
+/// (or the message's thinking/tool state) changes. Environment changes still
+/// reach the text representable, including Dynamic Type and selection actions.
+private struct NativeMarkdownSelectableGroup: View, Equatable {
+    let blocks: [NativeMarkdownBlock]
+
+    var body: some View {
+        SelectableChatText(blocks: blocks)
+    }
+}
+
+enum NativeMarkdownPresentationPolicy {
+    static func showsInitialRawText(
+        hasParsedRequest: Bool,
+        hasRenderedBlocks: Bool,
+        sourceIsEmpty: Bool
+    ) -> Bool {
+        !sourceIsEmpty && !hasParsedRequest && !hasRenderedBlocks
+    }
+}
+
+enum NativeMarkdownRenderGroup: Identifiable, Equatable {
+    case selectableText(id: String, blocks: [NativeMarkdownBlock])
+    case standalone(block: NativeMarkdownBlock)
+
+    var id: String {
+        switch self {
+        case let .selectableText(id, _): id
+        case let .standalone(block): block.renderID
+        }
+    }
+
+    static func groups(
+        for blocks: [NativeMarkdownBlock],
+        isolatesSelectableBlocks: Bool = false
+    ) -> [NativeMarkdownRenderGroup] {
+        var result: [NativeMarkdownRenderGroup] = []
+        var selectableBlocks: [NativeMarkdownBlock] = []
+
+        func flushSelectableBlocks() {
+            guard let first = selectableBlocks.first else { return }
+            result.append(.selectableText(id: "selectable-\(first.id)", blocks: selectableBlocks))
+            selectableBlocks.removeAll(keepingCapacity: true)
+        }
+
+        for block in blocks {
+            switch block {
+            case .paragraph, .heading, .quote, .list:
+                if isolatesSelectableBlocks {
+                    flushSelectableBlocks()
+                    result.append(.selectableText(
+                        id: "selectable-\(block.id)",
+                        blocks: [block]
+                    ))
+                    continue
+                }
+                selectableBlocks.append(block)
+            default:
+                flushSelectableBlocks()
+                result.append(.standalone(block: block))
+            }
+        }
+        flushSelectableBlocks()
+        return result
+    }
+}
+
+/// SwiftUI text has a usable height on the first layout pass, including while
+/// UIKit is fitting a new timeline cell. Keep it visible until WebKit has painted.
+struct NativeMarkdownMathPlaceholder: View {
+    let markdownText: String
+
+    var body: some View {
+        Text((try? AttributedString(
+            markdown: markdownText,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(markdownText))
+        .font(.body)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct NativeMarkdownGroupedBlocksView: View {
+    let blocks: [NativeMarkdownBlock]
+    var isStreaming = false
+    var onOpenMermaid: ((_ blockID: String, _ source: String) -> Void)? = nil
+    var onContentLayoutChange: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(NativeMarkdownRenderGroup.groups(for: blocks)) { group in
+                switch group {
+                case let .selectableText(_, blocks):
+                    SelectableChatText(blocks: blocks)
+                case let .standalone(block):
+                    NativeMarkdownBlockView(
+                        block: block,
+                        isStreaming: isStreaming,
+                        onOpenMermaid: onOpenMermaid,
+                        onContentLayoutChange: onContentLayoutChange
+                    )
+                }
+            }
+        }
+    }
+}
+
+private struct NativeMarkdownBlockView: View {
+    let block: NativeMarkdownBlock
+    var isStreaming = false
+    var onOpenMermaid: ((_ blockID: String, _ source: String) -> Void)? = nil
+    var onContentLayoutChange: (() -> Void)? = nil
+
+    var body: some View {
+        switch block {
+        case let .paragraph(_, text):
+            SelectableChatText(text: text, style: .body)
+        case let .heading(_, level, text):
+            SelectableChatText(text: text, style: headingTextStyle(level), weight: .bold)
+                .padding(.top, level <= 2 ? 4 : 0)
+        case let .code(_, language, code):
+            NativeCodeBlock(language: language, code: code)
+        case let .mermaid(id, source):
+            if MermaidPresentationPolicy.shouldRender(isStreaming: isStreaming) {
+                MermaidDiagramView(
+                    source: source,
+                    onExpand: onOpenMermaid.map { open in
+                        { open(id, source) }
+                    },
+                    onLayoutChange: onContentLayoutChange
+                )
+            } else {
+                NativeCodeBlock(language: "mermaid", code: source)
+            }
+        case let .math(_, markdown):
+            MathMarkdownView(markdownText: markdown, onLayoutChange: onContentLayoutChange)
+        case let .quote(_, blocks):
+            HStack(alignment: .top, spacing: 12) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.45))
+                    .frame(width: 3)
+                NativeMarkdownGroupedBlocksView(
+                    blocks: blocks,
+                    isStreaming: isStreaming,
+                    onOpenMermaid: onOpenMermaid,
+                    onContentLayoutChange: onContentLayoutChange
+                )
+            }
+        case let .list(_, ordered, start, rows):
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(ordered ? "\(start + index)." : "•")
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 18, alignment: .trailing)
+                        SelectableChatText(text: row, style: .body)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        case let .table(_, rows):
+            NativeMarkdownTable(rows: rows)
+        case .divider:
+            Divider()
+        }
+    }
+
+    private func headingTextStyle(_ level: Int) -> UIFont.TextStyle {
+        switch level {
+        case 1: .title2
+        case 2: .title3
+        default: .headline
+        }
+    }
+}
+
+enum MermaidPresentationPolicy {
+    static func shouldRender(isStreaming: Bool) -> Bool {
+        !isStreaming
+    }
+}
+
+private struct NativeCodeBlock: View {
+    let language: String?
+    let code: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(language?.isEmpty == false ? language! : L10n.text("コード"))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    UIPasteboard.general.string = code
+                } label: {
+                    Label(L10n.text("コピー"), systemImage: "doc.on.doc")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(minHeight: 38)
+
+            Divider()
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(12)
+            }
+        }
+        .background(Color(uiColor: .amoledSecondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct NativeMarkdownTable: View {
+    let rows: [[AttributedString]]
+
+    private static let textWidth: CGFloat = 220
+    private static let cellPadding: CGFloat = 9
+
+    var body: some View {
+        let grid = NativeMarkdownTableGrid(rows: rows)
+        ScrollView(.horizontal, showsIndicators: true) {
+            NativeMarkdownTableLayout(
+                columnCount: grid.columnCount,
+                columnWidth: Self.textWidth + Self.cellPadding * 2
+            ) {
+                ForEach(Array(grid.cells.enumerated()), id: \.offset) { index, cell in
+                    let isHeader = index < grid.columnCount
+                    SelectableChatText(
+                        text: cell,
+                        style: .caption1,
+                        weight: isHeader ? .semibold : .regular
+                    )
+                        // Use the same finite width during measurement and
+                        // placement so wrapping determines the row height.
+                        .frame(width: Self.textWidth, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(Self.cellPadding)
+                        // Expand every cell to its row height so backgrounds and
+                        // borders line up even when another cell wraps further.
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .background(isHeader ? Color.secondary.opacity(0.12) : Color.clear)
+                        .border(Color.secondary.opacity(0.18), width: 0.5)
+                }
+            }
+        }
+    }
+}
+
+/// Row-major cells of a Markdown table, padded so every row has the same
+/// number of columns.
+struct NativeMarkdownTableGrid: Equatable {
+    let columnCount: Int
+    let cells: [AttributedString]
+
+    init(rows: [[AttributedString]]) {
+        let columnCount = rows.map(\.count).max() ?? 0
+        self.columnCount = columnCount
+        cells = rows.flatMap { row in
+            row + Array(repeating: AttributedString(), count: columnCount - row.count)
+        }
+    }
+
+    /// Height of each row: the tallest cell in that row.
+    static func rowHeights(cellHeights: [CGFloat], columnCount: Int) -> [CGFloat] {
+        guard columnCount > 0 else { return [] }
+        return stride(from: 0, to: cellHeights.count, by: columnCount).map { start in
+            cellHeights[start..<min(start + columnCount, cellHeights.count)].max() ?? 0
+        }
+    }
+}
+
+/// Lays out table cells with fixed column widths and places every cell with
+/// its row's full height, so all cells in a row share the same frame height.
+private struct NativeMarkdownTableLayout: Layout {
+    let columnCount: Int
+    let columnWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let heights = rowHeights(subviews)
+        return CGSize(width: CGFloat(columnCount) * columnWidth, height: heights.reduce(0, +))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let heights = rowHeights(subviews)
+        var y = bounds.minY
+        for (rowIndex, rowHeight) in heights.enumerated() {
+            for column in 0..<columnCount {
+                let index = rowIndex * columnCount + column
+                guard index < subviews.count else { break }
+                subviews[index].place(
+                    at: CGPoint(x: bounds.minX + CGFloat(column) * columnWidth, y: y),
+                    anchor: .topLeading,
+                    proposal: ProposedViewSize(width: columnWidth, height: rowHeight)
+                )
+            }
+            y += rowHeight
+        }
+    }
+
+    private func rowHeights(_ subviews: Subviews) -> [CGFloat] {
+        let cellHeights = subviews.map {
+            $0.sizeThatFits(ProposedViewSize(width: columnWidth, height: nil)).height
+        }
+        return NativeMarkdownTableGrid.rowHeights(cellHeights: cellHeights, columnCount: columnCount)
+    }
+}
+
+enum ChatTextSelectionPolicy {
+    static func selectedText(in text: String, range: NSRange) -> String? {
+        guard range.location != NSNotFound,
+              range.length > 0,
+              let swiftRange = Range(range, in: text) else { return nil }
+        let selection = String(text[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return selection.isEmpty ? nil : selection
+    }
+}
+
+private extension NSAttributedString.Key {
+    static let yamabikoQuoteDepth = NSAttributedString.Key("com.porarri.yamabikochat.quote-depth")
+}
+
+final class SelectableChatTextView: UITextView {
+    static let quoteIndent: CGFloat = 15
+    private var measuredSizes: [CGFloat: CGSize] = [:]
+    private var measuredContentSizeCategory: UIContentSizeCategory?
+
+    #if DEBUG
+    private(set) var textMeasurementCount = 0
+    private(set) var attributedTextUpdateCount = 0
+    #endif
+
+    override var attributedText: NSAttributedString! {
+        didSet {
+            measuredSizes.removeAll(keepingCapacity: true)
+            #if DEBUG
+            attributedTextUpdateCount += 1
+            #endif
+        }
+    }
+
+    func replaceAttributedSuffix(from offset: Int, with suffix: NSAttributedString) {
+        let range = NSRange(location: offset, length: textStorage.length - offset)
+        guard !textStorage.attributedSubstring(from: range).isEqual(to: suffix) else { return }
+        let selection = selectedRange
+        textStorage.beginEditing()
+        textStorage.replaceCharacters(in: range, with: suffix)
+        textStorage.endEditing()
+        // Editing textStorage preserves TextKit's unchanged prefix, but bypasses
+        // the attributedText setter and its width-measurement invalidation.
+        measuredSizes.removeAll(keepingCapacity: true)
+        #if DEBUG
+        attributedTextUpdateCount += 1
+        #endif
+        if NSMaxRange(selection) <= textStorage.length { selectedRange = selection }
+        invalidateIntrinsicContentSize()
+        setNeedsDisplay()
+    }
+
+    func measuredSize(for width: CGFloat) -> CGSize {
+        if measuredContentSizeCategory != traitCollection.preferredContentSizeCategory {
+            measuredSizes.removeAll(keepingCapacity: true)
+            measuredContentSizeCategory = traitCollection.preferredContentSizeCategory
+        }
+        if let size = measuredSizes[width] { return size }
+        #if DEBUG
+        textMeasurementCount += 1
+        #endif
+        let fitted = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        let size = CGSize(width: width, height: ceil(fitted.height))
+        // SwiftUI can probe several widths in a single layout pass. Bound the
+        // cache while allowing the final width and the proposed width to coexist.
+        if measuredSizes.count >= 4 { measuredSizes.removeAll(keepingCapacity: true) }
+        measuredSizes[width] = size
+        return size
+    }
+
+    override func draw(_ rect: CGRect) {
+        super.draw(rect)
+        guard textStorage.length > 0 else { return }
+
+        let fullRange = NSRange(location: 0, length: textStorage.length)
+        textStorage.enumerateAttribute(.yamabikoQuoteDepth, in: fullRange) { value, range, _ in
+            guard let depth = value as? Int, depth > 0 else { return }
+            let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            var quoteBounds = CGRect.null
+            layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, _, _ in
+                quoteBounds = quoteBounds.union(usedRect)
+            }
+            guard !quoteBounds.isNull else { return }
+
+            UIColor.secondaryLabel.withAlphaComponent(0.45).setFill()
+            for level in 0..<depth {
+                let barRect = CGRect(
+                    x: textContainerInset.left + CGFloat(level) * Self.quoteIndent,
+                    y: textContainerInset.top + quoteBounds.minY,
+                    width: 3,
+                    height: quoteBounds.height
+                )
+                UIBezierPath(roundedRect: barRect, cornerRadius: 1.5).fill()
+            }
+        }
+    }
+}
+
+private struct SelectableChatText: UIViewRepresentable {
+    fileprivate struct Fragment: Equatable {
+        let text: AttributedString
+        let style: UIFont.TextStyle
+        let weight: UIFont.Weight
+        let prefixLength: Int
+        let quoteDepth: Int
+    }
+
+    private let fragments: [Fragment]
+
+    @Environment(\.onAskChatWithSelection) private var onAskChatWithSelection
+    @Environment(\.chatFileURLs) private var fileURLs
+    @Environment(\.onOpenChatFile) private var onOpenFile
+    @Environment(\.appAccent) private var appAccent
+
+    init(text: AttributedString, style: UIFont.TextStyle, weight: UIFont.Weight = .regular) {
+        fragments = [Fragment(
+            text: text,
+            style: style,
+            weight: weight,
+            prefixLength: 0,
+            quoteDepth: 0
+        )]
+    }
+
+    init(blocks: [NativeMarkdownBlock]) {
+        fragments = blocks.flatMap { Self.fragments(for: $0) }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onAskChatWithSelection: onAskChatWithSelection)
+    }
+
+    func makeUIView(context: Context) -> SelectableChatTextView {
+        let textView = SelectableChatTextView()
+        textView.delegate = context.coordinator
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isScrollEnabled = false
+        textView.backgroundColor = .clear
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.adjustsFontForContentSizeCategory = true
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textView.setContentHuggingPriority(.required, for: .vertical)
+        textView.accessibilityIdentifier = "selectable-chat-text"
+        textView.linkTextAttributes = [
+            .foregroundColor: UIColor.label,
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        return textView
+    }
+
+    func updateUIView(_ textView: SelectableChatTextView, context: Context) {
+        context.coordinator.onAskChatWithSelection = onAskChatWithSelection
+        context.coordinator.fileURLs = fileURLs
+        context.coordinator.onOpenFile = onOpenFile
+        textView.linkTextAttributes = [
+            .foregroundColor: UIColor(appAccent.color),
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        let links = ChatFileLinkPresentation(urls: fileURLs)
+        let linkedFragments = fragments.map { fragment in
+            Fragment(text: links.linkify(fragment.text), style: fragment.style, weight: fragment.weight,
+                     prefixLength: fragment.prefixLength, quoteDepth: fragment.quoteDepth)
+        }
+        context.coordinator.updateText(
+            in: textView,
+            fragments: linkedFragments,
+            dynamicTypeSize: context.environment.dynamicTypeSize,
+            render: renderedText
+        )
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: SelectableChatTextView,
+        context: Context
+    ) -> CGSize? {
+        guard let width = proposal.width, width > 0 else { return nil }
+        return uiView.measuredSize(for: width)
+    }
+
+    private func renderedText(_ fragments: [Fragment]) -> NSAttributedString {
+        let rendered = NSMutableAttributedString()
+        for (index, fragment) in fragments.enumerated() {
+            let start = rendered.length
+            rendered.append(NSAttributedString(fragment.text))
+            applyBaseStyle(
+                to: rendered,
+                range: NSRange(location: start, length: rendered.length - start),
+                style: fragment.style,
+                weight: fragment.weight,
+                quoteDepth: fragment.quoteDepth
+            )
+            if fragment.prefixLength > 0 {
+                rendered.addAttribute(
+                    .foregroundColor,
+                    value: UIColor.secondaryLabel,
+                    range: NSRange(location: start, length: fragment.prefixLength)
+                )
+            }
+            if index < fragments.count - 1, rendered.length > 0 {
+                let attributes = rendered.attributes(at: rendered.length - 1, effectiveRange: nil)
+                rendered.append(NSAttributedString(string: "\n", attributes: attributes))
+            }
+        }
+        return rendered
+    }
+
+    private static func fragments(
+        for block: NativeMarkdownBlock,
+        quoteDepth: Int = 0
+    ) -> [Fragment] {
+        switch block {
+        case let .paragraph(_, text):
+            return [fragment(text: text, style: .body, weight: .regular, quoteDepth: quoteDepth)]
+        case let .heading(_, level, text):
+            return [fragment(
+                text: text,
+                style: headingTextStyle(level),
+                weight: .bold,
+                quoteDepth: quoteDepth
+            )]
+        case let .quote(_, blocks):
+            return blocks.flatMap { fragments(for: $0, quoteDepth: quoteDepth + 1) }
+        case let .list(_, ordered, start, rows):
+            return rows.enumerated().map { index, row in
+                let marker = ordered ? "\(start + index). " : "• "
+                return fragment(
+                    text: row,
+                    style: .body,
+                    weight: .regular,
+                    quoteDepth: quoteDepth,
+                    marker: marker
+                )
+            }
+        case .code, .mermaid, .math, .table, .divider:
+            return []
+        }
+    }
+
+    private static func fragment(
+        text: AttributedString,
+        style: UIFont.TextStyle,
+        weight: UIFont.Weight,
+        quoteDepth: Int,
+        marker: String = ""
+    ) -> Fragment {
+        let prefix = marker
+        var prefixedText = AttributedString(prefix)
+        prefixedText.append(text)
+        return Fragment(
+            text: prefixedText,
+            style: style,
+            weight: weight,
+            prefixLength: (prefix as NSString).length,
+            quoteDepth: quoteDepth
+        )
+    }
+
+    private func applyBaseStyle(
+        to rendered: NSMutableAttributedString,
+        range fullRange: NSRange,
+        style: UIFont.TextStyle,
+        weight: UIFont.Weight,
+        quoteDepth: Int
+    ) {
+        let baseFont = UIFont.systemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: style).pointSize,
+            weight: weight
+        )
+        rendered.addAttributes([
+            .font: baseFont,
+            .foregroundColor: UIColor.label
+        ], range: fullRange)
+
+        rendered.enumerateAttribute(.inlinePresentationIntent, in: fullRange) { value, range, _ in
+            guard let intent = value as? InlinePresentationIntent else { return }
+            var traits = baseFont.fontDescriptor.symbolicTraits
+            if intent.contains(.stronglyEmphasized) { traits.insert(.traitBold) }
+            if intent.contains(.emphasized) { traits.insert(.traitItalic) }
+            if let descriptor = baseFont.fontDescriptor.withSymbolicTraits(traits) {
+                rendered.addAttribute(.font, value: UIFont(descriptor: descriptor, size: 0), range: range)
+            }
+            if intent.contains(.strikethrough) {
+                rendered.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+            }
+        }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.paragraphSpacing = 8
+        if quoteDepth > 0 {
+            let quoteIndent = CGFloat(quoteDepth) * SelectableChatTextView.quoteIndent
+            paragraph.firstLineHeadIndent = quoteIndent
+            paragraph.headIndent = quoteIndent
+            rendered.addAttribute(
+                .yamabikoQuoteDepth,
+                value: quoteDepth,
+                range: fullRange
+            )
+        }
+        rendered.addAttribute(.paragraphStyle, value: paragraph, range: fullRange)
+    }
+
+    private static func headingTextStyle(_ level: Int) -> UIFont.TextStyle {
+        switch level {
+        case 1: .title2
+        case 2: .title3
+        default: .headline
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var onAskChatWithSelection: (String) -> Void
+        var fileURLs: [URL] = []
+        var onOpenFile: (URL) -> Void = { _ in }
+
+        func textView(_ textView: UITextView, primaryActionFor textItem: UITextItem, defaultAction: UIAction) -> UIAction? {
+            guard case let .link(url) = textItem.content, url.isFileURL else { return defaultAction }
+            guard fileURLs.contains(url) else { return nil }
+            return UIAction { [weak self] _ in self?.onOpenFile(url) }
+        }
+
+        private var renderedFragments: [Fragment]?
+        private var renderedDynamicTypeSize: DynamicTypeSize?
+        private var renderedFragmentLengths: [Int] = []
+
+        fileprivate func updateText(
+            in textView: SelectableChatTextView,
+            fragments: [Fragment],
+            dynamicTypeSize: DynamicTypeSize,
+            render: ([Fragment]) -> NSAttributedString
+        ) {
+            guard renderedFragments != fragments || renderedDynamicTypeSize != dynamicTypeSize else { return }
+            var retainedCount = 0
+            if renderedDynamicTypeSize == dynamicTypeSize, let previous = renderedFragments,
+               previous.allSatisfy({ !$0.text.characters.isEmpty }),
+               fragments.allSatisfy({ !$0.text.characters.isEmpty }) {
+                // Retain complete fragments and their separators. The old/new
+                // last fragment may gain/lose a newline when rows are appended
+                // or removed, so include it in the replacement suffix.
+                // Empty headings can omit a leading separator. Render those
+                // uncommon groups in full so offsets retain that behavior.
+                let limit = max(0, min(previous.count, fragments.count) - 1)
+                while retainedCount < limit, previous[retainedCount] == fragments[retainedCount] {
+                    retainedCount += 1
+                }
+            }
+            let offset = renderedFragmentLengths.prefix(retainedCount).reduce(0, +)
+            let suffix = Array(fragments.dropFirst(retainedCount))
+            textView.replaceAttributedSuffix(from: offset, with: render(suffix))
+            renderedFragmentLengths = Array(renderedFragmentLengths.prefix(retainedCount))
+                + suffix.enumerated().map { index, fragment in
+                    NSAttributedString(fragment.text).length + (index < suffix.count - 1 ? 1 : 0)
+                }
+            renderedFragments = fragments
+            renderedDynamicTypeSize = dynamicTypeSize
+        }
+
+        init(onAskChatWithSelection: @escaping (String) -> Void) {
+            self.onAskChatWithSelection = onAskChatWithSelection
+        }
+
+        func textView(
+            _ textView: UITextView,
+            editMenuForTextIn range: NSRange,
+            suggestedActions: [UIMenuElement]
+        ) -> UIMenu? {
+            return menu(for: textView, range: range, suggestedActions: suggestedActions)
+        }
+
+        private func menu(
+            for textView: UITextView,
+            range: NSRange,
+            suggestedActions: [UIMenuElement]
+        ) -> UIMenu? {
+            guard ChatTextSelectionPolicy.selectedText(in: textView.text, range: range) != nil else {
+                return nil
+            }
+
+            let selectAllMenu = UIMenu(
+                title: L10n.text("すべて"),
+                image: UIImage(systemName: "selection.pin.in.out"),
+                children: [
+                    UIDeferredMenuElement.uncached { [weak self, weak textView] completion in
+                        guard let self, let textView else {
+                            completion([])
+                            return
+                        }
+                        textView.selectedRange = NSRange(
+                            location: 0,
+                            length: textView.textStorage.length
+                        )
+                        completion(self.expandedMenuActions(for: textView))
+                    }
+                ]
+            )
+
+            return UIMenu(
+                options: .displayInline,
+                children: [askAction(for: textView), copyAction(for: textView), selectAllMenu]
+            )
+        }
+
+        private func askAction(for textView: UITextView) -> UIAction {
+            UIAction(
+                title: L10n.text("チャットで質問する"),
+                image: UIImage(systemName: "text.bubble")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = ChatTextSelectionPolicy.selectedText(
+                        in: textView.text,
+                        range: textView.selectedRange
+                      ) else { return }
+                textView.resignFirstResponder()
+                DispatchQueue.main.async {
+                    self.onAskChatWithSelection(selection)
+                }
+            }
+        }
+
+        private func copyAction(for textView: UITextView) -> UIAction {
+            UIAction(
+                title: L10n.text("コピー"),
+                image: UIImage(systemName: "doc.on.doc")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = self.selection(in: textView) else { return }
+                UIPasteboard.general.string = selection
+            }
+        }
+
+        private func expandedMenuActions(for textView: UITextView) -> [UIMenuElement] {
+            let selectAll = UIAction(
+                title: L10n.text("すべてを選択"),
+                image: UIImage(systemName: "selection.pin.in.out")
+            ) { [weak textView] _ in
+                guard let textView else { return }
+                textView.selectedRange = NSRange(location: 0, length: textView.textStorage.length)
+            }
+            let lookup = UIAction(
+                title: L10n.text("調べる"),
+                image: UIImage(systemName: "info.circle")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = self.selection(in: textView),
+                      let presenter = self.presenter(for: textView) else { return }
+                presenter.present(UIReferenceLibraryViewController(term: selection), animated: true)
+            }
+            let translate = UIAction(
+                title: L10n.text("翻訳"),
+                image: UIImage(systemName: "character.bubble")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = self.selection(in: textView),
+                      var components = URLComponents(string: "https://translate.google.com/") else { return }
+                components.queryItems = [
+                    URLQueryItem(name: "sl", value: "auto"),
+                    URLQueryItem(name: "tl", value: "en"),
+                    URLQueryItem(name: "text", value: selection),
+                    URLQueryItem(name: "op", value: "translate")
+                ]
+                if let url = components.url { UIApplication.shared.open(url) }
+            }
+            let webSearch = UIAction(
+                title: L10n.text("ウェブを検索"),
+                image: UIImage(systemName: "magnifyingglass")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = self.selection(in: textView),
+                      var components = URLComponents(string: "https://www.google.com/search") else { return }
+                components.queryItems = [URLQueryItem(name: "q", value: selection)]
+                if let url = components.url { UIApplication.shared.open(url) }
+            }
+            let share = UIAction(
+                title: L10n.text("共有…"),
+                image: UIImage(systemName: "square.and.arrow.up")
+            ) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let selection = self.selection(in: textView),
+                      let presenter = self.presenter(for: textView) else { return }
+                let controller = UIActivityViewController(
+                    activityItems: [selection],
+                    applicationActivities: nil
+                )
+                controller.popoverPresentationController?.sourceView = textView
+                controller.popoverPresentationController?.sourceRect = textView.bounds
+                presenter.present(controller, animated: true)
+            }
+            return [
+                askAction(for: textView),
+                copyAction(for: textView),
+                selectAll,
+                UIMenu(options: .displayInline, children: [lookup, translate, webSearch]),
+                UIMenu(options: .displayInline, children: [share])
+            ]
+        }
+
+        private func selection(in textView: UITextView) -> String? {
+            ChatTextSelectionPolicy.selectedText(in: textView.text, range: textView.selectedRange)
+        }
+
+        private func presenter(for textView: UITextView) -> UIViewController? {
+            var presenter = textView.window?.rootViewController
+            while let presented = presenter?.presentedViewController {
+                presenter = presented
+            }
+            return presenter
+        }
+
+    }
+}

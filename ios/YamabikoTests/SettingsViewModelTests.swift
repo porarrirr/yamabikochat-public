@@ -1,0 +1,1053 @@
+import XCTest
+import GRDB
+@testable import YamabikoChat
+
+private final class SettingsViewModelCredentialStore: SecureCredentialStore {
+    private var storage: [String: String] = [:]
+    private(set) var readKeys: [String] = []
+    private(set) var savedKeys: [String] = []
+    var failingKey: String?
+
+    func saveSecret(_ value: String?, key: String) throws {
+        if key == failingKey { throw KeychainStoreError.invalidEncoding }
+        savedKeys.append(key)
+        if let value {
+            storage[key] = value
+        } else {
+            storage.removeValue(forKey: key)
+        }
+    }
+
+    func readSecret(key: String) throws -> String? {
+        readKeys.append(key)
+        return storage[key]
+    }
+
+    func deleteSecret(key: String) throws {
+        storage.removeValue(forKey: key)
+    }
+}
+
+private final class SettingsOpenCodeGoUsageHTTPClient: HTTPClientProtocol {
+    private(set) var requests: [HTTPRequest] = []
+
+    func send(_ request: HTTPRequest) async throws -> (Data, HTTPURLResponse) {
+        requests.append(request)
+        let response = try XCTUnwrap(HTTPURLResponse(
+            url: request.url,
+            statusCode: 200,
+            httpVersion: "HTTP/2",
+            headerFields: ["Content-Type": "application/json"]
+        ))
+        return (Data(Self.fixture.utf8), response)
+    }
+
+    private static let fixture = #"""
+    {"usage":{
+      "rolling":{"status":"ok","percent":4,"resetsAt":"2026-08-30T16:27:38.287Z"},
+      "weekly":{"status":"ok","percent":40,"resetsAt":"2026-08-31T00:00:00.023Z"},
+      "monthly":{"status":"ok","percent":43,"resetsAt":"2026-09-07T07:32:38.023Z"}
+    }}
+    """#
+}
+
+final class SettingsViewModelTests: XCTestCase {
+    @MainActor
+    func testSuperGrokLogoutCleanupFailureShowsAccountReviewGuidance() async throws {
+        let credentials = SettingsViewModelCredentialStore()
+        let auth = SuperGrokAuthRepository(credentialStore: credentials,
+            loginHandler: { _, _, _ in oauthResolution(accountID: nil) },
+            revokeHandler: { _ in throw URLError(.notConnectedToInternet) },
+            logoutHandler: { throw URLError(.cannotConnectToHost) })
+        _ = await auth.loginWithBrowser()
+        let fixture = try makeFixture(credentials: credentials, superGrokAuthRepository: auth)
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: credentials)
+        await viewModel.logoutSuperGrok()
+        XCTAssertEqual(viewModel.statusMessage, L10n.text("xAIのログアウトを完了できませんでした。アプリを終了し、Grokのアカウント設定で接続済みアプリとセッションを確認してください。"))
+        XCTAssertNil(try credentials.readSecret(key: "pi_oauth_supergrok_v1"))
+    }
+
+    @MainActor
+    func testTechnicalFailureIsHiddenAndInputGuidanceRemainsVisible() {
+        let viewModel = SettingsViewModel()
+        let error = NSError(domain: "DiagnosticOnly", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Response parse failed: timeout"])
+        viewModel.recordFailure(error)
+        XCTAssertEqual(viewModel.errorMessage, error.localizedDescription)
+        XCTAssertNil(viewModel.visibleErrorMessage)
+
+        viewModel.errorMessage = "APIキーを入力してください"
+        XCTAssertEqual(viewModel.visibleErrorMessage, viewModel.errorMessage)
+        viewModel.errorMessage = nil
+        XCTAssertNil(viewModel.visibleErrorMessage)
+    }
+
+    @MainActor
+    func testChatGPTManualRefreshLoadsFreshContractsBeforeAccountDiscovery() async throws {
+        let cacheURL = FileManager.default.temporaryDirectory.appendingPathComponent("chatgpt-refresh-\(UUID().uuidString).json")
+        let suiteName = "SettingsViewModelTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SettingsChatGPTCatalogURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: cacheURL)
+        }
+        let cachedProviders = try ModelsDevCatalogRepository.parseCatalog(Data(SettingsChatGPTCatalogURLProtocol.fixture.utf8))
+        var staleProviders = cachedProviders
+        staleProviders[0].models = []
+        try JSONEncoder().encode(staleProviders).write(to: cacheURL)
+        defaults.set(Date(), forKey: "models_dev_catalog_fetched_at")
+        let catalog = ModelsDevCatalogRepository(session: session, defaults: defaults, cacheURL: cacheURL)
+        let fixture = try await makeChatGPTFixture(modelsDevCatalogRepository: catalog) { _, contracts in
+            XCTAssertEqual(contracts["gpt-6.1-sol"]?.reasoningEfforts, ["low", "medium", "high", "max"])
+            XCTAssertEqual(contracts["gpt-6.1-sol"]?.contextWindow, 1_050_000)
+            return [PiCodexModel(id: "gpt-6.1-sol", name: "GPT-6.1 Sol", supported: true)]
+        }
+
+        await fixture.viewModel.refreshCodexModels(forceRefresh: true)
+
+        XCTAssertEqual(fixture.viewModel.codexModels.map(\.id), ["gpt-6.1-sol"])
+        XCTAssertNil(fixture.viewModel.codexModelsError)
+    }
+
+    @MainActor
+    func testChatGPTCatalogRefreshShowsNewModelsWithoutReplacingSavedSelection() async throws {
+        let models = [
+            PiCodexModel(id: "gpt-6.1-sol", name: "GPT-6.1 Sol", supported: true),
+            PiCodexModel(id: "future-model", name: "Future", supported: false, reason: "pi_model_missing")
+        ]
+        let fixture = try await makeChatGPTFixture { _, _ in models }
+        fixture.viewModel.settings.defaultModel = "gpt-5.6-sol"
+
+        await fixture.viewModel.refreshCodexModels(forceRefresh: true)
+
+        XCTAssertEqual(fixture.viewModel.codexModels.map(\.id), models.map(\.id))
+        XCTAssertEqual(fixture.viewModel.codexModels.last?.reason, "pi_model_missing")
+        XCTAssertEqual(fixture.viewModel.settings.defaultModel, "gpt-5.6-sol")
+        XCTAssertFalse(fixture.viewModel.codexModelsLoading)
+        XCTAssertNil(fixture.viewModel.codexModelsError)
+    }
+
+    @MainActor
+    func testChatGPTCatalogRefreshFailureIsVisibleAndKeepsSavedModel() async throws {
+        let fixture = try await makeChatGPTFixture { _, _ in throw URLError(.notConnectedToInternet) }
+        fixture.viewModel.settings.defaultModel = "saved-model"
+        fixture.viewModel.codexModels = [PiCodexModel(id: "stale-model", name: "Stale", supported: true)]
+
+        await fixture.viewModel.refreshCodexModels()
+
+        XCTAssertTrue(fixture.viewModel.codexModels.isEmpty)
+        XCTAssertNotNil(fixture.viewModel.codexModelsError)
+        XCTAssertFalse(fixture.viewModel.codexModelsLoading)
+        XCTAssertEqual(fixture.viewModel.settings.defaultModel, "saved-model")
+    }
+
+    @MainActor
+    func testChatGPTFreshCacheSkipsAccountDiscovery() async throws {
+        let calls = SettingsChatGPTCatalogGate()
+        let fixture = try await makeChatGPTFixture { _, _ in try await calls.fetch() }
+        // The first gate call blocks; use the second call to seed the account cache.
+        let initial = Task { await fixture.viewModel.refreshCodexModels() }
+        await calls.waitUntilStarted()
+        await fixture.viewModel.refreshCodexModels(forceRefresh: true)
+        await calls.resume()
+        await initial.value
+
+        await fixture.viewModel.refreshCodexModels()
+        XCTAssertEqual(fixture.viewModel.codexModels.map(\.id), ["new-model"])
+        let count = await calls.fetchCount()
+        XCTAssertEqual(count, 2)
+    }
+
+    @MainActor
+    func testChatGPTSlowRefreshAndFailureKeepCachedModelsVisible() async throws {
+        let mode = SettingsCatalogFailureMode()
+        let expected = [PiCodexModel(id: "saved", name: "Saved", supported: true)]
+        let fixture = try await makeChatGPTFixture { _, _ in
+            try await mode.check()
+            return expected
+        }
+        await fixture.viewModel.refreshCodexModels()
+        await mode.fail()
+        let refresh = Task { await fixture.viewModel.refreshCodexModels(forceRefresh: true) }
+        await mode.waitUntilStarted()
+        XCTAssertTrue(fixture.viewModel.codexModelsLoading)
+        XCTAssertEqual(fixture.viewModel.codexModels, expected)
+        await mode.resume()
+        await refresh.value
+
+        XCTAssertEqual(fixture.viewModel.codexModels, expected)
+        XCTAssertNotNil(fixture.viewModel.codexModelsError)
+        XCTAssertFalse(fixture.viewModel.codexModelsLoading)
+    }
+
+    @MainActor
+    func testChatGPTCatalogDiscardsOlderRefreshAfterNewerRefreshCompletes() async throws {
+        let gate = SettingsChatGPTCatalogGate()
+        let fixture = try await makeChatGPTFixture { _, _ in try await gate.fetch() }
+        let first = Task { await fixture.viewModel.refreshCodexModels() }
+        await gate.waitUntilStarted()
+        XCTAssertTrue(fixture.viewModel.codexModelsLoading)
+
+        await fixture.viewModel.refreshCodexModels()
+        await gate.resume()
+        await first.value
+
+        XCTAssertEqual(fixture.viewModel.codexModels.map(\.id), ["new-model"])
+        XCTAssertEqual(fixture.auth.cachedModels().map(\.id), ["new-model"])
+        XCTAssertFalse(fixture.viewModel.codexModelsLoading)
+    }
+
+    @MainActor
+    func testChatGPTSignOutDiscardsInFlightModelRefresh() async throws {
+        let gate = SettingsChatGPTCatalogGate()
+        let fixture = try await makeChatGPTFixture { _, _ in try await gate.fetch() }
+        let refresh = Task { await fixture.viewModel.refreshCodexModels() }
+        await gate.waitUntilStarted()
+
+        await fixture.viewModel.logoutCodexAuth()
+        await gate.resume()
+        await refresh.value
+
+        XCTAssertTrue(fixture.viewModel.codexModels.isEmpty)
+        XCTAssertFalse(fixture.viewModel.codexModelsLoading)
+        XCTAssertNil(fixture.viewModel.codexModelsError)
+    }
+
+    @MainActor
+    private func makeChatGPTFixture(
+        modelsDevCatalogRepository: ModelsDevCatalogRepository? = nil,
+        catalogHandler: @escaping PiChatGPTCatalogHandler
+    ) async throws -> (viewModel: SettingsViewModel, auth: CodexAuthRepository) {
+        let credentials = SettingsViewModelCredentialStore()
+        let auth = CodexAuthRepository(
+            credentialStore: credentials,
+            loginHandler: { host, _, _ in chatGPTResolution(hostID: host) },
+            resolveHandler: { _, _, _ in chatGPTResolution() },
+            catalogHandler: catalogHandler,
+            revokeHandler: { _ in }
+        )
+        guard case .success = await auth.loginWithBrowser() else {
+            throw ProviderClientError.parseFailure("Test sign-in failed")
+        }
+        let fixture = try makeFixture(
+            credentials: credentials,
+            codexAuthRepository: auth,
+            modelsDevCatalogRepository: modelsDevCatalogRepository
+        )
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: credentials)
+        return (viewModel, auth)
+    }
+
+    @MainActor
+    func testSelectingNewSystemPromptClearsPreviousPresetDraft() throws {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.systemPromptPresetsJSON = String(
+            data: try JSONEncoder().encode([
+                SystemPromptPreset(name: "Review", prompt: "Review carefully")
+            ]),
+            encoding: .utf8
+        ) ?? "[]"
+        viewModel.selectSystemPromptPreset("Review")
+
+        viewModel.selectSystemPromptOption(SettingsViewModel.newSystemPromptSelection)
+
+        XCTAssertTrue(viewModel.settings.isSystemPromptEnabled)
+        XCTAssertNil(viewModel.settings.selectedSystemPromptPreset)
+        XCTAssertNil(viewModel.settings.systemPrompt)
+        XCTAssertEqual(viewModel.systemPromptPresetNameInput, "")
+        XCTAssertEqual(viewModel.systemPromptPickerSelection, SettingsViewModel.newSystemPromptSelection)
+    }
+
+    @MainActor
+    func testSelectingDisabledSystemPromptKeepsDraftButStopsApplyingIt() throws {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.systemPromptPresetsJSON = String(
+            data: try JSONEncoder().encode([
+                SystemPromptPreset(name: "Review", prompt: "Review carefully")
+            ]),
+            encoding: .utf8
+        ) ?? "[]"
+        viewModel.selectSystemPromptPreset("Review")
+
+        viewModel.selectSystemPromptOption(SettingsViewModel.disabledSystemPromptSelection)
+
+        XCTAssertFalse(viewModel.settings.isSystemPromptEnabled)
+        XCTAssertNil(viewModel.settings.effectiveSystemPrompt())
+        XCTAssertEqual(viewModel.settings.selectedSystemPromptPreset, "Review")
+        XCTAssertEqual(viewModel.systemPromptPickerSelection, SettingsViewModel.disabledSystemPromptSelection)
+    }
+
+    @MainActor
+    func testSavingSelectedSystemPromptPresetRenamesInsteadOfDuplicatingIt() throws {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.systemPromptPresetsJSON = String(
+            data: try JSONEncoder().encode([
+                SystemPromptPreset(name: "Review", prompt: "Old prompt")
+            ]),
+            encoding: .utf8
+        ) ?? "[]"
+        viewModel.selectSystemPromptPreset("Review")
+        viewModel.updateSystemPromptName("Careful Review")
+        viewModel.updateSystemPromptText("New prompt")
+
+        XCTAssertEqual(viewModel.systemPromptPresets, [
+            SystemPromptPreset(name: "Careful Review", prompt: "New prompt")
+        ])
+        XCTAssertEqual(viewModel.settings.selectedSystemPromptPreset, "Careful Review")
+    }
+
+    @MainActor
+    func testModelSlotProviderChangeUsesOwnSavedModelOrDefault() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "GEMINI"
+        viewModel.settings.defaultModel = "gemini-2.5-flash"
+        viewModel.settings.providerDefaultModelsJSON = #"{"APPLE_INTELLIGENCE":"PrivateCloudComputeLanguageModel","SUPERGROK":"grok-4.3"}"#
+        XCTAssertEqual(viewModel.initialModelForSlot(for: "APPLE_INTELLIGENCE"), AppleIntelligenceModelCatalog.pccModel)
+        XCTAssertEqual(viewModel.initialModelForSlot(for: "SUPERGROK"), "grok-4.3")
+        XCTAssertEqual(viewModel.initialModelForSlot(for: "CODEX_AUTH"), CodexModelCatalog.defaultModel())
+        XCTAssertEqual(viewModel.initialModelForSlot(for: "MODELS_DEV:openai"), "")
+
+        var endpoint = OpenAICompatPreset(name: "Local", baseURL: "https://example.com/v1")
+        endpoint.apiProtocol = "openai-responses"
+        endpoint.modelId = "private-model"
+        viewModel.settings.openAICompatPresetsJSON = String(decoding: try! JSONEncoder().encode([endpoint]), as: UTF8.self)
+        viewModel.settings.selectedOpenAICompatPreset = "Local"
+        XCTAssertEqual(viewModel.initialModelForSlot(for: "OPENAI_COMPAT"), "private-model")
+    }
+
+    @MainActor
+    func testGeminiRotationCatalogProviderUsesModelsDevGoogleModels() throws {
+        let providers = try ModelsDevCatalogRepository.parseCatalog(Data(Self.modelsDevGeminiFixture.utf8))
+        let viewModel = SettingsViewModel()
+        viewModel.modelsDevCatalogState = CatalogLoadState(
+            availability: .ready,
+            providers: providers
+        )
+
+        XCTAssertEqual(viewModel.geminiRotationCatalogProvider?.id, "google")
+        XCTAssertEqual(
+            viewModel.geminiRotationCatalogProvider?.models.map(\.id),
+            ["gemini-model-from-models-dev"]
+        )
+    }
+
+    @MainActor
+    func testBindLoadsCurrentProviderApiKeyFromCredentialStore() throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENROUTER"
+        try fixture.repository.saveSettings(settings)
+        try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+
+        XCTAssertEqual(viewModel.apiKeyDraft, "openrouter-key")
+    }
+
+    @MainActor
+    func testSavingCustomEndpointKeyKeepsDiscoveryAndAutosaveCredentialHydrated() throws {
+        let fixture = try makeFixture()
+        var preset = OpenAICompatPreset(name: "Private", baseURL: "https://example.com/v1")
+        preset.apiProtocol = "openai-responses"
+        preset.modelId = "private-model"
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENAI_COMPAT"
+        settings.selectedOpenAICompatPreset = preset.name
+        settings.openAICompatPresetsJSON = String(decoding: try JSONEncoder().encode([preset]), as: UTF8.self)
+        try fixture.repository.saveSettings(settings)
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.openAICompatApiKeyInput = "custom-key"
+        viewModel.saveSelectedOpenAICompatApiKey()
+        XCTAssertEqual(viewModel.openAICompatApiKeyInput, "custom-key")
+        viewModel.flushPendingSettingsSave()
+        XCTAssertEqual(try fixture.credentials.openAICompatAPIKey(name: preset.name), "custom-key")
+    }
+
+    @MainActor
+    func testSetProviderReloadsApiKeyDraftForSelectedProvider() async throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENROUTER"
+        try fixture.repository.saveSettings(settings)
+        try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
+        try fixture.credentials.setCredential("openai-key", for: .openAI)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.setProvider("OPENAI")
+        await Task.yield()
+
+        XCTAssertEqual(viewModel.apiKeyDraft, "openai-key")
+    }
+
+    @MainActor
+    func testSetProviderPreservesUnsavedDraftPerProvider() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+
+        viewModel.apiKeyDraft = "gemini-unsaved"
+        viewModel.setProvider("OPENAI")
+        viewModel.apiKeyDraft = "openai-unsaved"
+        viewModel.setProvider("GEMINI")
+
+        XCTAssertEqual(viewModel.apiKeyDraft, "gemini-unsaved")
+        viewModel.setProvider("OPENAI")
+        XCTAssertEqual(viewModel.apiKeyDraft, "openai-unsaved")
+    }
+
+    @MainActor
+    func testEnablingGeminiToolDisablesClientSearchAndPython() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "GEMINI"
+        viewModel.settings.clientWebSearchToolEnabled = true
+        viewModel.settings.pythonToolEnabled = true
+
+        viewModel.setGeminiGoogleSearchEnabled(true)
+
+        XCTAssertTrue(viewModel.settings.geminiGoogleSearchEnabled)
+        XCTAssertFalse(viewModel.settings.clientWebSearchToolEnabled)
+        XCTAssertFalse(viewModel.settings.pythonToolEnabled)
+        XCTAssertFalse(viewModel.settings.genUIToolEnabled)
+    }
+
+    @MainActor
+    func testEnablingGenUIForGeminiDisablesNativeTools() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "GEMINI"
+        viewModel.settings.geminiGoogleSearchEnabled = true
+        viewModel.settings.geminiCodeExecutionEnabled = true
+        viewModel.settings.geminiURLContextEnabled = true
+        viewModel.settings.geminiGoogleMapsEnabled = true
+        viewModel.setGenUIToolEnabled(true)
+        XCTAssertTrue(viewModel.settings.genUIToolEnabled)
+        XCTAssertFalse(viewModel.settings.hasEnabledGeminiTool)
+        viewModel.setGenUIToolEnabled(false)
+        XCTAssertFalse(viewModel.settings.genUIToolEnabled)
+    }
+
+    @MainActor
+    func testEnablingClientToolForGeminiDisablesEveryGeminiTool() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "GEMINI"
+        viewModel.settings.geminiGoogleSearchEnabled = true
+        viewModel.settings.geminiURLContextEnabled = true
+        viewModel.settings.geminiCodeExecutionEnabled = true
+        viewModel.settings.geminiGoogleMapsEnabled = true
+        viewModel.settings.geminiComputerUseEnabled = true
+
+        viewModel.setPythonToolEnabled(true)
+
+        XCTAssertTrue(viewModel.settings.pythonToolEnabled)
+        XCTAssertFalse(viewModel.settings.hasEnabledGeminiTool)
+    }
+
+    @MainActor
+    func testEnablingClientSearchForGeminiDisablesEveryGeminiTool() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "GEMINI"
+        viewModel.settings.geminiGoogleSearchEnabled = true
+        viewModel.settings.geminiURLContextEnabled = true
+        viewModel.settings.geminiCodeExecutionEnabled = true
+        viewModel.settings.geminiGoogleMapsEnabled = true
+        viewModel.settings.geminiComputerUseEnabled = true
+
+        viewModel.setClientWebSearchToolEnabled(true)
+
+        XCTAssertTrue(viewModel.settings.clientWebSearchToolEnabled)
+        XCTAssertFalse(viewModel.settings.hasEnabledGeminiTool)
+    }
+
+    @MainActor
+    func testSwitchingToGeminiResolvesExistingToolConflictInFavorOfGeminiTools() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "OPENAI"
+        viewModel.settings.clientWebSearchToolEnabled = true
+        viewModel.settings.pythonToolEnabled = true
+        viewModel.settings.geminiCodeExecutionEnabled = true
+
+        viewModel.setProvider("GEMINI")
+
+        XCTAssertTrue(viewModel.settings.geminiCodeExecutionEnabled)
+        XCTAssertFalse(viewModel.settings.clientWebSearchToolEnabled)
+        XCTAssertFalse(viewModel.settings.pythonToolEnabled)
+        XCTAssertFalse(viewModel.settings.genUIToolEnabled)
+    }
+
+    @MainActor
+    func testBindLoadsAlibabaApiKeyFromCredentialStore() throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "ALIBABA_CODING_PLAN"
+        try fixture.repository.saveSettings(settings)
+        try fixture.credentials.setCredential("alibaba-key", for: .alibabaCodingPlan)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+
+        XCTAssertEqual(viewModel.apiKeyDraft, "alibaba-key")
+    }
+
+    @MainActor
+    func testSetProviderSetsAppleIntelligenceDisplayModel() throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "GEMINI"
+        settings.defaultModel = "gemini-2.5-flash"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.setProvider("APPLE_INTELLIGENCE")
+
+        XCTAssertEqual(viewModel.settings.defaultModel, AppleIntelligenceModelCatalog.displayModel)
+        XCTAssertEqual(
+            viewModel.settings.modelForProvider("APPLE_INTELLIGENCE"),
+            AppleIntelligenceModelCatalog.displayModel
+        )
+    }
+
+    @MainActor
+    func testSetProviderReloadsAlibabaApiKeyDraftForSelectedProvider() async throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENAI"
+        try fixture.repository.saveSettings(settings)
+        try fixture.credentials.setCredential("openai-key", for: .openAI)
+        try fixture.credentials.setCredential("alibaba-key", for: .alibabaCodingPlan)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.setProvider("ALIBABA_CODING_PLAN")
+        await Task.yield()
+
+        XCTAssertEqual(viewModel.apiKeyDraft, "alibaba-key")
+        XCTAssertEqual(viewModel.settings.defaultModel, AlibabaCodingPlanModelCatalog.defaultModel)
+    }
+
+    @MainActor
+    func testSetProviderUsesOpenCodeGoCatalogInsteadOfOpenCodeZenModel() throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENROUTER"
+        settings.defaultModel = "openai/gpt-4o-mini"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.setProvider("OPENCODE_GO")
+
+        XCTAssertEqual(viewModel.settings.apiProvider, "OPENCODE_GO")
+        XCTAssertEqual(viewModel.settings.defaultModel, OpenCodeGoModelCatalog.defaultModel)
+    }
+
+    @MainActor
+    func testSetProviderUsesZAICodingPlanModel() throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENAI"
+        settings.defaultModel = "gpt-4.1-mini"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.setProvider("ZAI")
+
+        XCTAssertEqual(viewModel.settings.defaultModel, ZAICodingPlanModelCatalog.defaultModel)
+    }
+
+    @MainActor
+    func testBindLoadsAlibabaMCPAuthorizationTokenFromCredentialStore() throws {
+        let fixture = try makeFixture()
+        try fixture.credentials.saveSecret("mcp-token", key: AppConstants.alibabaMCPAuthorizationTokenKey)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+
+        XCTAssertEqual(viewModel.alibabaMCPAuthorizationTokenInput, "mcp-token")
+    }
+
+    @MainActor
+    func testSaveSettingsPersistsAlibabaMCPAuthorizationTokenToCredentialStore() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.alibabaMCPAuthorizationTokenInput = "persist-me"
+
+        viewModel.saveSettings()
+
+        XCTAssertEqual(
+            try fixture.credentials.readSecret(key: AppConstants.alibabaMCPAuthorizationTokenKey),
+            "persist-me"
+        )
+    }
+
+    @MainActor
+    func testSetAlibabaMCPServerURLPreservesAuthorizationTokenDraftWhileEditing() throws {
+        let fixture = try makeFixture()
+        try fixture.credentials.saveSecret("mcp-token", key: AppConstants.alibabaMCPAuthorizationTokenKey)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        XCTAssertEqual(viewModel.alibabaMCPAuthorizationTokenInput, "mcp-token")
+
+        viewModel.setAlibabaMCPServerURL("https://mcp.firecrawl.dev/example/v2/mcp")
+
+        XCTAssertEqual(viewModel.alibabaMCPAuthorizationTokenInput, "mcp-token")
+    }
+
+    @MainActor
+    func testFlushPendingSettingsSavePersistsSettingsImmediately() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.themeMode = "DARK"
+
+        viewModel.flushPendingSettingsSave()
+
+        XCTAssertEqual(try fixture.repository.loadSettings().themeMode, "DARK")
+    }
+
+    @MainActor
+    func testClosingUneditedSettingsDoesNotWriteCredentials() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        let savedKeys = fixture.credentials.savedKeys
+
+        viewModel.flushPendingSettingsSave()
+        viewModel.flushPendingSettingsSave()
+
+        XCTAssertEqual(fixture.credentials.savedKeys, savedKeys)
+    }
+
+    @MainActor
+    func testCompletedAutoSaveDoesNotSaveAgainOnCloseAndAcceptsExternalUpdates() async throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.themeMode = "DARK"
+        let saved = expectation(for: NSPredicate { _, _ in
+            (try? fixture.repository.loadSettings().themeMode) == "DARK"
+        }, evaluatedWith: nil)
+        await fulfillment(of: [saved], timeout: 2)
+        let savedKeys = fixture.credentials.savedKeys
+
+        viewModel.flushPendingSettingsSave()
+        XCTAssertEqual(fixture.credentials.savedKeys, savedKeys)
+
+        var externalSettings = try fixture.repository.loadSettings()
+        externalSettings.themeMode = "LIGHT"
+        try fixture.repository.saveSettings(externalSettings)
+        let reloaded = expectation(for: NSPredicate { _, _ in
+            viewModel.settings.themeMode == "LIGHT"
+        }, evaluatedWith: nil)
+        await fulfillment(of: [reloaded], timeout: 2)
+        XCTAssertEqual(viewModel.settings.themeMode, "LIGHT")
+    }
+
+    @MainActor
+    func testCatalogCredentialReadsAreCachedAndInvalidatedAfterSave() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        let key = ModelsDevReasoningPreference.fieldKey(providerID: "example", fieldName: "API_KEY")
+
+        for _ in 0..<20 {
+            XCTAssertEqual(viewModel.modelsDevField(providerID: "example", fieldName: "API_KEY"), "")
+        }
+        XCTAssertEqual(fixture.credentials.readKeys.filter { $0 == key }.count, 1)
+
+        viewModel.saveModelsDevFields(providerID: "example", fields: ["API_KEY": " new-key "])
+        XCTAssertEqual(viewModel.modelsDevField(providerID: "example", fieldName: "API_KEY"), "new-key")
+        XCTAssertEqual(fixture.credentials.readKeys.filter { $0 == key }.count, 2)
+
+        viewModel.saveModelsDevFields(providerID: "example", fields: ["API_KEY": ""])
+        XCTAssertEqual(viewModel.modelsDevField(providerID: "example", fieldName: "API_KEY"), "")
+    }
+
+    @MainActor
+    func testClearingModelsDevReasoningEffortRemovesPersistedAndCachedValueWithoutCatalog() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.modelsDevCatalogState = .init()
+        let field = ModelsDevReasoningPreference.fieldName(modelID: "reasoning-model")
+        let key = ModelsDevReasoningPreference.fieldKey(providerID: "example", fieldName: field)
+        let otherKey = ModelsDevReasoningPreference.fieldKey(
+            providerID: "example",
+            fieldName: ModelsDevReasoningPreference.fieldName(modelID: "other-model")
+        )
+        try fixture.credentials.saveSecret("high", key: key)
+        try fixture.credentials.saveSecret("low", key: otherKey)
+        XCTAssertEqual(viewModel.modelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model"), "high")
+
+        viewModel.saveModelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model", effort: "")
+
+        XCTAssertNil(try fixture.credentials.readSecret(key: key))
+        XCTAssertEqual(viewModel.modelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model"), "")
+        XCTAssertEqual(try fixture.credentials.readSecret(key: otherKey), "low")
+        XCTAssertNil(viewModel.errorMessage)
+
+        // Deletion bypasses catalog validation; selecting a new effort still requires it.
+        viewModel.saveModelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model", effort: "high")
+        XCTAssertNil(try fixture.credentials.readSecret(key: key))
+        XCTAssertNotNil(viewModel.errorMessage)
+    }
+
+    @MainActor
+    func testFailedModelsDevReasoningEffortResetPreservesSavedValueAndReportsError() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        let key = ModelsDevReasoningPreference.fieldKey(
+            providerID: "example",
+            fieldName: ModelsDevReasoningPreference.fieldName(modelID: "reasoning-model")
+        )
+        try fixture.credentials.saveSecret("high", key: key)
+        XCTAssertEqual(viewModel.modelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model"), "high")
+        fixture.credentials.failingKey = key
+
+        viewModel.saveModelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model", effort: "")
+
+        XCTAssertEqual(try fixture.credentials.readSecret(key: key), "high")
+        XCTAssertEqual(viewModel.modelsDevReasoningEffort(providerID: "example", modelID: "reasoning-model"), "high")
+        XCTAssertNotNil(viewModel.errorMessage)
+    }
+
+    @MainActor
+    func testSystemPromptEditsAutoSavePresetAfterDebounce() async throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.updateSystemPromptName("Review")
+        viewModel.updateSystemPromptText("Review carefully\n")
+
+        let saved = expectation(for: NSPredicate { _, _ in
+            (try? fixture.repository.loadSettings().resolveSelectedSystemPromptPreset()?.prompt) == "Review carefully\n"
+        }, evaluatedWith: nil)
+        await fulfillment(of: [saved], timeout: 2)
+        XCTAssertEqual(try fixture.repository.loadSettings().selectedSystemPromptPreset, "Review")
+    }
+
+    @MainActor
+    func testSystemPromptSwitchKeepsLatestEditsAndEmptyBody() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.updateSystemPromptName("First")
+        viewModel.updateSystemPromptText("Original")
+        viewModel.selectSystemPromptOption(SettingsViewModel.newSystemPromptSelection)
+        viewModel.updateSystemPromptName("Second")
+        viewModel.updateSystemPromptText("Other")
+        viewModel.selectSystemPromptOption("First")
+        viewModel.updateSystemPromptText("")
+        viewModel.selectSystemPromptOption("Second")
+        viewModel.selectSystemPromptOption("First")
+        viewModel.flushPendingSettingsSave()
+
+        XCTAssertEqual(viewModel.settings.systemPrompt, "")
+        XCTAssertNil(viewModel.settings.effectiveSystemPrompt())
+        XCTAssertEqual(try fixture.repository.loadSettings().systemPromptPresets(), [
+            SystemPromptPreset(name: "First", prompt: ""),
+            SystemPromptPreset(name: "Second", prompt: "Other")
+        ])
+    }
+
+    @MainActor
+    func testAutomaticPromptNamingAndDuplicateRenamePreserveBothPresets() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.updateSystemPromptText("First body")
+        let firstName = viewModel.settings.selectedSystemPromptPreset!
+        viewModel.selectSystemPromptOption(SettingsViewModel.newSystemPromptSelection)
+        viewModel.updateSystemPromptText("Second body")
+        let secondName = viewModel.settings.selectedSystemPromptPreset!
+        XCTAssertNotEqual(firstName, secondName)
+        viewModel.updateSystemPromptName(firstName)
+        viewModel.updateSystemPromptText("Updated second body")
+        XCTAssertNotNil(viewModel.systemPromptPresetValidationMessage)
+        XCTAssertEqual(viewModel.settings.selectedSystemPromptPreset, secondName)
+        XCTAssertEqual(viewModel.systemPromptPresets.first?.prompt, "First body")
+        XCTAssertEqual(viewModel.systemPromptPresets.last?.prompt, "Updated second body")
+        viewModel.updateSystemPromptName("Renamed")
+        viewModel.flushPendingSettingsSave()
+        XCTAssertNil(viewModel.systemPromptPresetValidationMessage)
+        XCTAssertEqual(try fixture.repository.loadSettings().selectedSystemPromptPreset, "Renamed")
+    }
+
+    @MainActor
+    func testAutoSavePersistsSettingsAfterDebounce() async throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.isStreamingEnabled.toggle()
+        let expected = viewModel.settings.isStreamingEnabled
+
+        let saved = expectation(for: NSPredicate { _, _ in
+            (try? fixture.repository.loadSettings().isStreamingEnabled) == expected
+        }, evaluatedWith: nil)
+        await fulfillment(of: [saved], timeout: 2)
+
+        XCTAssertEqual(
+            try fixture.repository.loadSettings().isStreamingEnabled,
+            expected
+        )
+    }
+
+    @MainActor
+    func testAutoSavePersistsApiKeyDraftAfterDebounce() async throws {
+        let fixture = try makeFixture()
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENROUTER"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.apiKeyDraft = "auto-saved-key"
+
+        let saved = expectation(for: NSPredicate { _, _ in
+            (try? fixture.credentials.credential(for: .openRouter)) == "auto-saved-key"
+        }, evaluatedWith: nil)
+        await fulfillment(of: [saved], timeout: 2)
+
+        XCTAssertEqual(try fixture.credentials.credential(for: .openRouter), "auto-saved-key")
+    }
+
+    @MainActor
+    func testCredentialSaveFailureRollsBackSettingsAndKeepsDraftForRetry() throws {
+        let fixture = try makeFixture()
+        var original = try fixture.repository.loadSettings()
+        original.apiProvider = "OPENROUTER"
+        original.themeMode = "LIGHT"
+        try fixture.repository.saveSettings(original)
+        try fixture.credentials.setCredential("old-key", for: .openRouter)
+        try fixture.credentials.saveSecret("old-mcp-token", key: AppConstants.alibabaMCPAuthorizationTokenKey)
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.themeMode = "DARK"
+        viewModel.apiKeyDraft = "new-key"
+        viewModel.alibabaMCPAuthorizationTokenInput = "new-mcp-token"
+        fixture.credentials.failingKey = "provider_key_OPENROUTER"
+
+        viewModel.saveSettings()
+
+        XCTAssertNotNil(viewModel.errorMessage)
+        XCTAssertNil(viewModel.statusMessage)
+        XCTAssertEqual(try fixture.repository.loadSettings().themeMode, "LIGHT")
+        XCTAssertEqual(try fixture.credentials.credential(for: .openRouter), "old-key")
+        XCTAssertEqual(try fixture.credentials.readSecret(key: AppConstants.alibabaMCPAuthorizationTokenKey), "old-mcp-token")
+        XCTAssertEqual(viewModel.apiKeyDraft, "new-key")
+
+        fixture.credentials.failingKey = nil
+        viewModel.saveSettings()
+
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(try fixture.repository.loadSettings().themeMode, "DARK")
+        XCTAssertEqual(try fixture.credentials.credential(for: .openRouter), "new-key")
+        XCTAssertEqual(try fixture.credentials.readSecret(key: AppConstants.alibabaMCPAuthorizationTokenKey), "new-mcp-token")
+    }
+
+    @MainActor
+    func testOpenCodeGoUsageRefreshPersistsVisibleDraftBeforeRequest() async throws {
+        let client = SettingsOpenCodeGoUsageHTTPClient()
+        let fixture = try makeFixture(openCodeGoUsageHTTPClient: client)
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "OPENCODE_GO"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.apiKeyDraft = "new-visible-key"
+
+        await viewModel.retrieveOpenCodeGoUsage(apiKey: viewModel.apiKeyDraft)
+
+        XCTAssertEqual(try fixture.credentials.credential(for: .openCodeGo), "new-visible-key")
+        XCTAssertEqual(client.requests.first?.headers["Authorization"], "Bearer new-visible-key")
+        XCTAssertEqual(viewModel.openCodeGoUsageStatus?.weekly.usedPercent, 40)
+        XCTAssertNotNil(viewModel.openCodeGoUsageLastUpdated)
+        XCTAssertNil(viewModel.openCodeGoUsageError)
+    }
+
+    @MainActor
+    func testModelsDevOpenCodeGoUsageUsesCatalogIdentityAndCredentialKey() async throws {
+        let client = SettingsOpenCodeGoUsageHTTPClient()
+        let fixture = try makeFixture(openCodeGoUsageHTTPClient: client)
+        var settings = try fixture.repository.loadSettings()
+        settings.apiProvider = "MODELS_DEV:opencode-go"
+        try fixture.repository.saveSettings(settings)
+
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+
+        XCTAssertTrue(ModelsDevMergedProvider.isOpenCodeGo(viewModel.settings.apiProvider))
+
+        await viewModel.retrieveOpenCodeGoUsage(apiKey: "catalog-visible-key")
+
+        let fieldKey = ModelsDevReasoningPreference.fieldKey(
+            providerID: "opencode-go",
+            fieldName: "OPENCODE_API_KEY"
+        )
+        XCTAssertEqual(try fixture.credentials.readSecret(key: fieldKey), "catalog-visible-key")
+        XCTAssertNil(try fixture.credentials.credential(for: .openCodeGo))
+        XCTAssertEqual(client.requests.first?.headers["Authorization"], "Bearer catalog-visible-key")
+        XCTAssertEqual(viewModel.openCodeGoUsageStatus?.monthly.usedPercent, 43)
+    }
+
+    @MainActor
+    func testSaveSettingsRejectsInvalidAlibabaMCPURLWhenEnabled() throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.alibabaMCPEnabled = true
+        viewModel.settings.themeMode = "DARK"
+        viewModel.setAlibabaMCPServerURL("http://example.com/mcp")
+
+        viewModel.saveSettings()
+
+        XCTAssertEqual(viewModel.errorMessage, L10n.text("Remote MCP URL に有効な https:// URL を入力してください。"))
+        XCTAssertFalse(try fixture.repository.loadSettings().alibabaMCPEnabled)
+        XCTAssertEqual(try fixture.repository.loadSettings().themeMode, "DARK")
+    }
+
+    @MainActor
+    func testInvalidMCPDraftSurvivesItsOwnSaveObservation() async throws {
+        let fixture = try makeFixture()
+        let viewModel = SettingsViewModel()
+        viewModel.bind(repository: fixture.repository, credentialStore: fixture.credentials)
+        viewModel.settings.alibabaMCPEnabled = true
+        viewModel.setAlibabaMCPServerURL("http://example.com/mcp")
+
+        viewModel.flushPendingSettingsSave()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(viewModel.settings.alibabaMCPServerURL, "http://example.com/mcp")
+        XCTAssertTrue(viewModel.settings.alibabaMCPEnabled)
+        XCTAssertFalse(try fixture.repository.loadSettings().alibabaMCPEnabled)
+        XCTAssertEqual(viewModel.errorMessage, L10n.text("Remote MCP URL に有効な https:// URL を入力してください。"))
+    }
+
+    private func makeFixture(
+        openCodeGoUsageHTTPClient: HTTPClientProtocol? = nil,
+        credentials: SettingsViewModelCredentialStore = SettingsViewModelCredentialStore(),
+        codexAuthRepository: CodexAuthRepository? = nil,
+        superGrokAuthRepository: SuperGrokAuthRepository? = nil,
+        modelsDevCatalogRepository: ModelsDevCatalogRepository? = nil
+    ) throws -> (repository: ChatRepository, credentials: SettingsViewModelCredentialStore) {
+        let dbQueue = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(dbQueue)
+
+        let settings = SettingsRepository(dbQueue: dbQueue)
+        let conversations = ConversationRepository(dbQueue: dbQueue)
+        let usageRepository = openCodeGoUsageHTTPClient.map {
+            OpenCodeGoUsageRepository(httpClient: $0)
+        }
+        let repository = ChatRepositoryTestSupport.makeRepository(
+            dbQueue: dbQueue,
+            settings: settings,
+            conversations: conversations,
+            credentials: credentials,
+            modelsDevCatalogRepository: modelsDevCatalogRepository,
+            codexAuthRepository: codexAuthRepository,
+            superGrokAuthRepository: superGrokAuthRepository,
+            openCodeGoUsageRepository: usageRepository
+        )
+
+        return (repository, credentials)
+    }
+
+    private static let modelsDevGeminiFixture = #"""
+    {"providers":{
+      "other":{"name":"Other","npm":"@ai-sdk/openai-compatible","models":{
+        "other-model":{"name":"Other Model","modalities":{"output":["text"]}}
+      }},
+      "google":{"name":"Google Generative AI","npm":"@ai-sdk/google","models":{
+        "gemini-model-from-models-dev":{"name":"Gemini from models.dev","modalities":{"output":["text"]}}
+      }}
+    }}
+    """#
+}
+
+private actor SettingsChatGPTCatalogGate {
+    private var firstRequest: CheckedContinuation<Void, Never>?
+    private var startedWaiter: CheckedContinuation<Void, Never>?
+    private var requestCount = 0
+
+    func fetchCount() -> Int { requestCount }
+
+    func fetch() async throws -> [PiCodexModel] {
+        requestCount += 1
+        if requestCount == 1 {
+            await withCheckedContinuation { continuation in
+                firstRequest = continuation
+                startedWaiter?.resume()
+                startedWaiter = nil
+            }
+            return [PiCodexModel(id: "old-model", name: "Old", supported: true)]
+        }
+        return [PiCodexModel(id: "new-model", name: "New", supported: true)]
+    }
+
+    func waitUntilStarted() async {
+        if firstRequest != nil { return }
+        await withCheckedContinuation { startedWaiter = $0 }
+    }
+
+    func resume() {
+        firstRequest?.resume()
+        firstRequest = nil
+    }
+}
+
+private final class SettingsChatGPTCatalogURLProtocol: URLProtocol {
+    static let fixture = #"""
+    {"providers":{"openai":{"name":"OpenAI","npm":"@ai-sdk/openai","api":"https://api.openai.com/v1","models":{
+      "gpt-6.1-sol":{"name":"GPT-6.1 Sol","reasoning":true,"tool_call":true,
+        "reasoning_options":[{"type":"effort","values":["low","medium","high","max"]}],
+        "modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":1050000,"output":128000}}
+    }}}}
+    """#
+
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "models.dev" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(Self.fixture.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+private actor SettingsCatalogFailureMode {
+    private var failing = false
+    private var pending: CheckedContinuation<Void, Never>?
+    private var started: CheckedContinuation<Void, Never>?
+    func fail() { failing = true }
+    func check() async throws {
+        guard failing else { return }
+        await withCheckedContinuation { continuation in
+            pending = continuation
+            started?.resume()
+            started = nil
+        }
+        throw URLError(.timedOut)
+    }
+    func waitUntilStarted() async {
+        if pending != nil { return }
+        await withCheckedContinuation { started = $0 }
+    }
+    func resume() {
+        pending?.resume()
+        pending = nil
+    }
+}

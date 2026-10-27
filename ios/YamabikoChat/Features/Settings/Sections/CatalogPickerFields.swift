@@ -1,0 +1,318 @@
+import SwiftUI
+
+struct CatalogProviderPickerField: View {
+    @Binding var providerID: String
+    private let catalogProviders: [CatalogProviderOption]
+    var title: String = "API Provider"
+    var excludedProviderIDs: Set<String> = []
+    @State private var isProviderPickerPresented = false
+
+    init(
+        providerID: Binding<String>,
+        catalogProviders: [CatalogProvider],
+        title: String = "API Provider",
+        excludedProviderIDs: Set<String> = []
+    ) {
+        _providerID = providerID
+        self.catalogProviders = catalogProviders.map(CatalogProviderOption.init)
+        self.title = title
+        self.excludedProviderIDs = excludedProviderIDs
+    }
+
+    private var selectedLabel: String {
+        if let builtIn = ProviderCatalog.options.first(where: { $0.key == providerID.uppercased() }) { return builtIn.title }
+        let reference = ProviderReference(persistedID: providerID)
+        return catalogProviders.first(where: { $0.id == reference.modelsDevID })?.name ?? providerID
+    }
+
+    var body: some View {
+        Button {
+            isProviderPickerPresented = true
+        } label: {
+            HStack {
+                Text(L10n.text(title))
+                Spacer()
+                Text(selectedLabel).foregroundStyle(Color(uiColor: .amoledSecondaryLabel)).lineLimit(1)
+                Image(systemName: "chevron.forward")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("provider-picker-field")
+        .sheet(isPresented: $isProviderPickerPresented) {
+            NavigationStack {
+                CatalogProviderListView(
+                    selectedProviderID: providerID,
+                    catalogProviders: catalogProviders,
+                    excludedProviderIDs: excludedProviderIDs,
+                    onSelect: { providerID = $0 }
+                )
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            isProviderPickerPresented = false
+                        } label: {
+                            Image(systemName: "chevron.backward")
+                        }
+                        .accessibilityLabel(Text(L10n.text("戻る")))
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct CatalogProviderOption: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let persistedID: String
+
+    init(_ provider: CatalogProvider) {
+        id = provider.id
+        name = provider.name
+        persistedID = provider.reference.persistedID
+    }
+
+    func matches(_ query: String) -> Bool {
+        let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty || id.localizedCaseInsensitiveContains(value) || name.localizedCaseInsensitiveContains(value)
+    }
+}
+
+struct CatalogProviderListView: View {
+    @Environment(\.dismiss) private var dismiss
+    let selectedProviderID: String
+    let catalogProviders: [CatalogProviderOption]
+    var excludedProviderIDs: Set<String> = []
+    var dismissOnSelection = true
+    var title = "プロバイダー"
+    let onSelect: (String) -> Void
+    @State private var query = ""
+
+    private var filteredBuiltIns: [ProviderDisplay] {
+        ProviderCatalog.options.filter {
+            !excludedProviderIDs.contains($0.key.uppercased()) &&
+            (query.isEmpty || $0.key.localizedCaseInsensitiveContains(query) || $0.title.localizedCaseInsensitiveContains(query))
+        }
+    }
+
+    private var filteredCatalog: [CatalogProviderOption] {
+        catalogProviders.filter { provider in
+            !excludedProviderIDs.contains(provider.persistedID.uppercased()) &&
+            ModelsDevMergedProvider.isSelectableCatalogProvider(provider.id) && provider.matches(query)
+        }
+    }
+
+    var body: some View {
+        AMOLEDList {
+            Section("YamabikoChat") {
+                ForEach(filteredBuiltIns) { provider in providerRow(provider.key, provider.title, nil) }
+            }
+            Section {
+                ForEach(filteredCatalog) { provider in
+                    providerRow(provider.persistedID, provider.name, provider.id)
+                }
+            }
+        }
+        .overlay {
+            if filteredBuiltIns.isEmpty && filteredCatalog.isEmpty {
+                ContentUnavailableView.search(text: query)
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .pinnedListSearch(text: $query, prompt: L10n.text("プロバイダーを検索"))
+    }
+
+    @ViewBuilder
+    private func providerRow(_ id: String, _ title: String, _ subtitle: String?) -> some View {
+        Button {
+            onSelect(id)
+            if dismissOnSelection { dismiss() }
+        } label: {
+            HStack {
+                VStack(alignment: .leading) {
+                    Text(title)
+                    if let subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary) }
+                }
+                Spacer()
+                if selectedProviderID.caseInsensitiveCompare(id) == .orderedSame { Image(systemName: "checkmark") }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("provider-row-\(id)")
+    }
+}
+
+struct CatalogModelPickerField: View {
+    @Binding var modelID: String
+    let provider: CatalogProvider
+    var title: String = "Model"
+
+    private var selectedLabel: String {
+        provider.models.first(where: { $0.id == modelID })?.name ?? (modelID.isEmpty ? "モデルを選択" : modelID)
+    }
+
+    var body: some View {
+        NavigationLink {
+            CatalogModelListView(modelID: $modelID, provider: provider)
+        } label: {
+            HStack {
+                Text(L10n.text(title))
+                Spacer()
+                Text(selectedLabel).foregroundStyle(Color(uiColor: .amoledSecondaryLabel)).lineLimit(1)
+            }
+        }
+    }
+}
+
+struct ModelsDevReasoningEffortPicker: View {
+    let model: CatalogModel
+    let currentEffort: String
+    let onChange: (String) -> Void
+    let title: String?
+
+    @State private var selection: String
+
+    init(
+        model: CatalogModel,
+        currentEffort: String,
+        onChange: @escaping (String) -> Void,
+        title: String? = nil
+    ) {
+        self.model = model
+        self.currentEffort = currentEffort
+        self.onChange = onChange
+        self.title = title
+        let normalized = currentEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        _selection = State(initialValue: normalized)
+    }
+
+    var body: some View {
+        Picker(selection: Binding(
+            get: { selection },
+            set: { value in
+                selection = value
+                onChange(value)
+            }
+        )) {
+            Text("プロバイダー既定").tag("")
+            if !selection.isEmpty, !model.supportedReasoningEfforts.contains(selection) {
+                Text(L10n.format("%@（現在は非対応）", selection)).tag(selection)
+            }
+            ForEach(model.supportedReasoningEfforts, id: \.self) { effort in
+                Text(effort).tag(effort)
+            }
+        } label: {
+            Text(title ?? L10n.text("Reasoning Effort"))
+        }
+        .onChange(of: currentEffort) { _, value in
+            selection = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+    }
+}
+
+struct CatalogModelListView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var modelID: String
+    let provider: CatalogProvider
+    var dismissOnSelection = true
+    var title: String? = nil
+    @State private var query = ""
+    @State private var resolutions: [String: PiModelResolution] = [:]
+    @State private var resolutionError: String?
+
+    private var filtered: [CatalogModel] { provider.models.filter { $0.matches(query) } }
+
+    var body: some View {
+        List(filtered) { model in
+            let resolution = resolutions[model.id]
+            Button {
+                modelID = model.id
+                if dismissOnSelection { dismiss() }
+            } label: {
+                ModelSelectionRow(
+                    name: model.name,
+                    isSelected: model.id == modelID,
+                    unavailableReason: resolution?.supported == false ? unsupportedReason(resolution?.reason) : nil
+                )
+            }
+            .buttonStyle(.plain)
+            .listRowSeparator(.visible)
+            .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+            .disabled(resolution?.supported != true)
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Color(uiColor: .amoledSystemGroupedBackground))
+        .overlay {
+            if filtered.isEmpty { ContentUnavailableView.search(text: query) }
+        }
+        .navigationTitle(title ?? provider.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .pinnedListSearch(text: $query, prompt: L10n.text("モデルを検索"))
+        .task(id: "\(provider.id):\(provider.models.count)") {
+            do {
+                let configs = provider.models.map { model in
+                    PiAgentConfiguration(
+                        provider: provider.id,
+                        model: provider.id == "opencode-go"
+                            ? OpenCodeGoModelCatalog.normalizedModelID(model.id)
+                            : model.id,
+                        apiKey: nil,
+                        catalogContract: PiCatalogModelContract(
+                            providerName: provider.name,
+                            npm: model.providerContract?.npm,
+                            api: model.providerContract?.api,
+                            shape: model.providerContract?.shape,
+                            toolCall: model.toolCall,
+                            provenance: model.providerContract?.provenance,
+                            name: model.name,
+                            reasoning: model.reasoning,
+                            input: model.inputModalities,
+                            contextWindow: model.limits.context,
+                            maxTokens: model.limits.output,
+                            reasoningEfforts: model.supportedReasoningEfforts
+                        )
+                    )
+                }
+                let values = try await PiAgentRuntime.shared.resolveModels(configs)
+                resolutions = Dictionary(uniqueKeysWithValues: zip(provider.models.map(\.id), values))
+                resolutionError = nil
+            } catch {
+                resolutions = [:]
+                resolutionError = error.localizedDescription
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if let resolutionError {
+                Text("Piモデル契約を確認できません: \(resolutionError)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(8)
+            }
+        }
+    }
+
+    private func unsupportedReason(_ reason: String?) -> String {
+        switch reason {
+        case "pi_provider_missing": "Piにプロバイダー定義がありません"
+        case "pi_provider_ambiguous": "models.devとPiのプロバイダー対応を一意に特定できません"
+        case "model_operation_unsupported": "埋め込み専用モデルのため会話には使用できません"
+        case "pi_model_missing": "Piにモデル定義がありません"
+        case "pi_protocol_missing": "Piにこのモデルのプロトコル定義がありません"
+        case "protocol_conflict": "models.devとPiのプロトコルが一致しません"
+        case "endpoint_conflict": "models.devとPiのエンドポイントが一致しません"
+        case "catalog_contract_ambiguous": "models.devのモデル実行契約を一意に特定できません"
+        case "catalog_contract_incomplete": "公式カタログのモデル実行契約が不完全です"
+        case "contract_conflict": "models.devとPiの実行契約が一致しません"
+        case "runtime_contract_mismatch": "アプリとPi Runtimeの契約バージョンが一致しません"
+        default: "実行契約を確認できません"
+        }
+    }
+}

@@ -1,0 +1,313 @@
+import XCTest
+import GRDB
+import ZIPFoundation
+@testable import YamabikoChat
+
+final class ConversationExportTests: XCTestCase {
+    func testStartupCleanupRemovesAbandonedZipAndStagingCopies() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("YamabikoChatExports", isDirectory: true)
+        let staging = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try ProtectedFileStorage.createDirectory(staging)
+        try ProtectedFileStorage.write(Data("private export".utf8), to: root.appendingPathComponent("abandoned.zip"))
+        try ProtectedFileStorage.write(Data("private staged export".utf8), to: staging.appendingPathComponent("conversation.json"))
+        try ConversationExportService.removeAbandonedExports()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        try ConversationExportService.removeAbandonedExports()
+    }
+    func testHistoricalFusionDiagnosticsRemainExportable() throws {
+        let database = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(database)
+        let repository = ConversationRepository(dbQueue: database)
+        let conversationID = try repository.createConversation(
+            title: "Historical", model: "saved-model", provider: "OPENAI", systemPrompt: nil
+        )
+        let trace = #"{"panelResults":[{"modelId":"saved-model","toolActivity":{"attachmentPaths":["/tmp/historical.txt"]},"piExecution":{"phase":"panel"}}],"judgeResult":{"piExecutions":[{"phase":"judge"}]},"synthesisResult":{"piExecution":{"phase":"synthesis"}},"finalAnswer":"Saved answer"}"#
+        try database.write { db in
+            try db.execute(
+                sql: "INSERT INTO fusion_traces (id, conversationId, preset, startedAtMs, failedModelsJSON, traceJSON, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                arguments: ["historical", conversationID, "custom", 1, "[]", trace, "completed"]
+            )
+        }
+        let snapshot = try repository.fetchDebugExport(conversationId: conversationID)
+        XCTAssertEqual(snapshot.fusionTraces.first?.traceJSON, trace)
+        XCTAssertEqual(snapshot.referencedFilePaths, ["/tmp/historical.txt"])
+        XCTAssertEqual(snapshot.piExecutions.map(\.source), ["fusion-panel", "fusion-judge", "fusion-synthesis"])
+    }
+
+    func testDebugExportIncludesPiHistoryToolTranscriptMetricsAndFiles() throws {
+        let dbQueue = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(dbQueue)
+        let repository = ConversationRepository(dbQueue: dbQueue)
+        let conversationID = try repository.createConversation(
+            title: "Debug / Chat",
+            model: "test-model",
+            provider: "TEST",
+            systemPrompt: "system instructions"
+        )
+
+        let sourceDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sourceDirectory) }
+        let attachmentURL = sourceDirectory.appendingPathComponent("input.txt")
+        try Data("attachment body".utf8).write(to: attachmentURL)
+        let toolOutputURL = sourceDirectory.appendingPathComponent("chart.svg")
+        try Data("<svg>chart</svg>".utf8).write(to: toolOutputURL)
+        let attachmentJSON = String(
+            decoding: try JSONEncoder().encode([attachmentURL.path]),
+            as: UTF8.self
+        )
+
+        _ = try repository.insertMessage(
+            ChatMessage(
+                conversationId: conversationID,
+                role: "user",
+                text: "question",
+                attachmentsJSON: attachmentJSON,
+                createdAtMs: 1
+            )
+        )
+        let assistantID = try repository.insertMessage(
+            ChatMessage(conversationId: conversationID, role: "model", text: "answer", createdAtMs: 2)
+        )
+        try repository.saveThinking(messageId: assistantID, stream: "reasoning")
+
+        let call = ToolCall(id: "call-1", name: PythonExecuteTool.name, argumentsJSON: #"{"code":"print(42)"}"#)
+        let execution: JSONValue = .object([
+            "format": .string("yamabiko.pi-agent-execution"),
+            "version": .number(4),
+            "state": .object([
+                "messages": .array([
+                    .object(["role": .string("user"), "content": .string("question")]),
+                    .object(["role": .string("assistant"), "content": .string("answer")])
+                ])
+            ]),
+            "providerRequests": .array([
+                .object(["step": .number(1), "payload": .object(["model": .string("test-model")])])
+            ]),
+            "events": .array([
+                .object([
+                    "seq": .number(0),
+                    "time": .number(11),
+                    "event": .object(["type": .string("turn_start")])
+                ]),
+                .object([
+                    "seq": .number(1),
+                    "time": .number(19),
+                    "event": .object(["type": .string("turn_end")])
+                ])
+            ])
+        ])
+        try repository.saveToolActivity(
+            messageId: assistantID,
+            variantId: nil,
+            payload: ToolActivityPayload(
+                steps: [],
+                providerTranscript: [
+                    ProviderRequestMessage(role: "assistant", content: "", toolCalls: [call]),
+                    ProviderRequestMessage(
+                        role: "tool",
+                        content: #"{"stdout":"42"}"#,
+                        toolCallId: call.id,
+                        toolName: call.name,
+                        toolResultIsError: false
+                    )
+                ],
+                attachmentPaths: [toolOutputURL.path],
+                piExecution: execution
+            )
+        )
+        try repository.appendAttachments(messageId: assistantID, paths: [toolOutputURL.path])
+        try repository.insertTokenUsage(
+            TokenUsageRecord(
+                provider: "TEST",
+                model: "test-model",
+                conversationId: conversationID,
+                inputTokens: 10,
+                outputTokens: 4,
+                totalTokens: 14
+            )
+        )
+        try repository.insertExecutionMetric(
+            ConversationExecutionMetric(
+                conversationId: conversationID,
+                turnId: "turn-1",
+                kind: .llm,
+                startedAtMs: 10,
+                firstTokenAtMs: 12,
+                completedAtMs: 20,
+                succeeded: true,
+                inputTokens: 10,
+                outputTokens: 4,
+                cachedInputTokens: 0,
+                cacheCreationInputTokens: 0
+            )
+        )
+
+        let snapshot = try repository.fetchDebugExport(conversationId: conversationID)
+        XCTAssertEqual(snapshot.messages.count, 2)
+        XCTAssertEqual(snapshot.messages[1].thinkingStream, "reasoning")
+        XCTAssertEqual(snapshot.messages[1].toolActivity?.providerTranscript.count, 2)
+        XCTAssertEqual(snapshot.messages[1].toolActivity?.attachmentPaths, [toolOutputURL.path])
+        XCTAssertEqual(snapshot.messages[1].toolActivity?.piExecution, execution)
+        XCTAssertEqual(snapshot.tokenUsageRecords.first?.totalTokens, 14)
+        XCTAssertEqual(snapshot.executionMetrics.first?.turnId, "turn-1")
+
+        let archiveURL = try ConversationExportService.createArchive(snapshot: snapshot, mode: .fullDiagnostics)
+        XCTAssertEqual(try archiveURL.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        defer { try? FileManager.default.removeItem(at: archiveURL) }
+        XCTAssertEqual(archiveURL.pathExtension, "zip")
+
+        let extractedURL = sourceDirectory.appendingPathComponent("extracted", isDirectory: true)
+        try FileManager.default.unzipItem(at: archiveURL, to: extractedURL)
+        let data = try Data(contentsOf: extractedURL.appendingPathComponent("conversation.json"))
+        let decoded = try JSONDecoder().decode(ConversationDebugExport.self, from: data)
+        XCTAssertNil(decoded.messages[1].toolActivity?.piExecution)
+        XCTAssertTrue(decoded.piExecutions.isEmpty)
+        XCTAssertEqual(decoded.files.count, 2)
+        XCTAssertTrue(decoded.files.allSatisfy { $0.status == .included })
+        let attachmentRecord = try XCTUnwrap(
+            decoded.files.first { $0.originalPath == attachmentURL.path }
+        )
+        let archivedPath = try XCTUnwrap(attachmentRecord.archivePath)
+        XCTAssertEqual(
+            try String(contentsOf: extractedURL.appendingPathComponent(archivedPath), encoding: .utf8),
+            "attachment body"
+        )
+        let toolOutputRecord = try XCTUnwrap(
+            decoded.files.first { $0.originalPath == toolOutputURL.path }
+        )
+        let toolOutputArchivePath = try XCTUnwrap(toolOutputRecord.archivePath)
+        XCTAssertEqual(
+            try String(contentsOf: extractedURL.appendingPathComponent(toolOutputArchivePath), encoding: .utf8),
+            "<svg>chart</svg>"
+        )
+        let manifestData = try Data(
+            contentsOf: extractedURL.appendingPathComponent("sessions/manifest.json")
+        )
+        let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [[String: Any]]
+        XCTAssertEqual(manifest?.count, 1)
+        XCTAssertEqual(manifest?.first?["eventCount"] as? Int, 2)
+        let sessionPath = try XCTUnwrap(manifest?.first?["archivePath"] as? String)
+        XCTAssertTrue(sessionPath.hasSuffix("execution.json"))
+        let sessionData = try Data(contentsOf: extractedURL.appendingPathComponent(sessionPath))
+        XCTAssertEqual(try JSONDecoder().decode(JSONValue.self, from: sessionData), execution)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: extractedURL.appendingPathComponent(sessionPath).deletingLastPathComponent()
+                .appendingPathComponent("session.jsonl").path
+        ))
+
+        let standardArchiveURL = try ConversationExportService.createArchive(snapshot: snapshot, mode: .standard)
+        defer { try? FileManager.default.removeItem(at: standardArchiveURL) }
+        let standardExtractedURL = sourceDirectory.appendingPathComponent("standard-extracted", isDirectory: true)
+        try FileManager.default.unzipItem(at: standardArchiveURL, to: standardExtractedURL)
+        let standardData = try Data(contentsOf: standardExtractedURL.appendingPathComponent("conversation.json"))
+        let standard = try JSONDecoder().decode(ConversationDebugExport.self, from: standardData)
+        XCTAssertEqual(standard.format, "yamabiko-chat-export")
+        XCTAssertNil(standard.messages[1].thinkingStream)
+        XCTAssertNil(standard.messages[1].toolActivity)
+        XCTAssertTrue(standard.tokenUsageRecords.isEmpty)
+        XCTAssertTrue(standard.executionMetrics.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: standardExtractedURL.appendingPathComponent("sessions").path))
+    }
+
+    func testExportFailsWhenAReferencedFileIsMissing() throws {
+        let dbQueue = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(dbQueue)
+        let repository = ConversationRepository(dbQueue: dbQueue)
+        let conversationID = try repository.createConversation(
+            title: "Missing attachment",
+            model: "test-model",
+            provider: "TEST",
+            systemPrompt: ""
+        )
+        let missingPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .path
+        let attachmentsJSON = String(
+            decoding: try JSONEncoder().encode([missingPath]),
+            as: UTF8.self
+        )
+        _ = try repository.insertMessage(
+            ChatMessage(
+                conversationId: conversationID,
+                role: "user",
+                text: "question",
+                attachmentsJSON: attachmentsJSON
+            )
+        )
+
+        let snapshot = try repository.fetchDebugExport(conversationId: conversationID)
+        XCTAssertThrowsError(try ConversationExportService.createArchive(snapshot: snapshot)) { error in
+            guard case let ConversationExportError.referencedFileUnavailable(path) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, missingPath)
+        }
+    }
+
+    func testPiDiagnosticMigrationRemovesRepeatedPayloadsButKeepsTranscript() throws {
+        let dbQueue = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(dbQueue, upTo: "v28_enable_python_for_pcc")
+        let repository = ConversationRepository(dbQueue: dbQueue)
+        let conversationID = try repository.createConversation(
+            title: "Storage migration", model: "test-model", provider: "TEST", systemPrompt: ""
+        )
+        let messageID = try repository.insertMessage(
+            ChatMessage(conversationId: conversationID, role: "model", text: "saved answer")
+        )
+        let repeatedImage = String(repeating: "a", count: 16_000)
+        let execution: JSONValue = .object([
+            "format": .string("yamabiko.pi-agent-execution"),
+            "version": .number(2),
+            "request": .object(["image": .string(repeatedImage)]),
+            "state": .object([
+                "messages": .array([.object(["image": .string(repeatedImage)])]),
+                "model": .object(["id": .string("test-model")])
+            ]),
+            "providerRequests": .array([.object(["payload": .string(repeatedImage)])]),
+            "events": .array([]),
+            "resolution": .object(["api": .string("test-api")])
+        ])
+        try repository.saveToolActivity(
+            messageId: messageID, variantId: nil,
+            payload: ToolActivityPayload(
+                providerTranscript: [ProviderRequestMessage(role: "assistant", content: "tool replay")],
+                piExecution: execution
+            )
+        )
+        let trace = "{\"panelResults\":[{\"piExecution\":\(String(decoding: try JSONEncoder().encode(execution), as: UTF8.self))}]}"
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "INSERT INTO fusion_traces (id, preset, startedAtMs, failedModelsJSON, traceJSON, status) VALUES (?, ?, ?, ?, ?, ?)",
+                arguments: ["size-audit", "test", 1, "[]", trace, "completed"]
+            )
+        }
+
+        try AppDatabase.migrator.migrate(dbQueue)
+        let saved = try repository.fetchFullMessage(id: messageID)
+        XCTAssertEqual(saved?.message.text, "saved answer")
+        XCTAssertEqual(saved?.toolActivity?.providerTranscript?.first?.content, "tool replay")
+        let compacted = try XCTUnwrap(saved?.toolActivity?.piExecution)
+        guard case let .object(snapshot) = compacted,
+              case let .object(state)? = snapshot["state"] else {
+            return XCTFail("Missing compacted Pi snapshot")
+        }
+        XCTAssertNil(snapshot["request"])
+        XCTAssertNil(snapshot["providerRequests"])
+        XCTAssertNil(snapshot["events"])
+        XCTAssertNil(state["messages"])
+        XCTAssertEqual(state["model"], .object(["id": .string("test-model")]))
+        XCTAssertEqual(snapshot["legacyCompacted"], .number(1))
+        let compactedTrace = try dbQueue.read { db in
+            try String.fetchOne(db, sql: "SELECT traceJSON FROM fusion_traces WHERE id = 'size-audit'")
+        }
+        let traceObject = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(try XCTUnwrap(compactedTrace).utf8)
+        ) as? [String: Any])
+        let panels = try XCTUnwrap(traceObject["panelResults"] as? [[String: Any]])
+        let panelSnapshot = try XCTUnwrap(panels.first?["piExecution"] as? [String: Any])
+        XCTAssertNil(panelSnapshot["request"])
+        XCTAssertNil(panelSnapshot["providerRequests"])
+    }
+}

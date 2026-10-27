@@ -1,0 +1,9 @@
+"share.screen_title" = "YamabikoChat";
+"share.preview_heading" = "Content to import";
+"share.note_placeholder" = "Add a note (optional)";
+"share.primary_button" = "Add to chat";
+"share.cancel_button" = "Cancel";
+"share.loading" = "Loading…";
+"share.empty_preview" = "No content to import";
+"share.import_failed" = "The shared content could not be saved.";
+"share.open_failed" = "YamabikoChat could not be opened. Please try again.";

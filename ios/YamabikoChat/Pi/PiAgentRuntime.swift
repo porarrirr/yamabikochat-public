@@ -1,0 +1,1635 @@
+import Foundation
+import UniformTypeIdentifiers
+import UIKit
+
+private final class PiRuntimeBundleToken: NSObject {}
+
+struct PiAgentConfiguration: Codable, Sendable {
+    var nativePCC: PCCCapability? = nil
+    var contractVersion: Int = 2
+    var provider: String
+    var model: String
+    var apiKey: String?
+    var headers: [String: String] = [:]
+    var env: [String: String] = [:]
+    var customEndpoint: OpenAICompatPreset? = nil
+    var catalogContract: PiCatalogModelContract? = nil
+    var thinkingLevel: String?
+    var mcpAuthorizationToken: String? = nil
+    var subagents: PiSubagentOptions? = nil
+}
+
+struct PiSubagentOptions: Codable, Sendable {
+    var enabled: Bool
+    var defaultModelID: String?
+    var models: [PiSubagentModel]
+}
+
+struct PiSubagentModel: Codable, Sendable {
+    var id: String
+    var name: String
+    var configuration: PiAgentConfiguration?
+    var unsupportedReason: String? = nil
+}
+
+struct PiCatalogModelContract: Codable, Sendable {
+    var providerName: String? = nil
+    var npm: String?
+    var api: String?
+    var shape: String?
+    var toolCall: Bool?
+    var provenance: String? = nil
+    var name: String? = nil
+    var reasoning: Bool? = nil
+    var input: [String]? = nil
+    var contextWindow: Int? = nil
+    var maxTokens: Int? = nil
+    var reasoningEfforts: [String]? = nil
+}
+
+struct PiModelResolution: Codable, Equatable, Sendable {
+    var supportedThinkingLevels: [String]? = nil
+    var supported: Bool
+    var reason: String?
+    var provider: String?
+    var model: String?
+    var api: String?
+    var source: String?
+    var reasoning: Bool?
+    var input: [String]?
+    var contextWindow: Int?
+    var maxTokens: Int?
+    var toolCall: Bool?
+    var message: String?
+}
+
+private struct PiModelResolutionEnvelope: Codable {
+    var models: [PiAgentConfiguration]
+}
+
+private struct PiModelResolutionResponse: Codable {
+    var contractVersion: Int
+    var models: [PiModelResolution]
+}
+
+struct PiCodexModel: Codable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var supported: Bool? = nil
+    var reason: String? = nil
+    var supportedThinkingLevels: [String]? = nil
+}
+
+private struct PiCodexModelResponse: Codable {
+    var contractVersion: Int
+    var models: [PiCodexModel]
+}
+
+private struct PiHealthResponse: Decodable {
+    var ok: Bool
+    var contractVersion: Int
+    var node: String?
+    var runtimeId: String?
+    var startedAtMs: Int64?
+    var uptimeMs: Int64?
+    var activeRuns: Int?
+    var pendingTools: Int?
+    var rssBytes: Int64?
+}
+
+struct PiRuntimeReadinessConfiguration: Sendable {
+    var startupTimeout: Duration = .seconds(30)
+    var resumeTimeout: Duration = .seconds(30)
+    var retryDelay: Duration = .milliseconds(100)
+    var requestTimeout: TimeInterval = 1
+}
+
+protocol PiRuntimeHealthClient: Sendable {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse)
+}
+
+extension URLSession: PiRuntimeHealthClient {}
+
+struct PiStreamCompletionState {
+    private(set) var receivedCompletion = false
+
+    mutating func complete(hasResponse: Bool) throws {
+        guard !receivedCompletion else { throw ProviderClientError.parseFailure("Pi emitted duplicate completion") }
+        guard hasResponse else { throw ProviderClientError.parseFailure("Pi completed without a response") }
+        receivedCompletion = true
+    }
+
+    func finish() throws {
+        guard receivedCompletion else { throw ProviderClientError.parseFailure("Pi stream ended before completion") }
+    }
+}
+
+struct PiAttachment: Codable, Sendable {
+    var data: String
+    var mimeType: String
+}
+
+struct PiMessage: Codable, Sendable {
+    var role: String
+    var content: String
+    var attachments: [PiAttachment]
+    var reasoningContent: String?
+    var toolCalls: [ToolCall]?
+    var toolCallId: String?
+    var toolName: String?
+    var toolResultIsError: Bool?
+    var piMessage: JSONValue?
+}
+
+struct PiRequest: Codable, Sendable {
+    var skillContext: SkillRequestContext?
+    var messages: [PiMessage]
+    var systemPrompt: String?
+    var tools: [ProviderTool]
+    var thinking: ProviderThinkingConfig?
+    var provider: ProviderRoutingConfig?
+    var metadata: [String: String]
+    var timeoutInterval: TimeInterval?
+}
+
+private struct PiRunEnvelope: Codable, Sendable {
+    var runId: String
+    var request: PiRequest
+    var config: PiAgentConfiguration
+}
+
+private struct PiRuntimeEvent: Decodable {
+    var subagent: SubagentRun?
+    var subagentId: String?
+    var pcc: PCCNativeRequest?
+    var type: String
+    var runId: String?
+    var stage: String?
+    var delta: String?
+    var text: String?
+    var message: String?
+    var statusCode: Int?
+    var errorCode: String?
+    var metadata: [String: String]?
+    var requestId: String?
+    var toolCallId: String?
+    var stepId: Int?
+    var timeMs: Int64?
+    var succeeded: Bool?
+    var usage: ProviderUsage?
+    var name: String?
+    var arguments: JSONValue?
+    var response: ProviderResponse?
+    var execution: JSONValue?
+    var url: String?
+    var userCode: String?
+    var verificationUri: String?
+    var credential: JSONValue?
+    var profile: PiOAuthProfile?
+    var registration: JSONValue?
+}
+
+struct PiConversationMetricsCollector {
+    private struct OpenLLMStep {
+        var startedAtMs: Int64
+        var firstTokenAtMs: Int64?
+    }
+
+    private let context: ProviderMetricsContext?
+    private var openLLMSteps: [Int: OpenLLMStep] = [:]
+    private var activeStepID: Int?
+    private var openTools: [String: Int64] = [:]
+
+    init(context: ProviderMetricsContext?) {
+        self.context = context
+    }
+
+    mutating func startLLM(stepID: Int, at timeMs: Int64) {
+        openLLMSteps[stepID] = OpenLLMStep(startedAtMs: timeMs, firstTokenAtMs: nil)
+        activeStepID = stepID
+    }
+
+    mutating func observeToken(at timeMs: Int64) {
+        guard let stepID = activeStepID, openLLMSteps[stepID]?.firstTokenAtMs == nil else { return }
+        openLLMSteps[stepID]?.firstTokenAtMs = timeMs
+    }
+
+    mutating func endLLM(stepID: Int, at timeMs: Int64, succeeded: Bool, usage: ProviderUsage?) {
+        guard let open = openLLMSteps.removeValue(forKey: stepID) else { return }
+        if activeStepID == stepID { activeStepID = nil }
+        guard let context else { return }
+        let normalized = usage?.normalized()
+        context.recorder(
+            ConversationExecutionMetric(
+                conversationId: context.conversationId,
+                turnId: context.turnId,
+                kind: .llm,
+                startedAtMs: open.startedAtMs,
+                firstTokenAtMs: open.firstTokenAtMs,
+                completedAtMs: timeMs,
+                succeeded: succeeded,
+                inputTokens: normalized?.inputTokens,
+                outputTokens: normalized?.outputTokens,
+                cachedInputTokens: normalized?.cachedInputTokens,
+                cacheCreationInputTokens: normalized?.cacheCreationInputTokens,
+                dualSide: context.dualSide
+            )
+        )
+    }
+
+    mutating func closeInterruptedLLMSteps(at timeMs: Int64) {
+        for stepID in openLLMSteps.keys.sorted() {
+            endLLM(stepID: stepID, at: timeMs, succeeded: false, usage: nil)
+        }
+    }
+
+    mutating func startTool(callID: String, at timeMs: Int64) {
+        openTools[callID] = timeMs
+    }
+
+    mutating func endTool(callID: String, at timeMs: Int64, succeeded: Bool) {
+        guard let startedAtMs = openTools.removeValue(forKey: callID), let context else { return }
+        context.recorder(
+            ConversationExecutionMetric(
+                conversationId: context.conversationId,
+                turnId: context.turnId,
+                kind: .tool,
+                startedAtMs: startedAtMs,
+                firstTokenAtMs: nil,
+                completedAtMs: timeMs,
+                succeeded: succeeded,
+                inputTokens: nil,
+                outputTokens: nil,
+                cachedInputTokens: nil,
+                cacheCreationInputTokens: nil,
+                dualSide: context.dualSide
+            )
+        )
+    }
+}
+
+enum PiOAuthProvider: String, Codable, Sendable {
+    case codex
+    case chatgpt
+    case supergrok
+
+    func allowsAuthorizationURL(_ url: URL) -> Bool {
+        let hosts: Set<String> = self == .supergrok ? ["auth.x.ai", "accounts.x.ai"] : ["auth.openai.com"]
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased(), hosts.contains(host),
+              url.user == nil, url.password == nil, url.fragment == nil,
+              url.port == nil || url.port == 443 else { return false }
+        let fields = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        return !fields.contains { ["access_token", "refresh_token", "id_token"].contains($0.name.lowercased()) }
+    }
+}
+
+enum PiOAuthLoginMethod: String, Codable, Sendable {
+    case browser
+    case device
+}
+
+struct PiOAuthProfile: Codable, Equatable, Sendable {
+    var email: String?
+    var planType: String?
+    var accountId: String?
+    var planUsageEnabled: Bool? = nil
+}
+
+struct PiOAuthResolution: Codable, Equatable, Sendable {
+    var credential: JSONValue
+    var accessToken: String
+    var accountId: String?
+    var profile: PiOAuthProfile
+}
+
+private struct PiOAuthLoginRequest: Encodable {
+    var provider: PiOAuthProvider
+    var method: PiOAuthLoginMethod
+    var context: PiChatGPTLoginContext? = nil
+}
+
+private struct PiChatGPTLoginContext: Encodable {
+    var hostId: String
+    var registration: JSONValue?
+}
+
+private struct PiOAuthResolveRequest: Encodable {
+    var provider: PiOAuthProvider
+    var credential: JSONValue
+    var force: Bool
+}
+
+private struct PiChatGPTCatalogRequest: Encodable {
+    var credential: JSONValue
+    var contracts: [String: PiCatalogModelContract]
+}
+
+struct PiToolResultEnvelope: Encodable {
+    var requestId: String
+    var content: String
+    var isError: Bool
+    var status: ToolResultStatus
+    var provenance: ToolResultProvenance?
+    var sources: [ToolSource]
+    var images: [PiAttachment]
+    var imagePaths: [String]
+}
+
+actor PiAgentRuntime {
+    static let shared = PiAgentRuntime()
+
+    private struct HealthCheckFlight {
+        let id: String
+        let context: String
+        let requestID: String
+        let startedAt: Date
+        let task: Task<PiHealthResponse, Error>
+    }
+
+    private var endpoint: URL?
+    private var token: String?
+    private var startupTask: Task<(URL, String), Error>?
+    private var healthCheckFlight: HealthCheckFlight?
+    private var oauthSessions: [String: (Set<String>, URLSession)] = [:]
+    #if DEBUG
+    private var lastHealthyAt: Date?
+    private var activeRunIDs: Set<String> = []
+    private let nativeClientID = UUID().uuidString
+    #endif
+    private let readiness: PiRuntimeReadinessConfiguration
+    private let healthClient: any PiRuntimeHealthClient
+    private let startEngine: @Sendable ([String]) throws -> Void
+
+    init(
+        endpoint: URL? = nil,
+        token: String? = nil,
+        readiness: PiRuntimeReadinessConfiguration = PiRuntimeReadinessConfiguration(),
+        healthClient: any PiRuntimeHealthClient = CredentialHTTPTransport.shared,
+        startEngine: @escaping @Sendable ([String]) throws -> Void = {
+            try PiNodeRunner.startEngine(arguments: $0)
+        }
+    ) {
+        self.endpoint = endpoint
+        self.token = token
+        self.readiness = readiness
+        self.healthClient = healthClient
+        self.startEngine = startEngine
+    }
+
+    func verifyReady() async throws {
+        _ = try await startIfNeeded()
+    }
+
+    /// Synchronizes the native client with an already-started Node runtime after iOS resumes it.
+    /// Node Mobile is a process singleton and cannot safely be started a second time, so a cached
+    /// endpoint must be proven live instead of being replaced with another embedded runtime.
+    func prepareForForeground() async throws {
+        #if DEBUG
+        let requestID = "foreground-\(UUID().uuidString)"
+        let startedAt = Date()
+        var metadata = await Self.runtimeEnvironmentMetadata()
+        metadata.merge(Self.nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+        metadata["activeRuns"] = String(activeRunIDs.count)
+        metadata["cachedEndpoint"] = String(endpoint != nil && token != nil)
+        metadata["nativeClientId"] = nativeClientID
+        metadata["lastHealthyAgeMs"] = lastHealthyAt.map {
+            String(Int(max(0, Date().timeIntervalSince($0)) * 1_000))
+        } ?? "none"
+        DiagnosticsLogger.log(
+            "Pi runtime foreground synchronization requested",
+            category: .network,
+            requestID: requestID,
+            metadata: metadata
+        )
+        guard let endpoint, let token else {
+            DiagnosticsLogger.log(
+                "Pi runtime foreground synchronization skipped before first engine start",
+                category: .network,
+                requestID: requestID,
+                metadata: metadata
+            )
+            return
+        }
+        do {
+            let status = try await waitUntilHealthySingleFlight(
+                endpoint: endpoint,
+                token: token,
+                timeout: readiness.resumeTimeout,
+                context: "foreground",
+                requestID: requestID
+            )
+            DiagnosticsLogger.log(
+                "Pi runtime foreground synchronization completed",
+                category: .network,
+                requestID: requestID,
+                metadata: Self.healthMetadata(status).merging(
+                    ["elapsedMs": String(Int(Date().timeIntervalSince(startedAt) * 1_000))],
+                    uniquingKeysWith: { current, _ in current }
+                )
+            )
+        } catch {
+            var failureMetadata = await Self.runtimeEnvironmentMetadata()
+            failureMetadata.merge(Self.nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+            failureMetadata["activeRuns"] = String(activeRunIDs.count)
+            failureMetadata["elapsedMs"] = String(Int(Date().timeIntervalSince(startedAt) * 1_000))
+            DiagnosticsLogger.log(
+                "Pi runtime foreground synchronization failed",
+                category: .network,
+                requestID: requestID,
+                metadata: failureMetadata,
+                error: error
+            )
+            throw error
+        }
+        #else
+        guard let endpoint, let token else { return }
+        _ = try await waitUntilHealthySingleFlight(
+            endpoint: endpoint,
+            token: token,
+            timeout: readiness.resumeTimeout,
+            context: "foreground"
+        )
+        #endif
+    }
+
+    func resolveModels(_ configurations: [PiAgentConfiguration]) async throws -> [PiModelResolution] {
+        var configurations = configurations
+        if configurations.contains(where: { $0.provider == "apple-pcc" && $0.catalogContract == nil }) {
+            let capability = await PCCProviderClient.capability()
+            for index in configurations.indices where configurations[index].provider == "apple-pcc" && configurations[index].catalogContract == nil {
+                configurations[index].nativePCC = capability
+            }
+        }
+        let (endpoint, token) = try await startIfNeeded()
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/models/resolve"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(PiModelResolutionEnvelope(models: configurations))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderClientError.invalidResponse }
+        let resolved = try JSONDecoder().decode(PiModelResolutionResponse.self, from: data)
+        guard resolved.contractVersion == 2 else {
+            throw ProviderClientError.parseFailure("Pi runtime contract mismatch")
+        }
+        for model in resolved.models {
+            DiagnosticsLogger.log(
+                "Pi model contract resolved",
+                category: .network,
+                metadata: [
+                    "contractVersion": String(resolved.contractVersion),
+                    "supported": String(model.supported),
+                    "provider": model.provider ?? "unknown",
+                    "model": model.model ?? "unknown",
+                    "api": model.api ?? "none",
+                    "source": model.source ?? "none",
+                    "reason": model.reason ?? "none"
+                ]
+            )
+        }
+        return resolved.models
+    }
+
+    func codexModels() async throws -> [PiCodexModel] {
+        let (endpoint, token) = try await startIfNeeded()
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/models/codex"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderClientError.invalidResponse }
+        let catalog = try JSONDecoder().decode(PiCodexModelResponse.self, from: data)
+        guard catalog.contractVersion == 2 else { throw ProviderClientError.parseFailure("Pi runtime contract mismatch") }
+        return catalog.models
+    }
+
+    func chatGPTModels(credentialJSON: String, contracts: [String: PiCatalogModelContract]) async throws -> [PiCodexModel] {
+        let (endpoint, token) = try await startIfNeeded()
+        let credential = try Self.decodeAuthResponse(JSONValue.self, data: Data(credentialJSON.utf8))
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/models/chatgpt"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(PiChatGPTCatalogRequest(credential: credential, contracts: contracts))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw ProviderClientError.parseFailure("ChatGPT model catalog unavailable")
+        }
+        let catalog = try Self.decodeAuthResponse(PiCodexModelResponse.self, data: data)
+        guard catalog.contractVersion == 2 else {
+            throw ProviderClientError.parseFailure("Pi ChatGPT catalog contract mismatch")
+        }
+        return catalog.models
+    }
+
+    func loginChatGPT(
+        hostID: String,
+        registrationJSON: String?,
+        onRegistration: @escaping @Sendable (JSONValue) async throws -> Void
+    ) async throws -> PiOAuthResolution {
+        let registration = try registrationJSON.map { try Self.decodeAuthResponse(JSONValue.self, data: Data($0.utf8)) }
+        return try await loginOAuth(
+            provider: .chatgpt, method: .browser,
+            context: PiChatGPTLoginContext(hostId: hostID, registration: registration),
+            onRegistration: onRegistration
+        )
+    }
+
+    func revokeChatGPT(credentialJSON: String) async throws {
+        try await revokeOAuth(provider: .chatgpt, credentialJSON: credentialJSON)
+    }
+
+    func revokeOAuth(provider: PiOAuthProvider, credentialJSON: String) async throws {
+        guard provider == .chatgpt || provider == .supergrok else { throw ProviderClientError.invalidResponse }
+        cancelOAuthSessions(provider: provider == .chatgpt ? "openai-chatgpt" : "xai-oauth")
+        let (endpoint, token) = try await startIfNeeded()
+        let credential = try Self.decodeAuthResponse(JSONValue.self, data: Data(credentialJSON.utf8))
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/auth/revoke"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(["provider": JSONValue.string(provider.rawValue), "credential": credential])
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw ProviderClientError.parseFailure("OAuth session revocation was not confirmed")
+        }
+    }
+
+    func logoutOAuth(provider: PiOAuthProvider) async throws {
+        guard provider == .supergrok else { throw ProviderClientError.invalidResponse }
+        cancelOAuthSessions(provider: "xai-oauth")
+        guard endpoint != nil || startupTask != nil else { return }
+        let (endpoint, token) = try await startIfNeeded()
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/auth/logout"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(["provider": provider.rawValue])
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ProviderClientError.invalidResponse }
+    }
+
+    private func cancelOAuthSessions(provider: String) {
+        for (_, entry) in oauthSessions where entry.0.contains(provider) { entry.1.invalidateAndCancel() }
+    }
+
+    func loginOAuth(
+        provider: PiOAuthProvider,
+        method: PiOAuthLoginMethod,
+        onDeviceCode: (@Sendable (SuperGrokDeviceCodeChallenge) async -> Void)? = nil
+    ) async throws -> PiOAuthResolution {
+        try await loginOAuth(provider: provider, method: method, onDeviceCode: onDeviceCode, context: nil, onRegistration: nil)
+    }
+
+    private func loginOAuth(
+        provider: PiOAuthProvider,
+        method: PiOAuthLoginMethod,
+        onDeviceCode: (@Sendable (SuperGrokDeviceCodeChallenge) async -> Void)? = nil,
+        context: PiChatGPTLoginContext?,
+        onRegistration: (@Sendable (JSONValue) async throws -> Void)?
+    ) async throws -> PiOAuthResolution {
+        let (endpoint, token) = try await startIfNeeded()
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/auth/login"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(PiOAuthLoginRequest(provider: provider, method: method, context: context))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let backgroundTask = await MainActor.run {
+            UIApplication.shared.beginBackgroundTask(withName: "PiOAuthLogin")
+        }
+        defer {
+            Task { @MainActor in
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                }
+            }
+        }
+
+        let session = CredentialHTTPTransport.makeSession()
+        defer { session.invalidateAndCancel() }
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw ProviderClientError.invalidResponse
+            }
+            for try await line in bytes.lines where !line.isEmpty {
+                try Task.checkCancellation()
+                let event = try Self.decodeAuthResponse(PiRuntimeEvent.self, data: Data(line.utf8))
+                switch event.type {
+                case "auth_registration":
+                    guard let registration = event.registration, let requestID = event.requestId, let onRegistration else {
+                        throw ProviderClientError.parseFailure("Pi returned an unexpected ChatGPT registration")
+                    }
+                    try await onRegistration(registration)
+                    var acknowledgement = URLRequest(url: endpoint.appendingPathComponent("v1/auth/registration"))
+                    acknowledgement.httpMethod = "POST"
+                    acknowledgement.httpBody = try JSONEncoder().encode(["requestId": requestID])
+                    acknowledgement.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                    acknowledgement.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    let (_, acknowledgementResponse) = try await CredentialHTTPTransport.shared.data(for: acknowledgement)
+                    guard (acknowledgementResponse as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw ProviderClientError.parseFailure("ChatGPT registration acknowledgement failed")
+                    }
+                case "auth_url":
+                    guard let value = event.url, let url = URL(string: value), provider.allowsAuthorizationURL(url) else {
+                        throw ProviderClientError.parseFailure("Pi OAuth returned an invalid authorization URL")
+                    }
+                    try await Self.openBrowser(url)
+                case "device_code":
+                    guard let value = event.verificationUri,
+                          let url = URL(string: value), provider.allowsAuthorizationURL(url),
+                          let userCode = event.userCode else {
+                        throw ProviderClientError.parseFailure("Pi OAuth returned an invalid device code")
+                    }
+                    await onDeviceCode?(
+                        SuperGrokDeviceCodeChallenge(
+                            verificationURI: value,
+                            userCode: userCode,
+                            browserURL: value
+                        )
+                    )
+                    try await Self.openBrowser(url)
+                case "auth_completed":
+                    guard let credential = event.credential, let profile = event.profile else {
+                        throw ProviderClientError.parseFailure("Pi OAuth completed without credentials")
+                    }
+                    let object = credential.objectValue
+                    guard let accessToken = object?["access"]?.stringValue else {
+                        throw ProviderClientError.parseFailure("Pi OAuth credential has no access token")
+                    }
+                    return PiOAuthResolution(
+                        credential: credential,
+                        accessToken: accessToken,
+                        accountId: object?["accountId"]?.stringValue ?? profile.accountId,
+                        profile: profile
+                    )
+                case "error":
+                    throw ProviderClientError.parseFailure("Pi OAuth authorization failed")
+                default:
+                    continue
+                }
+            }
+            throw ProviderClientError.parseFailure("Pi OAuth login ended without credentials")
+        } onCancel: {
+            // Closing the stream tells Pi to abort OAuth and release its listener.
+            session.invalidateAndCancel()
+        }
+    }
+
+    func resolveOAuth(
+        provider: PiOAuthProvider,
+        credentialJSON: String,
+        force: Bool
+    ) async throws -> PiOAuthResolution {
+        let (endpoint, token) = try await startIfNeeded()
+        let credential = try Self.decodeAuthResponse(JSONValue.self, data: Data(credentialJSON.utf8))
+        let envelope = PiOAuthResolveRequest(provider: provider, credential: credential, force: force)
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/auth/resolve"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(envelope)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw ProviderClientError.parseFailure("Pi OAuth credential resolution failed")
+        }
+        return try Self.decodeAuthResponse(PiOAuthResolution.self, data: data)
+    }
+
+    func stream(
+        request: ProviderRequest,
+        configuration: PiAgentConfiguration,
+        tools: LocalToolRegistry
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        let tools = tools.scopedForExecution()
+        let runID = UUID().uuidString
+        let metricsContext = ProviderMetricsContext.current
+        #if DEBUG
+        var streamMetadata = [
+            "provider": configuration.provider,
+            "model": configuration.model,
+            "contractVersion": String(configuration.contractVersion),
+            "activeRuns": String(activeRunIDs.count),
+            "nativeClientId": nativeClientID
+        ]
+        if let metricsContext {
+            streamMetadata["conversationId"] = String(metricsContext.conversationId)
+            streamMetadata["turnId"] = metricsContext.turnId
+        }
+        DiagnosticsLogger.log(
+            "Pi runtime stream requested",
+            category: .network,
+            requestID: runID,
+            metadata: streamMetadata
+        )
+        #endif
+        let (endpoint, token) = try await startIfNeeded(requestID: runID)
+        var configuration = configuration
+        if Self.hasNativePCC(configuration) {
+            let capability = await PCCProviderClient.capability()
+            if configuration.provider == "apple-pcc", configuration.catalogContract == nil {
+                configuration.nativePCC = capability
+            }
+            if let profiles = configuration.subagents?.models {
+                for index in profiles.indices where profiles[index].configuration?.provider == "apple-pcc"
+                    && profiles[index].configuration?.catalogContract == nil {
+                    configuration.subagents?.models[index].configuration?.nativePCC = capability
+                }
+            }
+        }
+        let piRequest = try Self.makeRequest(request, strictImageAttachments: configuration.provider == "apple-pcc")
+        let envelope = PiRunEnvelope(runId: runID, request: piRequest, config: configuration)
+        let body = try JSONEncoder().encode(envelope)
+        var urlRequest = URLRequest(url: endpoint.appendingPathComponent("v1/run"))
+        urlRequest.httpMethod = "POST"
+        urlRequest.httpBody = body
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let session = CredentialHTTPTransport.makeSession()
+        oauthSessions[runID] = (Set([configuration.provider] + (configuration.subagents?.models.compactMap { $0.configuration?.provider } ?? [])), session)
+        DiagnosticsLogger.log(
+            "Pi runtime bridge request starting",
+            category: .network,
+            requestID: runID,
+            metadata: [
+                "provider": configuration.provider,
+                "model": configuration.model,
+                "contractVersion": String(configuration.contractVersion),
+                "messages": String(request.messages.count),
+                "tools": request.tools.map(\.type).joined(separator: ",")
+            ]
+        )
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                defer { oauthSessions.removeValue(forKey: runID); session.invalidateAndCancel() }
+                #if DEBUG
+                self.registerActiveRun(runID)
+                defer {
+                    Task { self.unregisterActiveRun(runID) }
+                }
+                #endif
+                var metrics = PiConversationMetricsCollector(context: metricsContext)
+                var toolTasks: [Task<Void, Error>] = []
+                var pccTasks: [String: Task<Void, Never>] = [:]
+                let pccToolRunner = PCCLocalToolRunner()
+                defer { pccTasks.values.forEach { $0.cancel() } }
+                var completionState = PiStreamCompletionState()
+
+                func nowMs() -> Int64 {
+                    Int64(Date().timeIntervalSince1970 * 1_000)
+                }
+
+                do {
+                    let (bytes, response) = try await session.bytes(for: urlRequest)
+                    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                        throw ProviderClientError.invalidResponse
+                    }
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        guard !line.isEmpty else { continue }
+                        let event = try JSONDecoder().decode(PiRuntimeEvent.self, from: Data(line.utf8))
+                        switch event.type {
+                        case "heartbeat":
+                            continue
+                        case "diagnostic":
+                            DiagnosticsLogger.log(
+                                event.message ?? "Pi runtime diagnostic",
+                                category: .network,
+                                requestID: event.runId ?? runID,
+                                metadata: (event.metadata ?? [:]).merging(
+                                    ["stage": event.stage ?? "unknown"],
+                                    uniquingKeysWith: { current, _ in current }
+                                )
+                            )
+                        case "text_delta":
+                            if event.delta?.trimmedNonEmpty != nil { metrics.observeToken(at: event.timeMs ?? nowMs()) }
+                            continuation.yield(.textDelta(event.delta ?? ""))
+                        case "text_snapshot":
+                            guard let text = event.text else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid text snapshot")
+                            }
+                            if text.trimmedNonEmpty != nil { metrics.observeToken(at: event.timeMs ?? nowMs()) }
+                            continuation.yield(.textSnapshot(text))
+                        case "reasoning_delta":
+                            if event.delta?.trimmedNonEmpty != nil { metrics.observeToken(at: event.timeMs ?? nowMs()) }
+                            continuation.yield(.reasoningDelta(event.delta ?? ""))
+                        case "subagent_update":
+                            guard let run = event.subagent else { throw ProviderClientError.parseFailure("Pi emitted an invalid subagent update") }
+                            continuation.yield(.toolActivity(ToolActivityEvent(
+                                phase: run.status == .running ? .started : .finished,
+                                call: ToolCall(id: "subagent-\(run.id)", name: "subagent", argumentsJSON: "{}"),
+                                result: nil, createdAtMs: run.updatedAtMs, subagent: run
+                            )))
+                        case "answer_start":
+                            continuation.yield(.answerStart)
+                        case "llm_start":
+                            guard let id = event.stepId else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid LLM start event")
+                            }
+                            metrics.startLLM(stepID: id, at: event.timeMs ?? nowMs())
+                        case "llm_end":
+                            guard let id = event.stepId else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid LLM end event")
+                            }
+                            metrics.endLLM(
+                                stepID: id,
+                                at: event.timeMs ?? nowMs(),
+                                succeeded: event.succeeded ?? false,
+                                usage: event.usage
+                            )
+                        case "genui_preview":
+                            guard event.name == GenUITool.name, let callID = event.toolCallId,
+                                  request.tools.contains(where: { $0.type == "function" && $0.payload["name"] == GenUITool.name }),
+                                  let arguments = event.arguments else { continue }
+                            let call = ToolCall(id: callID, name: GenUITool.name, argumentsJSON: Self.jsonString(arguments))
+                            continuation.yield(.toolActivity(ToolActivityEvent(phase: .generating, call: call, result: nil, createdAtMs: event.timeMs ?? nowMs())))
+                        case "tool_start":
+                            guard let callID = event.toolCallId else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid tool start event")
+                            }
+                            metrics.startTool(callID: callID, at: event.timeMs ?? nowMs())
+                        case "tool_end":
+                            guard let callID = event.toolCallId else { break }
+                            metrics.endTool(
+                                callID: callID,
+                                at: event.timeMs ?? nowMs(),
+                                succeeded: event.succeeded ?? false
+                            )
+                        case "pcc_request":
+                            guard Self.authorizesPCC(configuration, subagentID: event.subagentId), event.runId == runID,
+                                  let requestID = event.requestId, let nativeRequest = event.pcc,
+                                  pccTasks[requestID] == nil else {
+                                throw ProviderClientError.parseFailure("Invalid PCC bridge request")
+                            }
+                            pccTasks[requestID] = Task {
+                                do {
+                                    var scopedRequest = nativeRequest
+                                    scopedRequest.sessionID = event.subagentId ?? request.metadata["promptCacheKey"]?.trimmedNonEmpty
+                                    try await PCCProviderClient.execute(scopedRequest, runID: runID, requestID: requestID, executeTool: { nativeCall in
+                                        if nativeCall.name == "subagent" || nativeCall.name == "read" {
+                                            guard (nativeCall.name == "read" || (configuration.subagents?.enabled == true && event.subagentId == nil)),
+                                                  nativeRequest.context.tools?.contains(where: { $0.name == nativeCall.name }) == true else {
+                                                throw PCCFailure(code: "pcc_tool_not_authorized")
+                                            }
+                                            // Do not hold the local side-effect queue while children run:
+                                            // PCC children may need that same queue to finish their tools.
+                                            return try await Self.executePCCRuntimeTool(nativeCall, runID: runID,
+                                                requestID: requestID, endpoint: endpoint, token: token)
+                                        }
+                                        guard request.tools.contains(where: { $0.type == "function" && $0.payload["name"] == nativeCall.name }) else {
+                                            throw PCCFailure(code: "pcc_tool_not_authorized")
+                                        }
+                                        let callID = event.subagentId.map { "\($0):\(nativeCall.id)" } ?? nativeCall.id
+                                        let call = try Self.localToolCall(id: callID, name: nativeCall.name,
+                                                                        arguments: nativeCall.argumentsJSON, request: request)
+                                        return try await pccToolRunner.run {
+                                            try Task.checkCancellation()
+                                            let createdAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+                                            continuation.yield(.toolActivity(ToolActivityEvent(phase: .started, call: call, result: nil, createdAtMs: createdAtMs, ownerSubagentID: event.subagentId)))
+                                            let result = await tools.execute(call: call)
+                                            try Task.checkCancellation()
+                                            continuation.yield(.toolActivity(ToolActivityEvent(phase: .finished, call: call, result: result, createdAtMs: createdAtMs, ownerSubagentID: event.subagentId)))
+                                            // Native transcript IDs remain Apple's originals; activity IDs
+                                            // include the child identity to avoid cross-child collisions.
+                                            var nativeResult = result
+                                            nativeResult.callId = nativeCall.id
+                                            return nativeResult
+                                        }
+                                    }) { nativeEvent in
+                                        try await Self.submitPCCEvent(nativeEvent, endpoint: endpoint, token: token)
+                                    }
+                                } catch is CancellationError {
+                                    // Cancellation is acknowledged by the Pi abort/timeout event.
+                                } catch {
+                                    DiagnosticsLogger.log("PCC bridge failed", category: .network, requestID: requestID, error: error)
+                                    await Self.abort(runID: runID, endpoint: endpoint, token: token)
+                                }
+                            }
+                        case "pcc_cancel":
+                            guard event.runId == runID, let requestID = event.requestId else {
+                                throw ProviderClientError.parseFailure("Invalid PCC cancellation")
+                            }
+                            pccTasks[requestID]?.cancel()
+                        case "tool_request":
+                            guard let requestID = event.requestId,
+                                  let callID = event.toolCallId,
+                                  let name = event.name else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid tool request")
+                            }
+                            let arguments = Self.jsonString(event.arguments ?? .object([:]))
+                            let call = try Self.localToolCall(id: callID, name: name, arguments: arguments, request: request)
+                            let createdAtMs = event.timeMs ?? nowMs()
+                            let reportsActivity = ToolActivityEvent.reportsActivity(for: name)
+                            if reportsActivity {
+                                continuation.yield(.toolActivity(ToolActivityEvent(
+                                    phase: .started,
+                                    call: call,
+                                    result: nil,
+                                    createdAtMs: createdAtMs, ownerSubagentID: event.subagentId
+                                )))
+                            }
+                            toolTasks.append(Task {
+                                do {
+                                    let result = await tools.execute(call: call)
+                                    if reportsActivity {
+                                        continuation.yield(.toolActivity(ToolActivityEvent(
+                                            phase: .finished,
+                                            call: call,
+                                            result: result,
+                                            createdAtMs: createdAtMs, ownerSubagentID: event.subagentId
+                                        )))
+                                    }
+                                    try await Self.submitToolResult(
+                                        result,
+                                        requestID: requestID,
+                                        endpoint: endpoint,
+                                        token: token
+                                    )
+                                } catch {
+                                    await Self.abort(runID: runID, endpoint: endpoint, token: token)
+                                    throw error
+                                }
+                            })
+                        case "completed":
+                            try completionState.complete(hasResponse: event.response != nil)
+                            for toolTask in toolTasks {
+                                try await toolTask.value
+                            }
+                            guard let response = event.response else {
+                                throw ProviderClientError.parseFailure("Pi completed without a response")
+                            }
+                            DiagnosticsLogger.log(
+                                "Pi runtime request completed",
+                                category: .network,
+                                requestID: runID,
+                                metadata: [
+                                    "provider": configuration.provider,
+                                    "model": configuration.model,
+                                    "hasText": String(!response.text.isEmpty)
+                                ]
+                            )
+                            continuation.yield(.completed(response))
+                        case "execution_snapshot":
+                            guard let execution = event.execution else {
+                                throw ProviderClientError.parseFailure("Pi emitted an invalid execution snapshot")
+                            }
+                            continuation.yield(.executionSnapshot(PiDiagnosticSanitizer.sanitize(execution)))
+                        case "error":
+                            let message = event.message ?? "Pi agent failed"
+                            let error: ProviderClientError
+                            if event.statusCode != nil || event.errorCode?.trimmedNonEmpty != nil {
+                                error = .providerFailure(
+                                    statusCode: event.statusCode,
+                                    code: event.errorCode,
+                                    message: message
+                                )
+                            } else {
+                                error = .parseFailure(message)
+                            }
+                            DiagnosticsLogger.log(
+                                "Pi runtime reported an error",
+                                category: .network,
+                                requestID: event.runId ?? runID,
+                                metadata: [
+                                    "provider": configuration.provider,
+                                    "model": configuration.model,
+                                    "stage": event.stage ?? "unknown"
+                                ],
+                                error: error
+                            )
+                            throw error
+                        default:
+                            continue
+                        }
+                    }
+                    try completionState.finish()
+                    metrics.closeInterruptedLLMSteps(at: nowMs())
+                    continuation.finish()
+                } catch is CancellationError {
+                    toolTasks.forEach { $0.cancel() }
+                    metrics.closeInterruptedLLMSteps(at: nowMs())
+                    DiagnosticsLogger.log(
+                        "Pi runtime request cancelled",
+                        level: .warning,
+                        category: .network,
+                        requestID: runID,
+                        metadata: ["provider": configuration.provider, "model": configuration.model]
+                    )
+                    await Self.abort(runID: runID, endpoint: endpoint, token: token)
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    toolTasks.forEach { $0.cancel() }
+                    metrics.closeInterruptedLLMSteps(at: nowMs())
+                    DiagnosticsLogger.log(
+                        "Pi runtime bridge failed",
+                        category: .network,
+                        requestID: runID,
+                        metadata: ["provider": configuration.provider, "model": configuration.model],
+                        error: error
+                    )
+                    await Self.abort(runID: runID, endpoint: endpoint, token: token)
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    static func localToolCall(id: String, name: String, arguments: String, request: ProviderRequest) throws -> ToolCall {
+        var providerMetadata: [String: String]?
+        if name == PythonExecuteTool.name || name == StrReplaceEditorTool.name {
+            let attachmentPaths = request.messages.flatMap(\.attachments)
+            let attachmentsData = try JSONEncoder().encode(attachmentPaths)
+            if name == PythonExecuteTool.name {
+                providerMetadata = ["pythonAttachmentsJSON": String(decoding: attachmentsData, as: UTF8.self)]
+                if let sessionID = request.metadata["pythonSessionId"]?.trimmedNonEmpty {
+                    providerMetadata?["pythonSessionId"] = sessionID
+                }
+            } else {
+                providerMetadata = ["editorAttachmentsJSON": String(decoding: attachmentsData, as: UTF8.self)]
+                if let sessionID = request.metadata["editorSessionId"]?.trimmedNonEmpty {
+                    providerMetadata?["editorSessionId"] = sessionID
+                }
+            }
+            if let artifactSessionID = request.metadata[
+                ConversationWorkspacePath.artifactSessionMetadataKey
+            ]?.trimmedNonEmpty {
+                providerMetadata?[ConversationWorkspacePath.artifactSessionMetadataKey] = artifactSessionID
+            }
+        }
+        return ToolCall(id: id, name: name, argumentsJSON: arguments, providerMetadata: providerMetadata)
+    }
+
+    static func hasNativePCC(_ configuration: PiAgentConfiguration) -> Bool {
+        (configuration.provider == "apple-pcc" && configuration.catalogContract == nil)
+            || (configuration.subagents?.enabled == true && configuration.subagents?.models.contains {
+                $0.unsupportedReason == nil && $0.configuration?.provider == "apple-pcc" && $0.configuration?.catalogContract == nil
+            } == true)
+    }
+
+    static func authorizesPCC(_ configuration: PiAgentConfiguration, subagentID: String?) -> Bool {
+        if subagentID != nil {
+            return configuration.subagents?.enabled == true && hasNativePCC(configuration)
+        }
+        return configuration.provider == "apple-pcc" && configuration.catalogContract == nil
+    }
+
+    private static func executePCCRuntimeTool(_ call: ToolCall, runID: String, requestID: String,
+                                          endpoint: URL, token: String) async throws -> ToolResult {
+        struct Invocation: Encodable {
+            var runId: String
+            var requestId: String
+            var toolCall: ToolCall
+        }
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/pcc-tool"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 300
+        request.httpBody = try JSONEncoder().encode(Invocation(runId: runID, requestId: requestID, toolCall: call))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw ProviderClientError.invalidResponse }
+        if http.statusCode == 404 { throw CancellationError() }
+        guard http.statusCode == 200 else { throw PCCFailure(code: "pcc_tool_not_authorized") }
+        return try JSONDecoder().decode(ToolResult.self, from: data)
+    }
+
+    private static func submitPCCEvent(_ event: PCCNativeEvent, endpoint: URL, token: String) async throws {
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/pcc-event"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(event)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ProviderClientError.invalidResponse }
+        if http.statusCode == 404 { throw CancellationError() }
+        guard http.statusCode == 200 else {
+            throw ProviderClientError.parseFailure("PCC bridge rejected event: \(String(decoding: data, as: UTF8.self))")
+        }
+    }
+
+    private func startIfNeeded(requestID: String? = nil) async throws -> (URL, String) {
+        if let startupTask {
+            DiagnosticsLogger.log("Pi runtime startup already in progress", category: .network)
+            return try await startupTask.value
+        }
+        if let endpoint, let token {
+            _ = try await waitUntilHealthySingleFlight(
+                endpoint: endpoint,
+                token: token,
+                timeout: readiness.resumeTimeout,
+                context: "request",
+                requestID: requestID
+            )
+            return (endpoint, token)
+        }
+        let task = Task<(URL, String), Error> {
+            let resources = Bundle(for: PiRuntimeBundleToken.self)
+            guard let script = resources.url(forResource: "main", withExtension: "js") else {
+                let error = ProviderClientError.parseFailure("Bundled Pi runtime was not found")
+                DiagnosticsLogger.log("Pi runtime bundle lookup failed", category: .network, error: error)
+                throw error
+            }
+            let port = Int.random(in: 49_152 ... 59_999)
+            let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let endpoint = URL(string: "http://127.0.0.1:\(port)/")!
+            DiagnosticsLogger.log(
+                "Pi runtime engine starting",
+                category: .network,
+                requestID: requestID,
+                metadata: ["script": script.lastPathComponent, "port": String(port)]
+            )
+            #if DEBUG
+            let runtimeLogPath = DiagnosticsLogger.piRuntimeLogPath()
+            try self.startEngine(["node", script.path, String(port), token, runtimeLogPath])
+            #else
+            try self.startEngine(["node", script.path, String(port), token])
+            #endif
+
+            // Launch and readiness are separate states. A timeout (for example,
+            // while iOS suspends the listener) does not undo node_start(). Keep
+            // this identity before the first suspension point so every retry
+            // probes the same engine instead of initializing Node a second time.
+            self.endpoint = endpoint
+            self.token = token
+            _ = try await self.waitUntilHealthySingleFlight(
+                endpoint: endpoint,
+                token: token,
+                timeout: self.readiness.startupTimeout,
+                context: "startup",
+                requestID: requestID
+            )
+            return (endpoint, token)
+        }
+        startupTask = task
+        do {
+            let result = try await task.value
+            startupTask = nil
+            return result
+        } catch {
+            startupTask = nil
+            DiagnosticsLogger.log("Pi runtime startup failed", category: .network, error: error)
+            throw error
+        }
+    }
+
+    @discardableResult
+    private func waitUntilHealthySingleFlight(
+        endpoint: URL,
+        token: String,
+        timeout: Duration,
+        context: String,
+        requestID: String? = nil
+    ) async throws -> PiHealthResponse {
+        if let flight = healthCheckFlight {
+            #if DEBUG
+            DiagnosticsLogger.log(
+                "Pi runtime health check already in progress",
+                category: .network,
+                requestID: requestID ?? flight.requestID,
+                metadata: [
+                    "healthCheckId": flight.id,
+                    "ownerContext": flight.context,
+                    "ownerRequestId": flight.requestID,
+                    "waiterContext": context,
+                    "waitedMs": String(Int(Date().timeIntervalSince(flight.startedAt) * 1_000))
+                ]
+            )
+            #endif
+            let result = try await flight.task.value
+            #if DEBUG
+            lastHealthyAt = Date()
+            #endif
+            return result
+        }
+
+        let healthCheckID = UUID().uuidString
+        let resolvedRequestID = requestID ?? healthCheckID
+        let readiness = readiness
+        let healthClient = healthClient
+        let task = Task<PiHealthResponse, Error> {
+            try await Self.waitUntilHealthy(
+                endpoint: endpoint,
+                token: token,
+                timeout: timeout,
+                context: context,
+                healthCheckID: healthCheckID,
+                requestID: resolvedRequestID,
+                readiness: readiness,
+                healthClient: healthClient
+            )
+        }
+        healthCheckFlight = HealthCheckFlight(
+            id: healthCheckID,
+            context: context,
+            requestID: resolvedRequestID,
+            startedAt: Date(),
+            task: task
+        )
+        do {
+            let result = try await task.value
+            if healthCheckFlight?.id == healthCheckID {
+                healthCheckFlight = nil
+            }
+            #if DEBUG
+            lastHealthyAt = Date()
+            #endif
+            return result
+        } catch {
+            if healthCheckFlight?.id == healthCheckID {
+                healthCheckFlight = nil
+            }
+            throw error
+        }
+    }
+
+    private static func waitUntilHealthy(
+        endpoint: URL,
+        token: String,
+        timeout: Duration,
+        context: String,
+        healthCheckID: String,
+        requestID: String,
+        readiness: PiRuntimeReadinessConfiguration,
+        healthClient: any PiRuntimeHealthClient
+    ) async throws -> PiHealthResponse {
+        var health = URLRequest(
+            url: endpoint.appendingPathComponent("health"),
+            timeoutInterval: readiness.requestTimeout
+        )
+        health.cachePolicy = .reloadIgnoringLocalCacheData
+        health.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        var lastFailure = "no response"
+        var attempt = 0
+        #if DEBUG
+        var failureCounts: [String: Int] = [:]
+        var lastFailureSignature: String?
+        var nextProgressLogMs = 5_000
+        #endif
+        let clock = ContinuousClock()
+        #if DEBUG
+        let startedAt = Date()
+        #endif
+        let deadline = clock.now.advanced(by: timeout)
+        #if DEBUG
+        var initialMetadata = await runtimeEnvironmentMetadata()
+        initialMetadata.merge(nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+        initialMetadata.merge([
+            "context": context,
+            "healthCheckId": healthCheckID,
+            "port": endpoint.port.map(String.init) ?? "unknown",
+            "requestTimeoutMs": String(Int(readiness.requestTimeout * 1_000)),
+            "timeoutMs": String(durationMilliseconds(timeout))
+        ], uniquingKeysWith: { current, _ in current })
+        DiagnosticsLogger.log(
+            "Pi runtime health check started",
+            category: .network,
+            requestID: requestID,
+            metadata: initialMetadata
+        )
+        #endif
+
+        repeat {
+            try Task.checkCancellation()
+            attempt += 1
+            #if DEBUG
+            var signature = "unknown"
+            #endif
+            do {
+                let (data, response) = try await healthClient.data(for: health)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode
+                if statusCode == 200,
+                   let status = try? JSONDecoder().decode(PiHealthResponse.self, from: data),
+                   status.ok, status.contractVersion == 2 {
+                    #if DEBUG
+                    var successMetadata = healthMetadata(status)
+                    successMetadata.merge(nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+                    successMetadata.merge([
+                        "attempt": String(attempt),
+                        "context": context,
+                        "elapsedMs": String(Int(Date().timeIntervalSince(startedAt) * 1_000)),
+                        "healthCheckId": healthCheckID,
+                        "port": endpoint.port.map(String.init) ?? "unknown"
+                    ], uniquingKeysWith: { current, _ in current })
+                    DiagnosticsLogger.log(
+                        "Pi runtime health check succeeded",
+                        category: .network,
+                        requestID: requestID,
+                        metadata: successMetadata
+                    )
+                    #endif
+                    return status
+                }
+                lastFailure = statusCode.map { "HTTP \($0) or invalid health payload" }
+                    ?? "non-HTTP health response"
+                #if DEBUG
+                signature = statusCode.map { "http:\($0):invalidPayload" } ?? "nonHTTPResponse"
+                #endif
+            } catch {
+                let nsError = error as NSError
+                #if DEBUG
+                signature = "\(nsError.domain):\(nsError.code)"
+                lastFailure = "\(signature) \(error.localizedDescription)"
+                #else
+                lastFailure = "\(nsError.domain):\(nsError.code) \(error.localizedDescription)"
+                #endif
+            }
+            #if DEBUG
+            failureCounts[signature, default: 0] += 1
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1_000)
+            let shouldLogProgress = attempt == 1 || signature != lastFailureSignature || elapsedMs >= nextProgressLogMs
+            if shouldLogProgress {
+                var progressMetadata = await runtimeEnvironmentMetadata()
+                progressMetadata.merge(nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+                progressMetadata.merge([
+                    "attempt": String(attempt),
+                    "context": context,
+                    "elapsedMs": String(elapsedMs),
+                    "failure": lastFailure,
+                    "failureSignature": signature,
+                    "healthCheckId": healthCheckID,
+                    "port": endpoint.port.map(String.init) ?? "unknown"
+                ], uniquingKeysWith: { current, _ in current })
+                DiagnosticsLogger.log(
+                    "Pi runtime health check still unavailable",
+                    level: .warning,
+                    category: .network,
+                    requestID: requestID,
+                    metadata: progressMetadata
+                )
+                lastFailureSignature = signature
+                while nextProgressLogMs <= elapsedMs {
+                    nextProgressLogMs += 5_000
+                }
+            }
+            #endif
+            let now = clock.now
+            guard now < deadline else { break }
+            let remaining = now.duration(to: deadline)
+            try await Task.sleep(for: min(readiness.retryDelay, remaining))
+        } while true
+
+        let message = context == "startup"
+            ? "Pi agent runtime did not start"
+            : "Pi agent runtime did not resume"
+        let error = ProviderClientError.parseFailure(message)
+        #if DEBUG
+        var timeoutMetadata = await runtimeEnvironmentMetadata()
+        timeoutMetadata.merge(nativeEngineMetadata(), uniquingKeysWith: { current, _ in current })
+        timeoutMetadata.merge([
+            "attempts": String(attempt),
+            "context": context,
+            "elapsedMs": String(Int(Date().timeIntervalSince(startedAt) * 1_000)),
+            "failureCounts": failureCounts.sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ","),
+            "healthCheckId": healthCheckID,
+            "lastFailure": lastFailure,
+            "port": endpoint.port.map(String.init) ?? "unknown"
+        ], uniquingKeysWith: { current, _ in current })
+        DiagnosticsLogger.log(
+            "Pi runtime health check timed out",
+            category: .network,
+            requestID: requestID,
+            metadata: timeoutMetadata,
+            error: error
+        )
+        #endif
+        throw error
+    }
+
+    #if DEBUG
+    private func registerActiveRun(_ runID: String) {
+        activeRunIDs.insert(runID)
+    }
+
+    private func unregisterActiveRun(_ runID: String) {
+        activeRunIDs.remove(runID)
+    }
+
+    private static func healthMetadata(_ status: PiHealthResponse) -> [String: String] {
+        [
+            "activeRuns": status.activeRuns.map(String.init) ?? "unknown",
+            "node": status.node ?? "unknown",
+            "pendingTools": status.pendingTools.map(String.init) ?? "unknown",
+            "rssBytes": status.rssBytes.map(String.init) ?? "unknown",
+            "runtimeId": status.runtimeId ?? "unknown",
+            "runtimeStartedAtMs": status.startedAtMs.map(String.init) ?? "unknown",
+            "runtimeUptimeMs": status.uptimeMs.map(String.init) ?? "unknown"
+        ]
+    }
+
+    private static func nativeEngineMetadata() -> [String: String] {
+        PiNodeRunner.engineDiagnostics()
+    }
+
+    private static func durationMilliseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        return components.seconds * 1_000 + Int64(components.attoseconds / 1_000_000_000_000_000)
+    }
+
+    private static func runtimeEnvironmentMetadata() async -> [String: String] {
+        await MainActor.run {
+            let application = UIApplication.shared
+            let process = ProcessInfo.processInfo
+            let state: String
+            switch application.applicationState {
+            case .active: state = "active"
+            case .inactive: state = "inactive"
+            case .background: state = "background"
+            @unknown default: state = "unknown"
+            }
+            let thermal: String
+            switch process.thermalState {
+            case .nominal: thermal = "nominal"
+            case .fair: thermal = "fair"
+            case .serious: thermal = "serious"
+            case .critical: thermal = "critical"
+            @unknown default: thermal = "unknown"
+            }
+            let remaining = application.backgroundTimeRemaining
+            return [
+                "applicationState": state,
+                "backgroundTimeRemaining": remaining > 31_536_000
+                    ? "unlimited"
+                    : String(format: "%.1f", remaining),
+                "lowPowerMode": String(process.isLowPowerModeEnabled),
+                "protectedDataAvailable": String(application.isProtectedDataAvailable),
+                "systemUptimeMs": String(Int(process.systemUptime * 1_000)),
+                "thermalState": thermal
+            ]
+        }
+    }
+    #endif
+
+    static func makeRequest(_ request: ProviderRequest, strictImageAttachments: Bool = false) throws -> PiRequest {
+        let attachmentNames = Array(Set(request.messages.flatMap(\.attachments).map {
+            attachmentFileURL(from: $0).lastPathComponent
+        })).sorted()
+        var requestTools = request.tools
+        if !attachmentNames.isEmpty,
+           let index = requestTools.firstIndex(where: { $0.payload["name"] == PythonExecuteTool.name }) {
+            let existing = requestTools[index].payload["description"] ?? ""
+            requestTools[index].payload["description"] = existing
+                + " Files available in this chat workspace: "
+                + attachmentNames.joined(separator: ", ")
+                + "."
+        }
+        return PiRequest(
+            skillContext: request.skillContext,
+            messages: try request.messages.map { message in
+                PiMessage(
+                    role: message.role,
+                    content: message.content,
+                    attachments: try message.attachments.compactMap { path in
+                        let image = try loadImageAttachment(path)
+                        if strictImageAttachments && image == nil { throw PCCFailure(code: "pcc_attachment_unsupported") }
+                        return image
+                    },
+                    reasoningContent: message.reasoningContent,
+                    toolCalls: message.toolCalls,
+                    toolCallId: message.toolCallId,
+                    toolName: message.toolName,
+                    toolResultIsError: message.toolResultIsError,
+                    piMessage: message.piMessage
+                )
+            },
+            systemPrompt: request.systemPrompt,
+            tools: requestTools,
+            thinking: request.thinking,
+            provider: request.provider,
+            metadata: request.metadata,
+            timeoutInterval: request.timeoutInterval
+        )
+    }
+
+    private static func loadImageAttachment(_ path: String) throws -> PiAttachment? {
+        let url = attachmentFileURL(from: path)
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentTypeKey])
+        guard (values.fileSize ?? 0) <= AppConstants.maxAttachmentSizeBytes else {
+            throw ProviderClientError.parseFailure("Attachment exceeds the 10 MB limit")
+        }
+        guard values.contentType?.conforms(to: .image) == true else { return nil }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        let type = values.contentType?.preferredMIMEType ?? "image/jpeg"
+        return PiAttachment(data: data.base64EncodedString(), mimeType: type)
+    }
+
+    /// Resolves the attachment representation persisted in conversation history.
+    /// New messages contain filesystem paths, while messages created before the
+    /// path-serialization fix contain file URLs.
+    static func attachmentFileURL(from value: String) -> URL {
+        if let url = URL(string: value), url.isFileURL {
+            return url.standardizedFileURL
+        }
+        return URL(fileURLWithPath: value).standardizedFileURL
+    }
+
+    private static func submitToolResult(
+        _ result: ToolResult,
+        requestID: String,
+        endpoint: URL,
+        token: String
+    ) async throws {
+        let envelope = try toolResultEnvelope(result, requestID: requestID)
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/tool-result"))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(envelope)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await CredentialHTTPTransport.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw ProviderClientError.invalidResponse
+        }
+    }
+
+    static func toolResultEnvelope(_ result: ToolResult, requestID: String) throws -> PiToolResultEnvelope {
+        PiToolResultEnvelope(
+            requestId: requestID,
+            content: result.content,
+            isError: result.isError,
+            status: result.status,
+            provenance: result.provenance,
+            sources: result.sources,
+            images: try toolResultImages(from: result.artifacts),
+            imagePaths: result.artifacts.filter { $0.mime.lowercased().hasPrefix("image/") }.map(\.path)
+        )
+    }
+
+    static func toolResultImages(from artifacts: [ToolArtifact]) throws -> [PiAttachment] {
+        try artifacts.compactMap { artifact in
+            guard artifact.mime.lowercased().hasPrefix("image/") else { return nil }
+            guard artifact.size <= Int64(AppConstants.maxAttachmentSizeBytes) else {
+                throw ProviderClientError.parseFailure("Generated image exceeds the 10 MB limit")
+            }
+            let url = attachmentFileURL(from: artifact.path)
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            return PiAttachment(data: data.base64EncodedString(), mimeType: artifact.mime)
+        }
+    }
+
+    private static func abort(runID: String, endpoint: URL, token: String) async {
+        var request = URLRequest(url: endpoint.appendingPathComponent("v1/abort"))
+        request.httpMethod = "POST"
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["runId": runID])
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 5
+        let cleanupRequest = request
+        await Task.detached {
+            _ = try? await CredentialHTTPTransport.shared.data(for: cleanupRequest)
+        }.value
+    }
+
+    private static func jsonString(_ value: JSONValue) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let string = String(data: data, encoding: .utf8) else { return "{}" }
+        return string
+    }
+
+    static func credentialJSONString(_ value: JSONValue) throws -> String {
+        String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+    }
+
+    private static func decodeAuthResponse<T: Decodable>(_ type: T.Type, data: Data) throws -> T {
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch { throw ProviderClientError.parseFailure("Pi returned an invalid authentication response") }
+    }
+
+    private static func openBrowser(_ url: URL) async throws {
+        let canOpen = await MainActor.run { UIApplication.shared.canOpenURL(url) }
+        guard canOpen else { throw ProviderClientError.invalidBaseURL(url.absoluteString) }
+        try await withCheckedThrowingContinuation { continuation in
+            Task { @MainActor in
+                UIApplication.shared.open(url, options: [:]) { opened in
+                    if opened {
+                        continuation.resume(returning: ())
+                    } else {
+                        continuation.resume(throwing: ProviderClientError.invalidBaseURL(url.absoluteString))
+                    }
+                }
+            }
+        }
+    }
+}
+
+extension JSONValue {
+    var objectValue: [String: JSONValue]? {
+        guard case let .object(value) = self else { return nil }
+        return value
+    }
+
+    var stringValue: String? {
+        guard case let .string(value) = self else { return nil }
+        return value
+    }
+
+    var arrayValue: [JSONValue]? {
+        guard case let .array(value) = self else { return nil }
+        return value
+    }
+}

@@ -1,0 +1,1231 @@
+import Foundation
+import GRDB
+
+enum AppDatabase {
+    static func databaseURL(fileManager: FileManager = .default) throws -> URL {
+        let supportURL = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        )
+        return supportURL.appendingPathComponent("YamabikoChat", isDirectory: true)
+            .appendingPathComponent("yamabiko.sqlite")
+    }
+
+    static func makeDatabaseQueue() throws -> DatabaseQueue {
+        let fileManager = FileManager.default
+        let dbURL = try databaseURL(fileManager: fileManager)
+        let directoryURL = dbURL.deletingLastPathComponent()
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try fileManager.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: directoryURL.path
+        )
+        var directoryValues = URLResourceValues()
+        directoryValues.isExcludedFromBackup = true
+        var protectedDirectoryURL = directoryURL
+        try protectedDirectoryURL.setResourceValues(directoryValues)
+
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA journal_mode = TRUNCATE")
+            try db.execute(sql: "PRAGMA secure_delete = ON")
+        }
+
+        let queue = try DatabaseQueue(path: dbURL.path, configuration: configuration)
+        let databaseMigrator = migrator
+        let appliedMigrations = try queue.read { try databaseMigrator.appliedMigrations($0) }
+        if !appliedMigrations.contains("v35_credential_boundary_security") {
+            // Remove legacy diagnostic copies only for the app's actual database,
+            // never while migrating an unrelated in-memory or imported database.
+            try DiagnosticsLogger.removePersistedLogs()
+            let oldExports = fileManager.temporaryDirectory.appendingPathComponent("YamabikoChatExports", isDirectory: true)
+            try? fileManager.removeItem(at: oldExports)
+        }
+        try databaseMigrator.migrate(queue)
+        try recoverStreamCheckpoints(in: queue)
+        // Old diagnostic snapshots copied complete input histories and image
+        // payloads into SQLite on every run. Reclaim the pages their migration
+        // released; VACUUM runs outside a transaction and keeps chat data intact.
+        do {
+            try reclaimUnusedSpace(in: queue)
+        } catch {
+            DiagnosticsLogger.log("Database space reclamation failed", category: .app, error: error)
+        }
+        for protectedURL in [
+            dbURL,
+            URL(fileURLWithPath: dbURL.path + "-journal"),
+            URL(fileURLWithPath: dbURL.path + "-wal"),
+            URL(fileURLWithPath: dbURL.path + "-shm")
+        ] where fileManager.fileExists(atPath: protectedURL.path) {
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: protectedURL.path
+            )
+        }
+        return queue
+    }
+
+    static var migrator: DatabaseMigrator {
+        var migrator = DatabaseMigrator()
+
+        migrator.registerMigration("v1_base") { db in
+            try db.create(table: "conversations") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("title", .text).notNull()
+                t.column("systemPrompt", .text)
+                t.column("model", .text).notNull()
+                t.column("apiProvider", .text).notNull()
+                t.column("createdAtMs", .integer).notNull()
+                t.column("updatedAtMs", .integer).notNull()
+                t.column("codexSessionId", .text)
+                t.column("isSecret", .boolean).notNull().defaults(to: false)
+            }
+
+            try db.create(table: "chat_messages") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("conversationId", .integer).notNull().references("conversations", onDelete: .cascade)
+                t.column("role", .text).notNull()
+                t.column("text", .text).notNull()
+                t.column("attachmentsJSON", .text).notNull().defaults(to: "[]")
+                t.column("fusionTraceId", .text)
+                t.column("createdAtMs", .integer).notNull()
+            }
+            try db.create(index: "idx_messages_conversation_time", on: "chat_messages", columns: ["conversationId", "createdAtMs"])
+
+            try db.create(table: "chat_message_thinking") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("messageId", .integer).notNull().unique().references("chat_messages", onDelete: .cascade)
+                t.column("thinkingStream", .text).notNull()
+            }
+
+            try db.create(table: "dual_chat_messages") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("conversationId", .integer).notNull().references("conversations", onDelete: .cascade)
+                t.column("role", .text).notNull().defaults(to: "legacy")
+                t.column("userText", .text).notNull()
+                t.column("modelAText", .text).notNull()
+                t.column("modelBText", .text).notNull()
+                t.column("modelAName", .text).notNull()
+                t.column("modelBName", .text).notNull()
+                t.column("providerA", .text).notNull()
+                t.column("providerB", .text).notNull()
+                t.column("modelAThinking", .text)
+                t.column("modelBThinking", .text)
+                t.column("attachmentsJSON", .text).notNull().defaults(to: "[]")
+                t.column("modelAToolActivityJSON", .text)
+                t.column("modelBToolActivityJSON", .text)
+                t.column("createdAtMs", .integer).notNull()
+            }
+            try db.create(index: "idx_dual_conversation_time", on: "dual_chat_messages", columns: ["conversationId", "createdAtMs"])
+
+            try db.create(table: "auto_conversations") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("title", .text).notNull()
+                t.column("modelA", .text).notNull()
+                t.column("modelB", .text).notNull()
+                t.column("providerA", .text).notNull()
+                t.column("providerB", .text).notNull()
+                t.column("systemPromptA", .text).notNull()
+                t.column("systemPromptB", .text).notNull()
+                t.column("maxTurns", .integer).notNull()
+                t.column("status", .text).notNull()
+                t.column("boundConversationId", .integer).references("conversations", onDelete: .setNull)
+                t.column("createdAtMs", .integer).notNull()
+                t.column("updatedAtMs", .integer).notNull()
+            }
+
+            try db.create(table: "auto_conversation_messages") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("autoConversationId", .integer).notNull().references("auto_conversations", onDelete: .cascade)
+                t.column("speaker", .text).notNull()
+                t.column("content", .text).notNull()
+                t.column("turnIndex", .integer).notNull()
+                t.column("createdAtMs", .integer).notNull()
+            }
+            try db.create(index: "idx_auto_conversation_turn", on: "auto_conversation_messages", columns: ["autoConversationId", "turnIndex"])
+
+            try db.create(table: "model_presets") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("name", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("apiProvider", .text).notNull()
+                t.column("systemPrompt", .text)
+                t.column("configJSON", .text).notNull().defaults(to: "{}")
+                t.column("createdAtMs", .integer).notNull()
+            }
+
+            try db.create(table: "settings") { t in
+                t.primaryKey("id", .integer)
+                t.column("defaultModel", .text).notNull()
+                t.column("apiProvider", .text).notNull()
+                t.column("systemPrompt", .text)
+                t.column("isSystemPromptEnabled", .boolean).notNull().defaults(to: true)
+                t.column("systemPromptPresetsJSON", .text).notNull().defaults(to: "[]")
+                t.column("selectedSystemPromptPreset", .text)
+
+                t.column("isStreamingEnabled", .boolean).notNull().defaults(to: true)
+                t.column("mathRenderingEnabled", .boolean).notNull().defaults(to: true)
+                t.column("clientWebSearchToolEnabled", .boolean).notNull().defaults(to: false)
+                t.column("pythonToolEnabled", .boolean).notNull().defaults(to: true)
+                t.column("genUIToolEnabled", .boolean).notNull().defaults(to: true)
+
+                t.column("dynamicColorEnabled", .boolean).notNull().defaults(to: true)
+                t.column("themeColor", .text).notNull().defaults(to: "BLUE_PURPLE")
+                t.column("themeMode", .text).notNull().defaults(to: "SYSTEM")
+
+                t.column("geminiThinkingEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiThinkingBudget", .integer).notNull().defaults(to: 0)
+                t.column("geminiThinkingLevel", .text).notNull().defaults(to: "")
+                t.column("geminiGoogleSearchEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiCodeExecutionEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiURLContextEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiGoogleMapsEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiComputerUseEnabled", .boolean).notNull().defaults(to: false)
+                t.column("geminiResponseMimeType", .text).notNull().defaults(to: "")
+                t.column("geminiResponseJSONSchema", .text).notNull().defaults(to: "")
+                t.column("geminiFunctionDeclarations", .text).notNull().defaults(to: "")
+                t.column("geminiKeyNamesJSON", .text).notNull().defaults(to: "[]")
+                t.column("geminiRotationModelsJSON", .text).notNull().defaults(to: "[]")
+
+                t.column("openRouterThinkingEnabled", .boolean).notNull().defaults(to: false)
+                t.column("openRouterThinkingBudget", .integer).notNull().defaults(to: 0)
+                t.column("openRouterReasoningMode", .text).notNull().defaults(to: "auto")
+                t.column("openRouterReasoningEffort", .text).notNull().defaults(to: "")
+                t.column("openRouterReasoningExclude", .boolean).notNull().defaults(to: false)
+                t.column("openRouterGoogleSearchEnabled", .boolean).notNull().defaults(to: false)
+                t.column("openRouterCodeExecutionEnabled", .boolean).notNull().defaults(to: false)
+
+                t.column("isDualModeEnabled", .boolean).notNull().defaults(to: false)
+                t.column("dualModelA", .text).notNull()
+                t.column("dualModelB", .text).notNull()
+                t.column("dualProviderA", .text).notNull()
+                t.column("dualProviderB", .text).notNull()
+                t.column("dualSystemPromptA", .text)
+                t.column("dualSystemPromptB", .text)
+                t.column("dualSplitLayout", .text).notNull().defaults(to: "VERTICAL")
+                t.column("dualSplitRatio", .double).notNull().defaults(to: 0.5)
+                t.column("dualOpenRouterThinkingEnabledA", .boolean)
+                t.column("dualOpenRouterThinkingBudgetA", .integer)
+                t.column("dualOpenRouterReasoningModeA", .text)
+                t.column("dualOpenRouterReasoningEffortA", .text)
+                t.column("dualOpenRouterReasoningExcludeA", .boolean)
+                t.column("dualOpenRouterThinkingEnabledB", .boolean)
+                t.column("dualOpenRouterThinkingBudgetB", .integer)
+                t.column("dualOpenRouterReasoningModeB", .text)
+                t.column("dualOpenRouterReasoningEffortB", .text)
+                t.column("dualOpenRouterReasoningExcludeB", .boolean)
+                t.column("dualGoogleSearchEnabledA", .boolean)
+                t.column("dualCodeExecutionEnabledA", .boolean)
+                t.column("dualURLContextEnabledA", .boolean)
+                t.column("dualGoogleMapsEnabledA", .boolean)
+                t.column("dualComputerUseEnabledA", .boolean)
+                t.column("dualThinkingEnabledA", .boolean)
+                t.column("dualThinkingBudgetA", .integer)
+                t.column("dualThinkingLevelA", .text)
+                t.column("dualCodexReasoningEffortA", .text)
+                t.column("dualGoogleSearchEnabledB", .boolean)
+                t.column("dualCodeExecutionEnabledB", .boolean)
+                t.column("dualURLContextEnabledB", .boolean)
+                t.column("dualGoogleMapsEnabledB", .boolean)
+                t.column("dualComputerUseEnabledB", .boolean)
+                t.column("dualThinkingEnabledB", .boolean)
+                t.column("dualThinkingBudgetB", .integer)
+                t.column("dualThinkingLevelB", .text)
+                t.column("dualCodexReasoningEffortB", .text)
+
+                t.column("isFusionModeEnabled", .boolean).notNull().defaults(to: false)
+                t.column("fusionPresetName", .text).notNull().defaults(to: "quality")
+                t.column("fusionTaskType", .text).notNull().defaults(to: "auto")
+                t.column("fusionDebugModeEnabled", .boolean).notNull().defaults(to: false)
+                t.column("fusionLogPromptsEnabled", .boolean).notNull().defaults(to: false)
+                t.column("fusionCustomPresetJSON", .text).notNull().defaults(to: "")
+
+                t.column("isAutoConversationEnabled", .boolean).notNull().defaults(to: false)
+                t.column("autoModelA", .text).notNull()
+                t.column("autoModelB", .text).notNull()
+                t.column("autoProviderA", .text).notNull()
+                t.column("autoProviderB", .text).notNull()
+                t.column("autoSystemPromptA", .text).notNull()
+                t.column("autoSystemPromptB", .text).notNull()
+                t.column("autoMaxTurns", .integer).notNull().defaults(to: 20)
+                t.column("autoOpenRouterThinkingEnabledA", .boolean)
+                t.column("autoOpenRouterThinkingBudgetA", .integer)
+                t.column("autoOpenRouterReasoningModeA", .text)
+                t.column("autoOpenRouterReasoningEffortA", .text)
+                t.column("autoOpenRouterReasoningExcludeA", .boolean)
+                t.column("autoOpenRouterThinkingEnabledB", .boolean)
+                t.column("autoOpenRouterThinkingBudgetB", .integer)
+                t.column("autoOpenRouterReasoningModeB", .text)
+                t.column("autoOpenRouterReasoningEffortB", .text)
+                t.column("autoOpenRouterReasoningExcludeB", .boolean)
+                t.column("autoGoogleSearchEnabledA", .boolean)
+                t.column("autoCodeExecutionEnabledA", .boolean)
+                t.column("autoURLContextEnabledA", .boolean)
+                t.column("autoGoogleMapsEnabledA", .boolean)
+                t.column("autoComputerUseEnabledA", .boolean)
+                t.column("autoThinkingEnabledA", .boolean)
+                t.column("autoThinkingBudgetA", .integer)
+                t.column("autoThinkingLevelA", .text)
+                t.column("autoCodexReasoningEffortA", .text)
+                t.column("autoGoogleSearchEnabledB", .boolean)
+                t.column("autoCodeExecutionEnabledB", .boolean)
+                t.column("autoURLContextEnabledB", .boolean)
+                t.column("autoGoogleMapsEnabledB", .boolean)
+                t.column("autoComputerUseEnabledB", .boolean)
+                t.column("autoThinkingEnabledB", .boolean)
+                t.column("autoThinkingBudgetB", .integer)
+                t.column("autoThinkingLevelB", .text)
+                t.column("autoCodexReasoningEffortB", .text)
+
+                t.column("pccReasoningLevel", .text)
+                t.column("providerDefaultModelsJSON", .text).notNull().defaults(to: "{}")
+                t.column("preferredProvidersJSON", .text).notNull().defaults(to: "[]")
+                t.column("selectedQuantizationsJSON", .text).notNull().defaults(to: "[]")
+                t.column("maxPricePerMillionTokens", .double).notNull().defaults(to: 0)
+                t.column("allowFallbacks", .boolean).notNull().defaults(to: true)
+                t.column("requireParameters", .boolean).notNull().defaults(to: false)
+                t.column("providerSelectionMax", .integer).notNull().defaults(to: 12)
+                t.column("providerSort", .text).notNull().defaults(to: "price")
+
+                t.column("openAIBaseURL", .text).notNull().defaults(to: "")
+                t.column("miniMaxBaseURL", .text).notNull().defaults(to: "")
+                t.column("openAICompatPresetsJSON", .text).notNull().defaults(to: "[]")
+                t.column("selectedOpenAICompatPreset", .text)
+                t.column("alibabaMCPEnabled", .boolean).notNull().defaults(to: false)
+                t.column("alibabaMCPServerURL", .text).notNull().defaults(to: "")
+                t.column("alibabaMCPServerName", .text).notNull().defaults(to: "firecrawl")
+                t.column("alibabaMCPAllowedToolsCSV", .text).notNull().defaults(to: "")
+
+                t.column("codexReasoningEnabled", .boolean).notNull().defaults(to: true)
+                t.column("codexReasoningEffort", .text).notNull().defaults(to: "medium")
+                t.column("codexReasoningSummary", .text).notNull().defaults(to: "auto")
+                t.column("codexVerbosity", .text).notNull().defaults(to: "medium")
+                t.column("codexSupportsReasoningSummaries", .boolean).notNull().defaults(to: false)
+                t.column("codexPromptCacheEnabled", .boolean).notNull().defaults(to: true)
+
+                t.column("superGrokReasoningEnabled", .boolean).notNull().defaults(to: true)
+                t.column("superGrokReasoningEffort", .text).notNull().defaults(to: "medium")
+
+                t.column("showGlobalProviderPresetsInChat", .boolean).notNull().defaults(to: true)
+                t.column("showGlobalProviderPresetsInChatByProviderJSON", .text).notNull().defaults(to: "{}")
+                t.column("chatStatsVisibleFieldsJSON", .text).notNull()
+                    .defaults(to: #"["tokensPerSecond","cacheHit","tokens"]"#)
+
+                t.column("extraJSON", .text).notNull().defaults(to: "{}")
+            }
+
+            try db.create(table: "fusion_traces") { t in
+                t.column("id", .text).primaryKey()
+                t.column("conversationId", .integer).references("conversations", onDelete: .setNull)
+                t.column("preset", .text).notNull()
+                t.column("startedAtMs", .integer).notNull()
+                t.column("completedAtMs", .integer)
+                t.column("totalLatencyMs", .integer)
+                t.column("totalCostUsd", .double)
+                t.column("failedModelsJSON", .text).notNull().defaults(to: "[]")
+                t.column("traceJSON", .text).notNull()
+                t.column("status", .text).notNull()
+            }
+            try db.create(
+                index: "idx_fusion_traces_conversation",
+                on: "fusion_traces",
+                columns: ["conversationId", "startedAtMs"]
+            )
+
+            var defaultSettings = AppSettings()
+            try defaultSettings.insert(db)
+        }
+
+        migrator.registerMigration("v2_message_variants") { db in
+            try db.alter(table: "chat_messages") { t in
+                t.add(column: "selectedVariantIndex", .integer).notNull().defaults(to: 0)
+            }
+
+            try db.create(table: "chat_message_variants") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("baseMessageId", .integer).notNull().references("chat_messages", onDelete: .cascade)
+                t.column("variantIndex", .integer).notNull()
+                t.column("text", .text).notNull()
+                t.column("attachmentsJSON", .text).notNull().defaults(to: "[]")
+                t.column("thinkingStream", .text)
+                t.column("createdAtMs", .integer).notNull()
+            }
+            try db.create(
+                index: "idx_message_variants_base_order",
+                on: "chat_message_variants",
+                columns: ["baseMessageId", "variantIndex"],
+                unique: true
+            )
+        }
+
+        migrator.registerMigration("v3_projects") { db in
+            try db.create(table: "projects") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("title", .text).notNull()
+                t.column("iconName", .text).notNull().defaults(to: "folder.fill")
+                t.column("colorHex", .text).notNull().defaults(to: "#3A7AFE")
+                t.column("instructions", .text)
+                t.column("createdAtMs", .integer).notNull()
+                t.column("updatedAtMs", .integer).notNull()
+            }
+
+            try db.alter(table: "conversations") { t in
+                t.add(column: "projectId", .integer).references("projects", onDelete: .setNull)
+            }
+            try db.create(index: "idx_conversations_project", on: "conversations", columns: ["projectId", "updatedAtMs"])
+        }
+
+        migrator.registerMigration("v4_dual_parity") { db in
+            func existingColumns(in table: String) throws -> Set<String> {
+                let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+                return Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            }
+
+            func ensureDualMessageColumns() throws {
+                var columns = try existingColumns(in: "dual_chat_messages")
+                if !columns.contains("role") {
+                    try db.alter(table: "dual_chat_messages") { t in
+                        t.add(column: "role", .text).notNull().defaults(to: "legacy")
+                    }
+                    columns.insert("role")
+                }
+                if !columns.contains("modelathinking") {
+                    try db.alter(table: "dual_chat_messages") { t in
+                        t.add(column: "modelAThinking", .text)
+                    }
+                    columns.insert("modelathinking")
+                }
+                if !columns.contains("modelbthinking") {
+                    try db.alter(table: "dual_chat_messages") { t in
+                        t.add(column: "modelBThinking", .text)
+                    }
+                    columns.insert("modelbthinking")
+                }
+                if !columns.contains("attachmentsjson") {
+                    try db.alter(table: "dual_chat_messages") { t in
+                        t.add(column: "attachmentsJSON", .text).notNull().defaults(to: "[]")
+                    }
+                }
+            }
+
+            func ensureSettingsColumns() throws {
+                let columns = try existingColumns(in: "settings")
+                let nullableBooleanColumns = [
+                    "dualOpenRouterThinkingEnabledA",
+                    "dualOpenRouterReasoningExcludeA",
+                    "dualOpenRouterThinkingEnabledB",
+                    "dualOpenRouterReasoningExcludeB",
+                    "dualGoogleSearchEnabledA",
+                    "dualCodeExecutionEnabledA",
+                    "dualURLContextEnabledA",
+                    "dualGoogleMapsEnabledA",
+                    "dualComputerUseEnabledA",
+                    "dualThinkingEnabledA",
+                    "dualGoogleSearchEnabledB",
+                    "dualCodeExecutionEnabledB",
+                    "dualURLContextEnabledB",
+                    "dualGoogleMapsEnabledB",
+                    "dualComputerUseEnabledB",
+                    "dualThinkingEnabledB"
+                ]
+                let nullableIntColumns = [
+                    "dualOpenRouterThinkingBudgetA",
+                    "dualOpenRouterThinkingBudgetB",
+                    "dualThinkingBudgetA",
+                    "dualThinkingBudgetB"
+                ]
+                let nullableTextColumns = [
+                    "dualOpenRouterReasoningModeA",
+                    "dualOpenRouterReasoningEffortA",
+                    "dualOpenRouterReasoningModeB",
+                    "dualOpenRouterReasoningEffortB",
+                    "dualThinkingLevelA",
+                    "dualCodexReasoningEffortA",
+                    "dualThinkingLevelB",
+                    "dualCodexReasoningEffortB"
+                ]
+
+                for name in nullableBooleanColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .boolean)
+                    }
+                }
+                for name in nullableIntColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .integer)
+                    }
+                }
+                for name in nullableTextColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .text)
+                    }
+                }
+            }
+
+            try ensureDualMessageColumns()
+            try ensureSettingsColumns()
+        }
+
+        migrator.registerMigration("v5_auto_conversation_parity") { db in
+            func existingColumns(in table: String) throws -> Set<String> {
+                let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))")
+                return Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            }
+
+            func ensureAutoConversationColumns() throws {
+                var columns = try existingColumns(in: "auto_conversations")
+                if !columns.contains("currentturn") {
+                    try db.alter(table: "auto_conversations") { t in
+                        t.add(column: "currentTurn", .integer).notNull().defaults(to: 0)
+                    }
+                    columns.insert("currentturn")
+                }
+                if !columns.contains("lastactiveatms") {
+                    try db.alter(table: "auto_conversations") { t in
+                        t.add(column: "lastActiveAtMs", .integer).notNull().defaults(to: 0)
+                    }
+                    columns.insert("lastactiveatms")
+                }
+                if !columns.contains("endreason") {
+                    try db.alter(table: "auto_conversations") { t in
+                        t.add(column: "endReason", .text)
+                    }
+                    columns.insert("endreason")
+                }
+                if !columns.contains("endsignal") {
+                    try db.alter(table: "auto_conversations") { t in
+                        t.add(column: "endSignal", .text).notNull().defaults(to: "[END]")
+                    }
+                    columns.insert("endsignal")
+                }
+                if !columns.contains("boundchatconversationid") {
+                    try db.alter(table: "auto_conversations") { t in
+                        t.add(column: "boundChatConversationId", .integer)
+                    }
+                    columns.insert("boundchatconversationid")
+                }
+
+                try db.execute(
+                    sql: """
+                    UPDATE auto_conversations
+                    SET lastActiveAtMs = CASE
+                        WHEN lastActiveAtMs <= 0 THEN COALESCE(updatedAtMs, createdAtMs, 0)
+                        ELSE lastActiveAtMs
+                    END
+                    """
+                )
+                if columns.contains("boundconversationid") {
+                    try db.execute(
+                        sql: """
+                        UPDATE auto_conversations
+                        SET boundChatConversationId = COALESCE(boundChatConversationId, boundConversationId)
+                        WHERE boundChatConversationId IS NULL
+                        """
+                    )
+                }
+            }
+
+            func ensureAutoConversationMessageColumns() throws {
+                let columns = try existingColumns(in: "auto_conversation_messages")
+                if !columns.contains("reasoning") {
+                    try db.alter(table: "auto_conversation_messages") { t in
+                        t.add(column: "reasoning", .text)
+                    }
+                }
+                if !columns.contains("isendsignal") {
+                    try db.alter(table: "auto_conversation_messages") { t in
+                        t.add(column: "isEndSignal", .boolean).notNull().defaults(to: false)
+                    }
+                }
+            }
+
+            func ensureSettingsColumns() throws {
+                let columns = try existingColumns(in: "settings")
+                let nullableBooleanColumns = [
+                    "autoOpenRouterThinkingEnabledA",
+                    "autoOpenRouterReasoningExcludeA",
+                    "autoOpenRouterThinkingEnabledB",
+                    "autoOpenRouterReasoningExcludeB",
+                    "autoGoogleSearchEnabledA",
+                    "autoCodeExecutionEnabledA",
+                    "autoURLContextEnabledA",
+                    "autoGoogleMapsEnabledA",
+                    "autoComputerUseEnabledA",
+                    "autoThinkingEnabledA",
+                    "autoGoogleSearchEnabledB",
+                    "autoCodeExecutionEnabledB",
+                    "autoURLContextEnabledB",
+                    "autoGoogleMapsEnabledB",
+                    "autoComputerUseEnabledB",
+                    "autoThinkingEnabledB"
+                ]
+                let nullableIntColumns = [
+                    "autoOpenRouterThinkingBudgetA",
+                    "autoOpenRouterThinkingBudgetB",
+                    "autoThinkingBudgetA",
+                    "autoThinkingBudgetB"
+                ]
+                let nullableTextColumns = [
+                    "autoOpenRouterReasoningModeA",
+                    "autoOpenRouterReasoningEffortA",
+                    "autoOpenRouterReasoningModeB",
+                    "autoOpenRouterReasoningEffortB",
+                    "autoThinkingLevelA",
+                    "autoCodexReasoningEffortA",
+                    "autoThinkingLevelB",
+                    "autoCodexReasoningEffortB"
+                ]
+
+                for name in nullableBooleanColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .boolean)
+                    }
+                }
+                for name in nullableIntColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .integer)
+                    }
+                }
+                for name in nullableTextColumns where !columns.contains(name.lowercased()) {
+                    try db.alter(table: "settings") { t in
+                        t.add(column: name, .text)
+                    }
+                }
+            }
+
+            try ensureAutoConversationColumns()
+            try ensureAutoConversationMessageColumns()
+            try ensureSettingsColumns()
+        }
+
+        migrator.registerMigration("v6_token_usage_stats") { db in
+            try db.create(table: "token_usage_records", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("timestamp", .integer).notNull()
+                t.column("provider", .text).notNull()
+                t.column("model", .text).notNull()
+                t.column("requestType", .text).notNull().defaults(to: "chat")
+                t.column("conversationId", .integer).references("conversations", onDelete: .setNull)
+                t.column("inputTokens", .integer).notNull().defaults(to: 0)
+                t.column("outputTokens", .integer).notNull().defaults(to: 0)
+                t.column("totalTokens", .integer).notNull().defaults(to: 0)
+                t.column("reasoningTokens", .integer)
+                t.column("cachedInputTokens", .integer)
+                t.column("cacheCreationInputTokens", .integer)
+                t.column("costUsd", .double)
+            }
+            try db.create(index: "idx_token_usage_timestamp", on: "token_usage_records", columns: ["timestamp"], ifNotExists: true)
+            try db.create(index: "idx_token_usage_model_timestamp", on: "token_usage_records", columns: ["model", "timestamp"], ifNotExists: true)
+            try db.create(index: "idx_token_usage_conversation", on: "token_usage_records", columns: ["conversationId"], ifNotExists: true)
+        }
+
+        migrator.registerMigration("v7_token_usage_cache_creation") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(token_usage_records)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !columns.contains("cachecreationinputtokens") {
+                try db.alter(table: "token_usage_records") { t in
+                    t.add(column: "cacheCreationInputTokens", .integer)
+                }
+            }
+        }
+
+        migrator.registerMigration("v8_alibaba_remote_mcp") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "settings") { t in
+                if !columns.contains("alibabamcpenabled") {
+                    t.add(column: "alibabaMCPEnabled", .boolean).notNull().defaults(to: false)
+                }
+                if !columns.contains("alibabamcpserverurl") {
+                    t.add(column: "alibabaMCPServerURL", .text).notNull().defaults(to: "")
+                }
+                if !columns.contains("alibabamcpservername") {
+                    t.add(column: "alibabaMCPServerName", .text).notNull().defaults(to: "firecrawl")
+                }
+                if !columns.contains("alibabamcpallowedtoolscsv") {
+                    t.add(column: "alibabaMCPAllowedToolsCSV", .text).notNull().defaults(to: "")
+                }
+            }
+        }
+
+        migrator.registerMigration("v9_client_web_search_tool") { db in
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !settingsColumns.contains("clientwebsearchtoolenabled") {
+                try db.alter(table: "settings") { t in
+                    t.add(column: "clientWebSearchToolEnabled", .boolean).notNull().defaults(to: false)
+                }
+            }
+
+            try Self.createToolActivityTable(db)
+        }
+
+        migrator.registerMigration("v10_tool_activity_variants") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(chat_message_tool_activity)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            guard !columns.isEmpty else {
+                try Self.createToolActivityTable(db)
+                return
+            }
+            guard !columns.contains("variantid") else {
+                try Self.createToolActivityIndexes(db)
+                return
+            }
+
+            try db.execute(sql: "ALTER TABLE chat_message_tool_activity RENAME TO chat_message_tool_activity_legacy")
+            try Self.createToolActivityTable(db)
+            try db.execute(sql: """
+                INSERT INTO chat_message_tool_activity (id, messageId, stepsJSON)
+                SELECT id, messageId, stepsJSON
+                FROM chat_message_tool_activity_legacy
+                WHERE messageId IS NOT NULL
+                """)
+            try db.execute(sql: "DROP TABLE chat_message_tool_activity_legacy")
+        }
+
+        migrator.registerMigration("v11_fusion_mode") { db in
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "settings") { t in
+                if !settingsColumns.contains("isfusionmodeenabled") {
+                    t.add(column: "isFusionModeEnabled", .boolean).notNull().defaults(to: false)
+                }
+                if !settingsColumns.contains("fusionpresetname") {
+                    t.add(column: "fusionPresetName", .text).notNull().defaults(to: "quality")
+                }
+                if !settingsColumns.contains("fusiontasktype") {
+                    t.add(column: "fusionTaskType", .text).notNull().defaults(to: "auto")
+                }
+                if !settingsColumns.contains("fusiondebugmodeenabled") {
+                    t.add(column: "fusionDebugModeEnabled", .boolean).notNull().defaults(to: false)
+                }
+                if !settingsColumns.contains("fusionlogpromptsenabled") {
+                    t.add(column: "fusionLogPromptsEnabled", .boolean).notNull().defaults(to: false)
+                }
+            }
+
+            let messageRows = try Row.fetchAll(db, sql: "PRAGMA table_info(chat_messages)")
+            let messageColumns = Set(messageRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !messageColumns.contains("fusiontraceid") {
+                try db.alter(table: "chat_messages") { t in
+                    t.add(column: "fusionTraceId", .text)
+                }
+            }
+
+            try db.create(table: "fusion_traces", ifNotExists: true) { t in
+                t.column("id", .text).primaryKey()
+                t.column("conversationId", .integer).references("conversations", onDelete: .setNull)
+                t.column("preset", .text).notNull()
+                t.column("startedAtMs", .integer).notNull()
+                t.column("completedAtMs", .integer)
+                t.column("totalLatencyMs", .integer)
+                t.column("totalCostUsd", .double)
+                t.column("failedModelsJSON", .text).notNull().defaults(to: "[]")
+                t.column("traceJSON", .text).notNull()
+                t.column("status", .text).notNull()
+            }
+            try db.create(
+                index: "idx_fusion_traces_conversation",
+                on: "fusion_traces",
+                columns: ["conversationId", "startedAtMs"],
+                ifNotExists: true
+            )
+        }
+
+        migrator.registerMigration("v12_fusion_custom_preset") { db in
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !settingsColumns.contains("fusioncustompresetjson") {
+                try db.alter(table: "settings") { t in
+                    t.add(column: "fusionCustomPresetJSON", .text).notNull().defaults(to: "")
+                }
+            }
+        }
+
+        migrator.registerMigration("v13_gemini_rotation") { db in
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "settings") { t in
+                if !settingsColumns.contains("geminikeynamesjson") {
+                    t.add(column: "geminiKeyNamesJSON", .text).notNull().defaults(to: "[]")
+                }
+                if !settingsColumns.contains("geminirotationmodelsjson") {
+                    t.add(column: "geminiRotationModelsJSON", .text).notNull().defaults(to: "[]")
+                }
+            }
+        }
+
+        migrator.registerMigration("v14_supergrok_reasoning") { db in
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "settings") { t in
+                if !settingsColumns.contains("supergrokreasoningenabled") {
+                    t.add(column: "superGrokReasoningEnabled", .boolean).notNull().defaults(to: true)
+                }
+                if !settingsColumns.contains("supergrokreasoningeffort") {
+                    t.add(column: "superGrokReasoningEffort", .text).notNull().defaults(to: "medium")
+                }
+            }
+        }
+
+        migrator.registerMigration("v15_conversation_stats") { db in
+            try db.create(table: "conversation_execution_metrics", ifNotExists: true) { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("conversationId", .integer).notNull().references("conversations", onDelete: .cascade)
+                t.column("turnId", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("startedAtMs", .integer).notNull()
+                t.column("firstTokenAtMs", .integer)
+                t.column("completedAtMs", .integer).notNull()
+                t.column("succeeded", .boolean).notNull()
+                t.column("inputTokens", .integer)
+                t.column("outputTokens", .integer)
+                t.column("cachedInputTokens", .integer)
+                t.column("cacheCreationInputTokens", .integer)
+            }
+            try db.create(
+                index: "idx_execution_metrics_conversation",
+                on: "conversation_execution_metrics",
+                columns: ["conversationId", "id"],
+                ifNotExists: true
+            )
+
+            let settingsRows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let settingsColumns = Set(settingsRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !settingsColumns.contains("chatstatsvisiblefieldsjson") {
+                try db.alter(table: "settings") { t in
+                    t.add(
+                        column: "chatStatsVisibleFieldsJSON",
+                        .text
+                    ).notNull().defaults(to: #"["tokensPerSecond","cacheHit","tokens"]"#)
+                }
+            }
+        }
+
+        migrator.registerMigration("v16_tool_provider_transcript") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(chat_message_tool_activity)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !columns.contains("providertranscriptjson") {
+                try db.alter(table: "chat_message_tool_activity") { t in
+                    t.add(column: "providerTranscriptJSON", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v17_pi_context_usage") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(token_usage_records)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "token_usage_records") { t in
+                if !columns.contains("contexttokens") {
+                    t.add(column: "contextTokens", .integer)
+                }
+                if !columns.contains("contextwindow") {
+                    t.add(column: "contextWindow", .integer)
+                }
+            }
+        }
+
+        migrator.registerMigration("v18_dual_tool_activity") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(dual_chat_messages)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            try db.alter(table: "dual_chat_messages") { t in
+                if !columns.contains("modelatoolactivityjson") {
+                    t.add(column: "modelAToolActivityJSON", .text)
+                }
+                if !columns.contains("modelbtoolactivityjson") {
+                    t.add(column: "modelBToolActivityJSON", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v19_python_execute_tool") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(settings)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !columns.contains("pythontoolenabled") {
+                try db.alter(table: "settings") { t in
+                    t.add(column: "pythonToolEnabled", .boolean).notNull().defaults(to: true)
+                }
+            }
+        }
+
+        migrator.registerMigration("v20_pi_execution_history") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(chat_message_tool_activity)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !columns.contains("piexecutionjson") {
+                try db.alter(table: "chat_message_tool_activity") { t in
+                    t.add(column: "piExecutionJSON", .text)
+                }
+            }
+
+            let autoRows = try Row.fetchAll(db, sql: "PRAGMA table_info(auto_conversation_messages)")
+            let autoColumns = Set(autoRows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !autoColumns.contains("piexecutionjson") {
+                try db.alter(table: "auto_conversation_messages") { t in
+                    t.add(column: "piExecutionJSON", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v21_tool_attachment_paths") { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(chat_message_tool_activity)")
+            let columns = Set(rows.compactMap { ($0["name"] as String?)?.lowercased() })
+            if !columns.contains("attachmentpathsjson") {
+                try db.alter(table: "chat_message_tool_activity") { t in
+                    t.add(column: "attachmentPathsJSON", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v22_dual_side_status") { db in
+            let columns = Set(try db.columns(in: "dual_chat_messages").map(\.name))
+            try db.alter(table: "dual_chat_messages") { table in
+                if !columns.contains("modelAStatus") {
+                    table.add(column: "modelAStatus", .text).notNull().defaults(to: "completed")
+                }
+                if !columns.contains("modelBStatus") {
+                    table.add(column: "modelBStatus", .text).notNull().defaults(to: "completed")
+                }
+                if !columns.contains("modelAError") {
+                    table.add(column: "modelAError", .text)
+                }
+                if !columns.contains("modelBError") {
+                    table.add(column: "modelBError", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v23_pending_initial_message") { db in
+            let columns = Set(try db.columns(in: "conversations").map(\.name))
+            if !columns.contains("pendingInitialMessage") {
+                try db.alter(table: "conversations") { table in
+                    table.add(column: "pendingInitialMessage", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v24_stream_checkpoints") { db in
+            try db.create(table: "chat_stream_checkpoints", ifNotExists: true) { table in
+                table.autoIncrementedPrimaryKey("id")
+                table.column("messageId", .integer).references("chat_messages", onDelete: .cascade)
+                table.column("variantId", .integer).references("chat_message_variants", onDelete: .cascade)
+                table.column("text", .text).notNull().defaults(to: "")
+                table.column("thinking", .text).notNull().defaults(to: "")
+                table.column("updatedAtMs", .integer).notNull()
+                table.check(sql: "(messageId IS NOT NULL AND variantId IS NULL) OR (messageId IS NULL AND variantId IS NOT NULL)")
+            }
+            try db.create(
+                index: "idx_stream_checkpoint_message",
+                on: "chat_stream_checkpoints",
+                columns: ["messageId"],
+                unique: true,
+                ifNotExists: true
+            )
+            try db.create(
+                index: "idx_stream_checkpoint_variant",
+                on: "chat_stream_checkpoints",
+                columns: ["variantId"],
+                unique: true,
+                ifNotExists: true
+            )
+        }
+
+        migrator.registerMigration("v25_system_prompt_enabled") { db in
+            let columns = Set(try db.columns(in: "settings").map(\.name))
+            if !columns.contains("isSystemPromptEnabled") {
+                try db.alter(table: "settings") { table in
+                    table.add(column: "isSystemPromptEnabled", .boolean).notNull().defaults(to: true)
+                }
+            }
+        }
+
+        migrator.registerMigration("v26_provider_rotation_notices") { db in
+            let columns = Set(try db.columns(in: "chat_message_tool_activity").map(\.name))
+            if !columns.contains("rotationNoticesJSON") {
+                try db.alter(table: "chat_message_tool_activity") { table in
+                    table.add(column: "rotationNoticesJSON", .text)
+                }
+            }
+        }
+
+        migrator.registerMigration("v_review_share_inbox") { db in
+            try db.create(table: "share_imports") { t in
+                t.column("payloadId", .text).primaryKey()
+                t.column("conversationId", .integer).references("conversations", onDelete: .setNull)
+                t.column("draft", .text)
+            }
+            try db.execute(sql: """
+                CREATE TRIGGER consume_share_draft_after_message AFTER INSERT ON chat_messages
+                WHEN NEW.role = 'user' BEGIN
+                    UPDATE share_imports SET draft = NULL WHERE conversationId = NEW.conversationId;
+                END;
+                CREATE TRIGGER consume_share_draft_after_dual AFTER INSERT ON dual_chat_messages
+                WHEN NEW.role = 'user' BEGIN
+                    UPDATE share_imports SET draft = NULL WHERE conversationId = NEW.conversationId;
+                END;
+                """)
+        }
+        migrator.registerMigration("v27_pcc_reasoning") { db in
+            let columns = Set(try db.columns(in: "settings").map(\.name))
+            if !columns.contains("pccReasoningLevel") {
+                try db.alter(table: "settings") { table in
+                    table.add(column: "pccReasoningLevel", .text)
+                }
+            }
+        }
+        migrator.registerMigration("v28_enable_python_for_pcc") { db in
+            try db.execute(sql: """
+                UPDATE settings
+                SET pythonToolEnabled = 1
+                WHERE UPPER(apiProvider) = 'APPLE_INTELLIGENCE'
+                  AND defaultModel = ?
+                """, arguments: [AppleIntelligenceModelCatalog.pccModel])
+        }
+        migrator.registerMigration("v29_compact_pi_diagnostics") { db in
+            // The replayable transcript, message text, and attachments have
+            // their own canonical storage. Remove only redundant diagnostic
+            // copies from snapshots created by the previous Pi contract.
+            let paths = [
+                "$.request", "$.state.messages", "$.state.streamingMessage",
+                "$.providerRequests", "$.providerTranscript", "$.events"
+            ]
+            let removePaths = paths.map { "'\($0)'" }.joined(separator: ", ")
+            let compact = "json_set(json_remove(%@, \(removePaths)), '$.version', 3, '$.legacyCompacted', 1, '$.redactions', json('[\"Credentials, message bodies, image bytes, and provider payload bodies\"]'))"
+            for (table, column) in [
+                ("chat_message_tool_activity", "piExecutionJSON"),
+                ("auto_conversation_messages", "piExecutionJSON")
+            ] {
+                let expression = String(format: compact, column)
+                try db.execute(sql: """
+                    UPDATE \(table) SET \(column) = \(expression)
+                    WHERE \(column) IS NOT NULL AND json_valid(\(column))
+                      AND json_extract(\(column), '$.format') = 'yamabiko.pi-agent-execution'
+                      AND COALESCE(json_extract(\(column), '$.version'), 0) < 3
+                    """)
+            }
+            for column in ["modelAToolActivityJSON", "modelBToolActivityJSON"] {
+                let activity = "json_set(\(column), '$.piExecution', json(\(String(format: compact, "json_extract(\(column), '$.piExecution')"))))"
+                try db.execute(sql: """
+                    UPDATE dual_chat_messages SET \(column) = \(activity)
+                    WHERE \(column) IS NOT NULL AND json_valid(\(column))
+                      AND json_extract(\(column), '$.piExecution.format') = 'yamabiko.pi-agent-execution'
+                      AND COALESCE(json_extract(\(column), '$.piExecution.version'), 0) < 3
+                    """)
+            }
+            let traceIDs = try String.fetchAll(
+                db,
+                sql: "SELECT id FROM fusion_traces WHERE instr(traceJSON, 'yamabiko.pi-agent-execution') > 0"
+            )
+            for id in traceIDs {
+                guard let traceJSON = try String.fetchOne(
+                    db, sql: "SELECT traceJSON FROM fusion_traces WHERE id = ?", arguments: [id]
+                ), let object = try? JSONSerialization.jsonObject(with: Data(traceJSON.utf8)) else {
+                    continue
+                }
+                let (compacted, changed) = compactNestedPiDiagnostics(object)
+                guard changed else { continue }
+                let data = try JSONSerialization.data(withJSONObject: compacted, options: [.sortedKeys])
+                try db.execute(
+                    sql: "UPDATE fusion_traces SET traceJSON = ? WHERE id = ?",
+                    arguments: [String(decoding: data, as: UTF8.self), id]
+                )
+            }
+        }
+        migrator.registerMigration("v30_remove_url_only_endpoints") { db in
+            let columns = Set(try db.columns(in: "settings").map(\.name))
+            for column in ["openAIBaseURL", "miniMaxBaseURL"] where columns.contains(column) {
+                try db.execute(sql: "ALTER TABLE settings DROP COLUMN \(column)")
+            }
+        }
+        migrator.registerMigration("v31_genui_tool_setting") { db in
+            guard !(try db.columns(in: "settings")).contains(where: { $0.name == "genUIToolEnabled" }) else { return }
+            try db.alter(table: "settings") { t in
+                t.add(column: "genUIToolEnabled", .boolean).notNull().defaults(to: true)
+            }
+        }
+        migrator.registerMigration("v32_context_compaction") { db in
+            try db.create(table: "conversation_context_checkpoints") { t in
+                t.column("conversationId", .integer).primaryKey().references("conversations", onDelete: .cascade)
+                t.column("payload", .text).notNull()
+            }
+        }
+        // Keep historical columns and traces readable, but retire all Fusion settings.
+        migrator.registerMigration("v33_retire_fusion") { db in
+            try db.execute(sql: """
+                UPDATE settings SET isFusionModeEnabled = 0,
+                    fusionPresetName = '', fusionTaskType = '',
+                    fusionDebugModeEnabled = 0, fusionLogPromptsEnabled = 0,
+                    fusionCustomPresetJSON = ''
+                """)
+        }
+
+        migrator.registerMigration("v34_redact_persisted_diagnostic_credentials") { db in
+            let locations = [
+                ("chat_message_tool_activity", "piExecutionJSON"),
+                ("auto_conversation_messages", "piExecutionJSON"),
+                ("dual_chat_messages", "modelAToolActivityJSON"),
+                ("dual_chat_messages", "modelBToolActivityJSON"),
+                ("fusion_traces", "traceJSON"),
+                ("chat_stream_checkpoints", "payload"),
+                ("conversation_context_checkpoints", "payload")
+            ]
+            for (table, column) in locations {
+                guard try db.columns(in: table).contains(where: { $0.name == column }) else { continue }
+                let rows = try Row.fetchAll(db, sql: "SELECT rowid AS securityRowID, \(column) FROM \(table) WHERE instr(\(column), 'yamabiko.pi-agent-execution') > 0")
+                for row in rows {
+                    let id: Int64 = row["securityRowID"]
+                    guard let text: String = row[column], let value = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)) else { continue }
+                    let cleaned = try JSONEncoder().encode(PiDiagnosticSanitizer.sanitize(value))
+                    try db.execute(sql: "UPDATE \(table) SET \(column) = ? WHERE rowid = ?", arguments: [String(decoding: cleaned, as: UTF8.self), id])
+                }
+            }
+        }
+
+        // Marker for the one-time removal of pre-hardening diagnostic files above.
+        migrator.registerMigration("v35_credential_boundary_security") { _ in }
+
+        migrator.registerMigration("v36_context_usage_breakdown") { db in
+            let columns = Set(try db.columns(in: "token_usage_records").map { $0.name.lowercased() })
+            try db.alter(table: "token_usage_records") { t in
+                for column in ["contextSystemPromptTokens", "contextToolDefinitionTokens", "contextMessageTokens"]
+                    where !columns.contains(column.lowercased()) {
+                    t.add(column: column, .integer)
+                }
+            }
+        }
+
+        migrator.registerMigration("v37_dual_side_execution_metrics") { db in
+            let columns = Set(try db.columns(in: "conversation_execution_metrics").map { $0.name.lowercased() })
+            guard !columns.contains("dualside") else { return }
+            try db.alter(table: "conversation_execution_metrics") { t in
+                t.add(column: "dualSide", .text)
+            }
+        }
+        return migrator
+    }
+
+    private static func compactNestedPiDiagnostics(_ value: Any) -> (Any, Bool) {
+        if var object = value as? [String: Any] {
+            var changed = false
+            if object["format"] as? String == "yamabiko.pi-agent-execution",
+               (object["version"] as? Int ?? 0) < 3 {
+                for key in ["request", "providerRequests", "providerTranscript", "events"] {
+                    object.removeValue(forKey: key)
+                }
+                if var state = object["state"] as? [String: Any] {
+                    state.removeValue(forKey: "messages")
+                    state.removeValue(forKey: "streamingMessage")
+                    object["state"] = state
+                }
+                object["version"] = 3
+                object["legacyCompacted"] = true
+                object["redactions"] = ["Credentials, message bodies, image bytes, and provider payload bodies"]
+                changed = true
+            }
+            for (key, nested) in object {
+                let (result, nestedChanged) = compactNestedPiDiagnostics(nested)
+                if nestedChanged {
+                    object[key] = result
+                    changed = true
+                }
+            }
+            return (object, changed)
+        }
+        if let array = value as? [Any] {
+            var changed = false
+            let compacted = array.map { nested -> Any in
+                let (result, nestedChanged) = compactNestedPiDiagnostics(nested)
+                changed = changed || nestedChanged
+                return result
+            }
+            return (compacted, changed)
+        }
+        return (value, false)
+    }
+
+    private static func reclaimUnusedSpace(in queue: DatabaseQueue) throws {
+        try queue.writeWithoutTransaction { db in
+            let freePages = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
+            let pageCount = try Int.fetchOne(db, sql: "PRAGMA page_count") ?? 0
+            let pageSize = try Int.fetchOne(db, sql: "PRAGMA page_size") ?? 4096
+            guard Int64(freePages) * Int64(pageSize) >= 32 * 1_024 * 1_024,
+                  freePages * 5 >= pageCount else { return }
+            try db.execute(sql: "VACUUM")
+        }
+    }
+
+    /// A checkpoint is written to a table that is intentionally outside all
+    /// conversation UI observations. On a cold launch, fold any interrupted
+    /// stream into its canonical row before observers are installed.
+    static func recoverStreamCheckpoints(in queue: DatabaseQueue) throws {
+        try queue.write { db in
+            let rows = try Row.fetchAll(db, sql: "SELECT messageId, variantId, text, thinking FROM chat_stream_checkpoints")
+            for row in rows {
+                let text: String = row["text"] ?? ""
+                let thinking: String = row["thinking"] ?? ""
+                if let messageId: Int64 = row["messageId"] {
+                    try db.execute(sql: "UPDATE chat_messages SET text = ? WHERE id = ?", arguments: [text, messageId])
+                    if !thinking.isEmpty {
+                        try db.execute(
+                            sql: "INSERT INTO chat_message_thinking (messageId, thinkingStream) VALUES (?, ?) ON CONFLICT(messageId) DO UPDATE SET thinkingStream = excluded.thinkingStream",
+                            arguments: [messageId, thinking]
+                        )
+                    }
+                } else if let variantId: Int64 = row["variantId"] {
+                    try db.execute(
+                        sql: "UPDATE chat_message_variants SET text = ?, thinkingStream = CASE WHEN ? = '' THEN thinkingStream ELSE ? END WHERE id = ?",
+                        arguments: [text, thinking, thinking, variantId]
+                    )
+                }
+            }
+            try db.execute(sql: "DELETE FROM chat_stream_checkpoints")
+            // An iOS process cannot retain a child session across a cold launch.
+            // Keep its partial output and mark only unfinished child records interrupted.
+            for row in try Row.fetchAll(db, sql: "SELECT id, stepsJSON FROM chat_message_tool_activity WHERE stepsJSON LIKE '%\"subagent\":%' AND stepsJSON LIKE '%\"running\"%'") {
+                let id: Int64 = row["id"]
+                let json: String = row["stepsJSON"]
+                guard let data = json.data(using: .utf8), let steps = try? JSONDecoder().decode([ToolActivityStep].self, from: data) else { continue }
+                var payload = ToolActivityPayload(steps: steps)
+                guard payload.subagents.contains(where: { $0.status == .running }) else { continue }
+                payload.failRunning(message: "アプリの終了によりサブエージェントの実行が中断されました")
+                let encoded = String(decoding: try JSONEncoder().encode(payload.steps), as: UTF8.self)
+                try db.execute(sql: "UPDATE chat_message_tool_activity SET stepsJSON = ? WHERE id = ?", arguments: [encoded, id])
+            }
+        }
+    }
+
+    private static func createToolActivityTable(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS chat_message_tool_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                messageId INTEGER REFERENCES chat_messages(id) ON DELETE CASCADE,
+                variantId INTEGER REFERENCES chat_message_variants(id) ON DELETE CASCADE,
+                stepsJSON TEXT NOT NULL DEFAULT '[]',
+                providerTranscriptJSON TEXT,
+                attachmentPathsJSON TEXT,
+                piExecutionJSON TEXT,
+                rotationNoticesJSON TEXT,
+                CHECK (
+                    (messageId IS NOT NULL AND variantId IS NULL)
+                    OR (messageId IS NULL AND variantId IS NOT NULL)
+                )
+            )
+            """)
+        try createToolActivityIndexes(db)
+    }
+
+    private static func createToolActivityIndexes(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_activity_message
+            ON chat_message_tool_activity(messageId)
+            WHERE messageId IS NOT NULL
+            """)
+        try db.execute(sql: """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_activity_variant
+            ON chat_message_tool_activity(variantId)
+            WHERE variantId IS NOT NULL
+            """)
+    }
+}

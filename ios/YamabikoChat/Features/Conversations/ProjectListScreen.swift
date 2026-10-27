@@ -1,0 +1,305 @@
+import SwiftUI
+
+struct ProjectListScreen: View {
+    @Environment(\.appAccent) private var appAccent
+    @ObservedObject var viewModel: ConversationListViewModel
+    var onBack: () -> Void
+    var onSelectProject: (Int64) -> Void
+
+    @State private var searchQuery: String = ""
+    @State private var isCreateProjectPresented: Bool = false
+    @State private var editingInstructionsProject: ProjectListEntry?
+    @State private var editingDetailsProject: ProjectListEntry?
+    @State private var pendingProjectDeletion: ProjectListEntry?
+
+    private var normalizedSearchQuery: String {
+        searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var hasSearchQuery: Bool {
+        !normalizedSearchQuery.isEmpty
+    }
+
+    private var filteredProjects: [ProjectListEntry] {
+        if normalizedSearchQuery.isEmpty {
+            return viewModel.projects
+        }
+        return viewModel.projects.filter {
+            $0.title.localizedCaseInsensitiveContains(normalizedSearchQuery) ||
+                ($0.instructions?.localizedCaseInsensitiveContains(normalizedSearchQuery) ?? false)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            headerBar
+
+            searchBar
+
+            projectListView
+        }
+        .background(Color(uiColor: .amoledSystemGroupedBackground).ignoresSafeArea())
+        .sheet(isPresented: $isCreateProjectPresented) {
+            ProjectEditorSheet(viewModel: viewModel, mode: .create) { title, instructions, iconName, colorHex in
+                guard let projectId = viewModel.createProject(
+                    title: title,
+                    instructions: instructions,
+                    iconName: iconName,
+                    colorHex: colorHex
+                ) else {
+                    return false
+                }
+                onSelectProject(projectId)
+                return true
+            }
+        }
+        .sheet(item: $editingInstructionsProject) { project in
+            ProjectInstructionsSheet(
+                viewModel: viewModel,
+                initialInstructions: project.instructions
+            ) { newInstructions in
+                viewModel.updateProjectInstructions(id: project.id, instructions: newInstructions)
+            }
+        }
+        .sheet(item: $editingDetailsProject) { project in
+            let chatProject = ChatProject(
+                id: project.id,
+                title: project.title,
+                iconName: project.iconName,
+                colorHex: project.colorHex,
+                instructions: project.instructions,
+                updatedAtMs: project.updatedAtMs
+            )
+            ProjectEditorSheet(viewModel: viewModel, mode: .edit(chatProject)) { title, instructions, iconName, colorHex in
+                viewModel.updateProject(
+                    id: project.id,
+                    title: title,
+                    instructions: instructions,
+                    iconName: iconName,
+                    colorHex: colorHex
+                )
+            }
+        }
+    }
+
+    // MARK: - Header Bar
+
+    private var headerBar: some View {
+        HStack(spacing: 12) {
+            Button(action: onBack) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 44, height: 44)
+                    .background(AMOLEDMaterial(material: .thinMaterial), in: Circle())
+                    .overlay(Circle().strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(L10n.text("戻る")))
+
+            Text(L10n.text("プロジェクト"))
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity)
+
+            Button {
+                isCreateProjectPresented = true
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(appAccent.onAccentColor)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(appAccent.color)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(L10n.text("新しいプロジェクト")))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+    }
+
+    // MARK: - Project List
+
+    private var projectListView: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if filteredProjects.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary.opacity(0.6))
+                            .padding(.top, 48)
+
+                        Text(hasSearchQuery ? L10n.text("該当するプロジェクトがありません") : L10n.text("プロジェクトがありません"))
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+
+                        if !hasSearchQuery {
+                            Button {
+                                isCreateProjectPresented = true
+                            } label: {
+                                Text(L10n.text("新しいプロジェクトを作成"))
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(appAccent.color)
+                            }
+                            .padding(.top, 4)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                } else {
+                    ForEach(filteredProjects) { project in
+                        projectRow(project)
+
+                    }
+                }
+            }
+            .padding(16)
+        }
+    }
+
+    private func projectRow(_ project: ProjectListEntry) -> some View {
+        Button {
+            onSelectProject(project.id)
+        } label: {
+            HStack(spacing: 14) {
+                // Folder Icon Box
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color(hex: project.colorHex).opacity(0.18))
+                        .frame(width: 44, height: 44)
+
+                    Image(systemName: project.iconName)
+                        .font(.system(size: 20))
+                        .foregroundStyle(Color(hex: project.colorHex))
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(project.title)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    if let instructions = project.instructions, !instructions.isEmpty {
+                        Text(instructions)
+                            .font(.subheadline)
+                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+                            .lineLimit(2)
+                    }
+                    if project.updatedAtMs > 0 {
+                        Text(RelativeDateFormatter.format(epochMs: project.updatedAtMs))
+                            .font(.system(size: 13))
+                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+                    }
+                }
+
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color(uiColor: .amoledTertiaryLabel))
+            }
+            .padding(16)
+            .background(Color(uiColor: .amoledSecondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("project-row-\(project.id)")
+        .confirmationDialog(
+            L10n.text("プロジェクトを削除"),
+            isPresented: Binding(
+                get: { pendingProjectDeletion?.id == project.id },
+                set: { isPresented in
+                    if !isPresented && pendingProjectDeletion?.id == project.id {
+                        pendingProjectDeletion = nil
+                    }
+                }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(role: .destructive) {
+                if viewModel.deleteProject(id: project.id, mode: .projectOnly) {
+                    pendingProjectDeletion = nil
+                }
+            } label: {
+                Text(L10n.text("プロジェクトのみ削除"))
+            }
+
+            Button(role: .destructive) {
+                if viewModel.deleteProject(id: project.id, mode: .withConversations) {
+                    pendingProjectDeletion = nil
+                }
+            } label: {
+                Text(L10n.text("会話も削除"))
+            }
+
+            Button(L10n.text("キャンセル"), role: .cancel) {
+                pendingProjectDeletion = nil
+            }
+        }
+        .contextMenu {
+            Button {
+                editingDetailsProject = project
+            } label: {
+                Label(L10n.text("プロジェクトを編集する"), systemImage: "pencil")
+            }
+
+            Button {
+                editingInstructionsProject = project
+            } label: {
+                Label(L10n.text("指示を編集"), systemImage: "slider.horizontal.3")
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                beginProjectDeletion(project)
+            } label: {
+                Label(L10n.text("プロジェクトを削除する"), systemImage: "trash")
+            }
+        }
+    }
+
+    // MARK: - Search
+
+    private var searchBar: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.body)
+                    .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+
+                TextField(L10n.text("プロジェクトを検索"), text: $searchQuery, prompt: Text(L10n.text("プロジェクトを検索")).foregroundStyle(Color(uiColor: .amoledPlaceholderText)))
+                    .font(.body)
+                    .textInputAutocapitalization(.never)
+                    .disableAutocorrection(true)
+
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.body)
+                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color(uiColor: .amoledSecondarySystemGroupedBackground))
+            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+        }
+        .background(Color(uiColor: .amoledSystemGroupedBackground))
+    }
+
+    private func beginProjectDeletion(_ project: ProjectListEntry) {
+        pendingProjectDeletion = project
+    }
+}

@@ -1,0 +1,1051 @@
+import Foundation
+
+typealias PiModelResolver = @Sendable ([PiAgentConfiguration]) async throws -> [PiModelResolution]
+
+typealias PiAgentStream = @Sendable (
+    ProviderRequest,
+    PiAgentConfiguration,
+    LocalToolRegistry
+) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error>
+
+/// The single LLM execution boundary. Every network-backed provider is normalized into a
+/// Pi model and executed by the bundled `pi-agent-core` runtime.
+final class ProviderGateway {
+    static let openRouterAttributionHeaders = [
+        // OpenRouter can group attribution by origin. The shared apps.apple.com
+        // origin can identify another iOS app even when our title is supplied.
+        "HTTP-Referer": AppConstants.marketingURL.absoluteString,
+        "X-OpenRouter-Title": "yamabikochat",
+        "X-Title": "yamabikochat"
+    ]
+
+    private let settingsRepository: SettingsRepository
+    private let credentialStore: SecureCredentialStore
+    private let piStream: PiAgentStream
+    private let piModelResolver: PiModelResolver
+    /// Snapshot fallback for tests / legacy callers.
+    private let localTools: LocalToolRegistry
+    /// Factory evaluated per request so Skill states are reflected without recreating the gateway.
+    private let localToolFactory: (@Sendable () -> LocalToolRegistry)?
+    private let codexAuthRepository: CodexAuthRepository?
+    private let superGrokAuthRepository: SuperGrokAuthRepository?
+    private let modelsDevCatalogRepository: ModelsDevCatalogRepository?
+    private let openRouterModelService: OpenRouterModelService?
+    private let projectWorkspaces: ProjectWorkspaceStore
+    private let editorWorkspaces: EditorWorkspaceStore
+    private let resetPythonSession: @Sendable (String) async -> Void
+    private let appleIntelligence = AppleIntelligenceProviderClient()
+    private let geminiRotationStateLock = NSLock()
+    private var lastGoodGeminiRotationCandidate: GeminiRotationCandidate?
+
+    private struct GeminiRotationCandidate: Sendable {
+        let keyID: String
+        let apiKey: String
+        let model: String
+        let keyIndex: Int
+    }
+
+    private enum GeminiRotationEligibility {
+        case rateLimited
+        case authFailure
+        case other
+    }
+
+    init(
+        settingsRepository: SettingsRepository,
+        credentialStore: SecureCredentialStore,
+        codexAuthRepository: CodexAuthRepository? = nil,
+        superGrokAuthRepository: SuperGrokAuthRepository? = nil,
+        modelsDevCatalogRepository: ModelsDevCatalogRepository? = nil,
+        openRouterModelService: OpenRouterModelService? = nil,
+        localTools: LocalToolRegistry = LocalToolRegistry(executors: [WebSearchTool(), FetchUrlTool(), PythonExecuteTool(), GenUITool(), GenUIReferenceTool()]),
+        localToolFactory: (@Sendable () -> LocalToolRegistry)? = nil,
+        projectWorkspaces: ProjectWorkspaceStore = .shared,
+        editorWorkspaces: EditorWorkspaceStore = .shared,
+        resetPythonSession: @escaping @Sendable (String) async -> Void = { sessionID in
+            await PythonWorker.shared.resetSession(sessionID: sessionID)
+        },
+        piModelResolver: @escaping PiModelResolver = { try await PiAgentRuntime.shared.resolveModels($0) },
+        piStream: @escaping PiAgentStream = { request, configuration, tools in
+            try await PiAgentRuntime.shared.stream(
+                request: request,
+                configuration: configuration,
+                tools: tools
+            )
+        }
+    ) {
+        self.settingsRepository = settingsRepository
+        self.credentialStore = credentialStore
+        self.codexAuthRepository = codexAuthRepository
+        self.superGrokAuthRepository = superGrokAuthRepository
+        self.modelsDevCatalogRepository = modelsDevCatalogRepository
+        self.openRouterModelService = openRouterModelService
+        self.localTools = localTools
+        self.localToolFactory = localToolFactory
+        self.projectWorkspaces = projectWorkspaces
+        self.editorWorkspaces = editorWorkspaces
+        self.resetPythonSession = resetPythonSession
+        self.piStream = piStream
+        self.piModelResolver = piModelResolver
+    }
+
+    // Factory has priority; fallback to snapshot for backwards compatibility / tests.
+    private func resolveLocalTools() -> LocalToolRegistry {
+        localToolFactory?() ?? localTools
+    }
+
+    func compact(request: ProviderRequest, providerID: String) async throws -> ProviderResponse {
+        // Use the same Pi model/auth configuration, without gateway rotation or local tools.
+        if knownProvider(providerID) == .appleIntelligence, request.model != AppleIntelligenceModelCatalog.pccModel {
+            throw ProviderClientError.parseFailure(L10n.text("このモデルは Pi compaction に対応していません。"))
+        }
+        var request = request
+        request.metadata["contextOperation"] = "compact"
+        request.tools = []
+        request.skillContext = nil
+        let config = try await configuration(providerID: providerID, request: request, settings: settingsRepository.load())
+        let stream = try await piStream(request, config, LocalToolRegistry(executors: []))
+        var response: ProviderResponse?
+        for try await event in stream {
+            if case let .completed(value) = event { response = value }
+        }
+        guard let response, response.providerTranscript?.isEmpty == false else {
+            throw ProviderClientError.parseFailure("Pi compaction returned no context")
+        }
+        return response
+    }
+
+    func generate(request: ProviderRequest, provider: LLMProvider) async throws -> ProviderResponse {
+        try await generate(request: request, providerID: provider.rawValue)
+    }
+
+    func generate(
+        request: ProviderRequest,
+        providerID: String,
+        onStreamEvent: (@Sendable (ProviderStreamEvent) -> Void)? = nil
+    ) async throws -> ProviderResponse {
+        let stream = try await stream(request: request, providerID: providerID)
+        var completed: ProviderResponse?
+        var reasoning = ""
+        var toolActivity = ToolActivityPayload()
+        for try await event in stream {
+            onStreamEvent?(event)
+            switch event {
+            case .answerStart, .textDelta, .textSnapshot: break
+            case let .reasoningDelta(delta): reasoning += delta
+            case let .toolActivity(activity): toolActivity.apply(activity)
+            case let .rotation(notice): toolActivity.rotationNotices.append(notice)
+            case let .executionSnapshot(execution): toolActivity.piExecution = execution
+            case let .completed(response): completed = response
+            }
+        }
+        guard var response = completed else {
+            throw ProviderClientError.parseFailure("Pi agent stream ended without completion")
+        }
+        for run in response.subagents ?? [] { toolActivity.applySubagent(run) }
+        if response.reasoningSummary == nil { response.reasoningSummary = reasoning.trimmedNonEmpty }
+        if let providerTranscript = response.providerTranscript {
+            toolActivity.providerTranscript = providerTranscript
+        }
+        if toolActivity.hasPersistableContent {
+            var merged = response.toolActivity ?? ToolActivityPayload()
+            if !toolActivity.steps.isEmpty { merged.steps = toolActivity.steps }
+            if !toolActivity.providerTranscript.isEmpty { merged.providerTranscript = toolActivity.providerTranscript }
+            if !toolActivity.attachmentPaths.isEmpty { merged.attachmentPaths = toolActivity.attachmentPaths }
+            if !toolActivity.rotationNotices.isEmpty { merged.rotationNotices = toolActivity.rotationNotices }
+            merged.piExecution = response.piExecution ?? toolActivity.piExecution
+            response.toolActivity = merged
+        }
+        return response
+    }
+
+    func stream(
+        request: ProviderRequest,
+        provider: LLMProvider
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        try await stream(request: request, providerID: provider.rawValue)
+    }
+
+    func stream(
+        request: ProviderRequest,
+        providerID: String
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        var scopedRequest = request
+        let executionSessionID: String?
+        if let rawProjectID = request.metadata[ConversationWorkspacePath.projectSourceMetadataKey]?.trimmedNonEmpty {
+            guard let projectID = Int64(rawProjectID) else {
+                throw ProviderClientError.parseFailure("Invalid project workspace source identifier")
+            }
+            let sessionID = try projectWorkspaces.prepareExecutionWorkspace(projectID: projectID)
+            scopedRequest.metadata["pythonSessionId"] = sessionID
+            scopedRequest.metadata["editorSessionId"] = sessionID
+            executionSessionID = sessionID
+        } else {
+            executionSessionID = nil
+        }
+
+        do {
+            let stream = try await streamPrepared(request: scopedRequest, providerID: providerID)
+            guard let executionSessionID else { return stream }
+            return executionWorkspaceStream(stream, sessionID: executionSessionID)
+        } catch {
+            if let executionSessionID {
+                await cleanupExecutionWorkspace(sessionID: executionSessionID)
+            }
+            throw error
+        }
+    }
+
+    private func streamPrepared(
+        request: ProviderRequest,
+        providerID: String
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        let requestID = UUID().uuidString
+        let normalizedProvider = providerID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        DiagnosticsLogger.log(
+            "Provider gateway entered",
+            category: .network,
+            requestID: requestID,
+            metadata: [
+                "provider": normalizedProvider,
+                "model": request.model,
+                "messages": String(request.messages.count),
+                "tools": request.tools.map(\.type).joined(separator: ","),
+                "stream": String(request.stream)
+            ]
+        )
+        let settings: AppSettings
+        do {
+            settings = try settingsRepository.load()
+        } catch {
+            DiagnosticsLogger.log(
+                "Provider gateway settings load failed",
+                category: .network,
+                requestID: requestID,
+                metadata: ["provider": normalizedProvider, "model": request.model],
+                error: error
+            )
+            throw error
+        }
+        if knownProvider(providerID) == .appleIntelligence, request.model != AppleIntelligenceModelCatalog.pccModel {
+            guard request.model == AppleIntelligenceModelCatalog.displayModel else { throw PCCFailure(code: "pcc_model_unsupported") }
+            return appleIntelligence.stream(request: request)
+        }
+        if knownProvider(providerID) == .gemini {
+            let candidates = try reorderedForLastGoodGeminiCandidate(
+                geminiRotationCandidates(for: request, settings: settings)
+            )
+            return try await geminiRotationStream(
+                request: request,
+                providerID: providerID,
+                settings: settings,
+                candidates: candidates,
+                requestID: requestID,
+                normalizedProvider: normalizedProvider
+            )
+        }
+
+        let piConfiguration: PiAgentConfiguration
+        do {
+            piConfiguration = try await configuration(
+                providerID: providerID,
+                request: request,
+                settings: settings
+            )
+        } catch {
+            DiagnosticsLogger.log(
+                "Pi agent configuration failed",
+                category: .network,
+                requestID: requestID,
+                metadata: ["provider": normalizedProvider, "model": request.model],
+                error: error
+            )
+            throw error
+        }
+        DiagnosticsLogger.log(
+            "Pi agent configuration ready",
+            category: .network,
+            requestID: requestID,
+            metadata: [
+                "provider": normalizedProvider,
+                "piProvider": piConfiguration.provider,
+                "model": piConfiguration.model,
+                "contractVersion": String(piConfiguration.contractVersion),
+                "credential": piConfiguration.apiKey?.isEmpty == false || !piConfiguration.env.isEmpty ? "present" : "missing",
+                "thinkingLevel": piConfiguration.thinkingLevel ?? "none"
+            ]
+        )
+        do {
+            let stream = try await piStream(request, piConfiguration, resolveLocalTools())
+            DiagnosticsLogger.log(
+                "Pi agent stream created",
+                category: .network,
+                requestID: requestID,
+                metadata: ["provider": normalizedProvider, "model": request.model]
+            )
+            return monitoredStream(
+                stream,
+                requestID: requestID,
+                provider: normalizedProvider,
+                model: request.model
+            )
+        } catch {
+            DiagnosticsLogger.log(
+                "Pi agent stream creation failed",
+                category: .network,
+                requestID: requestID,
+                metadata: ["provider": normalizedProvider, "model": request.model],
+                error: error
+            )
+            throw error
+        }
+    }
+
+    private func executionWorkspaceStream(
+        _ stream: AsyncThrowingStream<ProviderStreamEvent, Error>,
+        sessionID: String
+    ) -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await event in stream {
+                        continuation.yield(event)
+                    }
+                    await cleanupExecutionWorkspace(sessionID: sessionID)
+                    continuation.finish()
+                } catch is CancellationError {
+                    await cleanupExecutionWorkspace(sessionID: sessionID)
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    await cleanupExecutionWorkspace(sessionID: sessionID)
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func cleanupExecutionWorkspace(sessionID: String) async {
+        await resetPythonSession(sessionID)
+        do {
+            try editorWorkspaces.delete(sessionID: sessionID)
+        } catch {
+            DiagnosticsLogger.log(
+                "Project execution workspace cleanup failed",
+                category: .app,
+                metadata: ["sessionID": sessionID],
+                error: error
+            )
+        }
+    }
+
+    private func monitoredStream(
+        _ stream: AsyncThrowingStream<ProviderStreamEvent, Error>,
+        requestID: String,
+        provider: String,
+        model: String
+    ) -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await event in stream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish(throwing: CancellationError())
+                } catch {
+                    DiagnosticsLogger.log(
+                        "Pi agent stream failed",
+                        category: .network,
+                        requestID: requestID,
+                        metadata: ["provider": provider, "model": model],
+                        error: error
+                    )
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func geminiRotationCandidates(
+        for request: ProviderRequest,
+        settings: AppSettings
+    ) throws -> [GeminiRotationCandidate] {
+        var keys: [(id: String, value: String)] = []
+        if let defaultKey = try credentialStore.credential(for: .gemini)?.trimmedNonEmpty {
+            keys.append((id: "default", value: defaultKey))
+        }
+        for name in settings.geminiKeyNames() {
+            guard let value = try credentialStore.geminiAPIKey(name: name)?.trimmedNonEmpty else {
+                DiagnosticsLogger.log(
+                    "Gemini rotation key slot has no credential",
+                    level: .warning,
+                    category: .network,
+                    metadata: ["keySlot": name]
+                )
+                continue
+            }
+            guard !keys.contains(where: { $0.value == value }) else { continue }
+            keys.append((id: "slot:\(name)", value: value))
+        }
+        guard !keys.isEmpty else {
+            throw ProviderClientError.missingCredential(CredentialProvider.gemini.rawValue)
+        }
+
+        var models = [request.model]
+        for model in settings.geminiRotationModelsList() where !models.contains(model) {
+            models.append(model)
+        }
+
+        return keys.enumerated().flatMap { keyIndex, key in
+            models.map { model in
+                GeminiRotationCandidate(
+                    keyID: key.id,
+                    apiKey: key.value,
+                    model: model,
+                    keyIndex: keyIndex
+                )
+            }
+        }
+    }
+
+    private func reorderedForLastGoodGeminiCandidate(
+        _ candidates: [GeminiRotationCandidate]
+    ) -> [GeminiRotationCandidate] {
+        let last = geminiRotationStateLock.withLock { lastGoodGeminiRotationCandidate }
+        guard let last,
+              let matchIndex = candidates.firstIndex(where: {
+                  $0.keyID == last.keyID &&
+                      $0.apiKey == last.apiKey &&
+                      $0.model == last.model
+              }) else {
+            return candidates
+        }
+        let keyIndex = candidates[matchIndex].keyIndex
+        let sameKey = candidates.filter { $0.keyIndex == keyIndex }
+        let otherKeys = candidates.filter { $0.keyIndex != keyIndex }
+        guard let modelIndex = sameKey.firstIndex(where: { $0.model == last.model }) else {
+            return candidates
+        }
+        return Array(sameKey[modelIndex...]) + Array(sameKey[..<modelIndex]) + otherKeys
+    }
+
+    private func rememberGoodGeminiRotationCandidate(_ candidate: GeminiRotationCandidate) {
+        geminiRotationStateLock.withLock {
+            lastGoodGeminiRotationCandidate = candidate
+        }
+    }
+
+    private func geminiRotationStream(
+        request: ProviderRequest,
+        providerID: String,
+        settings: AppSettings,
+        candidates: [GeminiRotationCandidate],
+        requestID: String,
+        normalizedProvider: String
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        var initialCandidateIndex = 0
+        var initialStream: AsyncThrowingStream<ProviderStreamEvent, Error>
+        var initialRotationNotices: [ProviderRotationNotice] = []
+        while true {
+            let candidate = candidates[initialCandidateIndex]
+            var candidateRequest = request
+            candidateRequest.model = candidate.model
+            do {
+                initialStream = try await startGeminiCandidate(
+                    request: candidateRequest,
+                    providerID: providerID,
+                    settings: settings,
+                    candidate: candidate,
+                    candidateIndex: initialCandidateIndex,
+                    requestID: requestID,
+                    normalizedProvider: normalizedProvider
+                )
+                break
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let eligibility = Self.geminiRotationEligibility(error)
+                guard let nextIndex = Self.nextGeminiCandidateIndex(
+                    after: initialCandidateIndex,
+                    failedKeyIndex: candidate.keyIndex,
+                    candidates: candidates,
+                    eligibility: eligibility
+                ) else {
+                    throw error
+                }
+                logGeminiRotation(
+                    candidate: candidate,
+                    candidateIndex: initialCandidateIndex,
+                    nextCandidateIndex: nextIndex,
+                    eligibility: eligibility,
+                    requestID: requestID,
+                    error: error
+                )
+                initialRotationNotices.append(
+                    Self.geminiRotationNotice(
+                        from: candidate,
+                        to: candidates[nextIndex],
+                        eligibility: eligibility
+                    )
+                )
+                initialCandidateIndex = nextIndex
+            }
+        }
+
+        let preparedCandidateIndex = initialCandidateIndex
+        let preparedInitialStream = initialStream
+        let preparedRotationNotices = initialRotationNotices
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var candidateIndex = preparedCandidateIndex
+                var preparedStream: AsyncThrowingStream<ProviderStreamEvent, Error>? = preparedInitialStream
+
+                preparedRotationNotices.forEach { continuation.yield(.rotation($0)) }
+
+                while candidateIndex < candidates.count {
+                    let candidate = candidates[candidateIndex]
+                    var candidateRequest = request
+                    candidateRequest.model = candidate.model
+                    var pendingEvents: [ProviderStreamEvent] = []
+                    var committedToCandidate = false
+
+                    do {
+                        let stream: AsyncThrowingStream<ProviderStreamEvent, Error>
+                        if let existingStream = preparedStream {
+                            stream = existingStream
+                        } else {
+                            stream = try await startGeminiCandidate(
+                                request: candidateRequest,
+                                providerID: providerID,
+                                settings: settings,
+                                candidate: candidate,
+                                candidateIndex: candidateIndex,
+                                requestID: requestID,
+                                normalizedProvider: normalizedProvider
+                            )
+                        }
+                        preparedStream = nil
+
+                        for try await event in stream {
+                            if !committedToCandidate && Self.commitsGeminiCandidate(event) {
+                                pendingEvents.forEach { continuation.yield($0) }
+                                pendingEvents.removeAll(keepingCapacity: false)
+                                committedToCandidate = true
+                            }
+                            if committedToCandidate {
+                                continuation.yield(event)
+                            } else {
+                                pendingEvents.append(event)
+                            }
+                        }
+
+                        if !committedToCandidate {
+                            pendingEvents.forEach { continuation.yield($0) }
+                        }
+                        rememberGoodGeminiRotationCandidate(candidate)
+                        continuation.finish()
+                        return
+                    } catch is CancellationError {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    } catch {
+                        let eligibility = Self.geminiRotationEligibility(error)
+                        let nextIndex = Self.nextGeminiCandidateIndex(
+                            after: candidateIndex,
+                            failedKeyIndex: candidate.keyIndex,
+                            candidates: candidates,
+                            eligibility: eligibility
+                        )
+                        if !committedToCandidate, let nextIndex {
+                            logGeminiRotation(
+                                candidate: candidate,
+                                candidateIndex: candidateIndex,
+                                nextCandidateIndex: nextIndex,
+                                eligibility: eligibility,
+                                requestID: requestID,
+                                error: error
+                            )
+                            continuation.yield(
+                                .rotation(
+                                    Self.geminiRotationNotice(
+                                        from: candidate,
+                                        to: candidates[nextIndex],
+                                        eligibility: eligibility
+                                    )
+                                )
+                            )
+                            candidateIndex = nextIndex
+                            continue
+                        }
+
+                        pendingEvents.forEach { continuation.yield($0) }
+                        let exhausted = eligibility != .other && !committedToCandidate
+                        DiagnosticsLogger.log(
+                            exhausted ? "Gemini Pi rotation exhausted all candidates" : "Pi agent stream failed",
+                            category: .network,
+                            requestID: requestID,
+                            metadata: [
+                                "provider": normalizedProvider,
+                                "model": candidate.model,
+                                "geminiCandidate": String(candidateIndex),
+                                "outputCommitted": String(committedToCandidate)
+                            ],
+                            error: error
+                        )
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func startGeminiCandidate(
+        request: ProviderRequest,
+        providerID: String,
+        settings: AppSettings,
+        candidate: GeminiRotationCandidate,
+        candidateIndex: Int,
+        requestID: String,
+        normalizedProvider: String
+    ) async throws -> AsyncThrowingStream<ProviderStreamEvent, Error> {
+        let configuration = try await configuration(
+            providerID: providerID,
+            request: request,
+            settings: settings,
+            geminiAPIKeyOverride: candidate.apiKey
+        )
+        DiagnosticsLogger.log(
+            "Pi agent configuration ready",
+            category: .network,
+            requestID: requestID,
+            metadata: [
+                "provider": normalizedProvider,
+                "piProvider": configuration.provider,
+                "model": configuration.model,
+                "contractVersion": String(configuration.contractVersion),
+                "credential": "present",
+                "thinkingLevel": configuration.thinkingLevel ?? "none",
+                "geminiCandidate": String(candidateIndex),
+                "geminiKeyIndex": String(candidate.keyIndex)
+            ]
+        )
+        let stream = try await piStream(request, configuration, resolveLocalTools())
+        DiagnosticsLogger.log(
+            "Pi agent stream created",
+            category: .network,
+            requestID: requestID,
+            metadata: [
+                "provider": normalizedProvider,
+                "model": candidate.model,
+                "geminiCandidate": String(candidateIndex)
+            ]
+        )
+        return stream
+    }
+
+    private func logGeminiRotation(
+        candidate: GeminiRotationCandidate,
+        candidateIndex: Int,
+        nextCandidateIndex: Int,
+        eligibility: GeminiRotationEligibility,
+        requestID: String,
+        error: Error
+    ) {
+        DiagnosticsLogger.log(
+            "Gemini Pi candidate failed; rotating",
+            category: .network,
+            requestID: requestID,
+            metadata: [
+                "model": candidate.model,
+                "keyIndex": String(candidate.keyIndex),
+                "classification": eligibility == .authFailure ? "auth" : "rateLimit",
+                "candidateIndex": String(candidateIndex),
+                "nextCandidateIndex": String(nextCandidateIndex)
+            ],
+            error: error
+        )
+    }
+
+    private static func geminiRotationNotice(
+        from candidate: GeminiRotationCandidate,
+        to nextCandidate: GeminiRotationCandidate,
+        eligibility: GeminiRotationEligibility
+    ) -> ProviderRotationNotice {
+        ProviderRotationNotice(
+            id: UUID().uuidString,
+            provider: "GEMINI",
+            fromModel: candidate.model,
+            toModel: nextCandidate.model,
+            fromKeyID: candidate.keyID,
+            toKeyID: nextCandidate.keyID,
+            reason: eligibility == .authFailure ? .authenticationFailed : .rateLimited,
+            createdAtMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+    }
+
+    private static func commitsGeminiCandidate(_ event: ProviderStreamEvent) -> Bool {
+        switch event {
+        case let .textDelta(value), let .textSnapshot(value), let .reasoningDelta(value):
+            return value.trimmedNonEmpty != nil
+        case .toolActivity, .completed:
+            return true
+        case .answerStart, .rotation, .executionSnapshot:
+            return false
+        }
+    }
+
+    private static func geminiRotationEligibility(_ error: Error) -> GeminiRotationEligibility {
+        guard let providerError = error as? ProviderClientError else { return .other }
+        let statusCode: Int?
+        let code: String?
+        let message: String
+        switch providerError {
+        case let .httpStatus(status, body):
+            statusCode = status
+            code = nil
+            message = body
+        case let .providerFailure(status, providerCode, providerMessage):
+            statusCode = status
+            code = providerCode
+            message = providerMessage
+        default:
+            return .other
+        }
+
+        let normalizedCode = code?.uppercased() ?? ""
+        let normalizedMessage = message.uppercased()
+        if statusCode == 429 || normalizedCode == "RESOURCE_EXHAUSTED" || normalizedMessage.contains("RESOURCE_EXHAUSTED") {
+            return .rateLimited
+        }
+        if statusCode == 401 || statusCode == 403 ||
+            ["UNAUTHENTICATED", "PERMISSION_DENIED", "API_KEY_INVALID"].contains(normalizedCode) {
+            return .authFailure
+        }
+        return .other
+    }
+
+    private static func nextGeminiCandidateIndex(
+        after candidateIndex: Int,
+        failedKeyIndex: Int,
+        candidates: [GeminiRotationCandidate],
+        eligibility: GeminiRotationEligibility
+    ) -> Int? {
+        guard eligibility != .other else { return nil }
+        var nextIndex = candidateIndex + 1
+        if eligibility == .authFailure {
+            while nextIndex < candidates.count,
+                  candidates[nextIndex].keyIndex == failedKeyIndex {
+                nextIndex += 1
+            }
+        }
+        return nextIndex < candidates.count ? nextIndex : nil
+    }
+
+    func modelSupportsVision(provider: String, model: String) async throws -> Bool {
+        if knownProvider(provider) == .appleIntelligence, model != AppleIntelligenceModelCatalog.pccModel { return false }
+        let config = try await configuration(providerID: provider, request: ProviderRequest(model: model, messages: []), settings: settingsRepository.load(), forModelResolution: true)
+        guard let resolution = try await piModelResolver([config]).first else {
+            throw ProviderClientError.parseFailure("Pi returned no model capability contract")
+        }
+        guard resolution.supported, let input = resolution.input else {
+            throw ProviderClientError.parseFailure(resolution.message ?? resolution.reason ?? "Pi model input capability is unknown")
+        }
+        return input.contains("image")
+    }
+
+    private func configuration(
+        providerID: String,
+        request: ProviderRequest,
+        settings: AppSettings,
+        geminiAPIKeyOverride: String? = nil,
+        forModelResolution: Bool = false
+    ) async throws -> PiAgentConfiguration {
+        var config = try await baseConfiguration(providerID: providerID, request: request, settings: settings,
+            geminiAPIKeyOverride: geminiAPIKeyOverride, forModelResolution: forModelResolution)
+        guard !forModelResolution, request.executionPolicy?.allowsClientTools != false,
+              request.executionPolicy?.allowsSubagents != false,
+              request.metadata["supportsClientTools"] != "false",
+              request.metadata["subagentsEnabled"] == "true", settings.subagents.enabled else { return config }
+        var profiles: [PiSubagentModel] = []
+        for profile in settings.subagents.models {
+            do {
+                let child = try await subagentConfiguration(profile, settings: settings)
+                profiles.append(PiSubagentModel(id: profile.id, name: profile.name, configuration: child))
+            } catch {
+                let reason = error.localizedDescription
+                DiagnosticsLogger.log("Subagent profile unavailable", category: .network,
+                    metadata: ["profile": profile.id, "provider": profile.provider, "model": profile.model], error: error)
+                profiles.append(PiSubagentModel(id: profile.id, name: profile.name, configuration: nil, unsupportedReason: reason))
+            }
+        }
+        config.subagents = PiSubagentOptions(enabled: true, defaultModelID: settings.subagents.defaultModelID, models: profiles)
+        return config
+    }
+
+    func subagentConfiguration(_ profile: SubagentModelProfile, settings: AppSettings, forModelResolution: Bool = false) async throws -> PiAgentConfiguration {
+        if !forModelResolution, let error = profile.validationError { throw ProviderClientError.parseFailure(error) }
+        if profile.provider.caseInsensitiveCompare("APPLE_INTELLIGENCE") == .orderedSame,
+           profile.model != AppleIntelligenceModelCatalog.pccModel {
+            throw ProviderClientError.parseFailure("subagent_native_apple_bridge_unsupported: オンデバイスのApple Intelligenceの子セッションには未対応です")
+        }
+        var childSettings = settings
+        if let name = profile.endpointPresetName { childSettings.selectedOpenAICompatPreset = name }
+        var config = try await baseConfiguration(providerID: profile.provider,
+            request: ProviderRequest(model: profile.model, messages: []), settings: childSettings, forModelResolution: forModelResolution)
+        config.thinkingLevel = forModelResolution ? nil : profile.effort
+        if !forModelResolution, config.customEndpoint != nil {
+            config.customEndpoint?.reasoningEffort = profile.effort
+            if profile.effort == "off" { config.customEndpoint?.thinkingBudget = nil }
+        }
+        return config
+    }
+
+    private func baseConfiguration(
+        providerID: String,
+        request: ProviderRequest,
+        settings: AppSettings,
+        geminiAPIKeyOverride: String? = nil,
+        forModelResolution: Bool = false
+    ) async throws -> PiAgentConfiguration {
+        if let dynamicID = ProviderReference(persistedID: providerID).modelsDevID {
+            return try modelsDevConfiguration(providerID: dynamicID, request: request, forModelResolution: forModelResolution)
+        }
+        guard let provider = knownProvider(providerID) else {
+            throw ProviderClientError.parseFailure("Unknown provider: \(providerID)")
+        }
+
+        func credential(_ provider: CredentialProvider) throws -> String {
+            forModelResolution ? "" : try self.credential(provider)
+        }
+        var piProvider = provider.rawValue.lowercased()
+        var apiKey: String
+        var headers: [String: String] = [:]
+        var mcpAuthorizationToken: String?
+
+        switch provider {
+        case .gemini:
+            piProvider = "google"
+            apiKey = try geminiAPIKeyOverride?.trimmedNonEmpty ?? credential(.gemini)
+        case .openRouter:
+            piProvider = "openrouter"
+            apiKey = try credential(.openRouter)
+            headers = Self.openRouterAttributionHeaders
+        case .sarashina:
+            piProvider = "sarashina"
+            apiKey = try credential(.sarashina)
+        case .openAI:
+            piProvider = "openai"
+            apiKey = try credential(.openAI)
+        case .openAICompat:
+            guard let endpoint = settings.openAICompatPresets().first(where: { $0.name.caseInsensitiveCompare(settings.selectedOpenAICompatPreset ?? "") == .orderedSame }),
+                  let preset = endpoint.resolving(modelID: request.model),
+                  preset.validationError == nil else {
+                throw ProviderClientError.unsupportedModel(provider: provider.rawValue, model: request.model)
+            }
+            let key = forModelResolution ? "" : try credentialStore.openAICompatAPIKey(name: preset.name)
+            if !forModelResolution && key?.trimmedNonEmpty == nil {
+                throw ProviderClientError.missingCredential(provider.rawValue)
+            }
+            return PiAgentConfiguration(
+                provider: "yamabiko-custom", model: request.model, apiKey: key,
+                customEndpoint: preset, thinkingLevel: preset.reasoningEffort == "off" ? nil : preset.reasoningEffort
+            )
+        case .miniMax:
+            piProvider = "minimax"
+            apiKey = try credential(.miniMax)
+        case .zai:
+            piProvider = "zai"
+            apiKey = try credential(.zai)
+        case .clinePass:
+            throw ProviderClientError.unsupportedModel(provider: provider.rawValue, model: request.model)
+        case .alibabaCodingPlan:
+            piProvider = "qwen-token-plan"
+            apiKey = try credential(.alibabaCodingPlan)
+            if request.tools.contains(where: { $0.type == "mcp_toolset" }) {
+                headers["anthropic-beta"] = "mcp-client-2025-11-20"
+                mcpAuthorizationToken = try credentialStore.readSecret(
+                    key: AppConstants.alibabaMCPAuthorizationTokenKey
+                )?.trimmedNonEmpty
+            }
+        case .openCodeGo:
+            piProvider = "opencode-go"
+            apiKey = try credential(.openCodeGo)
+        case .codexAuth:
+            if forModelResolution { piProvider = "openai-chatgpt"; apiKey = ""; break }
+            guard let auth = await codexAuthRepository?.getBearerToken() else {
+                throw ProviderClientError.missingCredential(LLMProvider.codexAuth.rawValue)
+            }
+            piProvider = "openai-chatgpt"
+            apiKey = auth.token
+        case .superGrok:
+            if forModelResolution { piProvider = "xai-oauth"; apiKey = ""; break }
+            guard let auth = await superGrokAuthRepository?.getBearerToken() else {
+                throw ProviderClientError.missingCredential(LLMProvider.superGrok.rawValue)
+            }
+            piProvider = "xai-oauth"
+            apiKey = auth.token
+        case .appleIntelligence:
+            guard request.model == AppleIntelligenceModelCatalog.pccModel else { throw PCCFailure(code: "pcc_model_unsupported") }
+            let level = settings.pccReasoningLevel ?? AppleIntelligenceModelCatalog.defaultPCCReasoningLevel
+            guard let piLevel = AppleIntelligenceModelCatalog.piThinkingLevel(forPCCReasoningLevel: level) else {
+                throw PCCFailure(code: "pcc_reasoning_unsupported")
+            }
+            return PiAgentConfiguration(provider: "apple-pcc", model: request.model, thinkingLevel: piLevel)
+        }
+
+        let catalogContract: PiCatalogModelContract?
+        let openRouterModels: [SimpleModel]
+        if provider == .openRouter, let openRouterModelService {
+            openRouterModels = await openRouterModelService.getAvailableModels()
+        } else {
+            openRouterModels = []
+        }
+        if provider == .codexAuth {
+            catalogContract = CodexModelCatalog.modelsDevContracts(
+                from: modelsDevCatalogRepository?.provider(for: .modelsDev("openai"))
+            )[normalizedModel(request.model, provider: provider)]
+        } else if let model = openRouterModels.first(where: { $0.id == request.model }) {
+            catalogContract = PiCatalogModelContract(
+                npm: "@openrouter/ai-sdk-provider",
+                api: "https://openrouter.ai/api/v1",
+                shape: nil,
+                toolCall: model.supportsTools,
+                provenance: "official_provider_catalog",
+                name: model.name,
+                reasoning: model.supportsReasoning,
+                input: model.inputModalities,
+                contextWindow: model.contextLength,
+                maxTokens: model.maxCompletionTokens
+            )
+        } else {
+            catalogContract = nil
+        }
+        if provider == .codexAuth, forModelResolution, let codexAuthRepository {
+            // The runtime catalog is account-scoped and disappears on engine restart.
+            // A persisted picker cache cannot authorize runtime model resolution.
+            _ = try await codexAuthRepository.models(contracts: CodexModelCatalog.modelsDevContracts(
+                from: modelsDevCatalogRepository?.provider(for: .modelsDev("openai"))
+            ))
+        }
+        return PiAgentConfiguration(
+            provider: piProvider,
+            model: normalizedModel(request.model, provider: provider),
+            apiKey: apiKey,
+            headers: headers,
+            catalogContract: catalogContract,
+            thinkingLevel: thinkingLevel(
+                request.thinking,
+                geminiLevel: provider == .gemini ? request.metadata["geminiThinkingLevel"] : nil
+            ),
+            mcpAuthorizationToken: mcpAuthorizationToken
+        )
+    }
+
+    private func modelsDevConfiguration(
+        providerID: String,
+        request: ProviderRequest,
+        forModelResolution: Bool = false
+    ) throws -> PiAgentConfiguration {
+        guard let catalog = modelsDevCatalogRepository?.provider(for: .modelsDev(providerID)),
+              let model = catalog.models.first(where: { $0.id == request.model }) else {
+            throw ProviderClientError.parseFailure("models.dev provider or model is unavailable: \(providerID)/\(request.model)")
+        }
+        var env: [String: String] = [:]
+        for field in catalog.connectionFields where !forModelResolution {
+            let key = modelsDevFieldKey(providerID: providerID, fieldName: field)
+            try migrateLegacyCredentialIfNeeded(providerID: providerID, destinationKey: key)
+            if let value = try credentialStore.readSecret(key: key)?.trimmedNonEmpty { env[field] = value }
+        }
+        guard forModelResolution || !env.isEmpty else {
+            throw ProviderClientError.missingCredential(providerID)
+        }
+        let normalizedModel = providerID.caseInsensitiveCompare("opencode-go") == .orderedSame
+            ? OpenCodeGoModelCatalog.normalizedModelID(request.model)
+            : request.model
+        return PiAgentConfiguration(
+            provider: providerID,
+            model: normalizedModel,
+            apiKey: nil,
+            headers: providerID.caseInsensitiveCompare("openrouter") == .orderedSame
+                ? Self.openRouterAttributionHeaders : [:],
+            env: env,
+            catalogContract: PiCatalogModelContract(
+                providerName: catalog.name,
+                npm: model.providerContract?.npm,
+                api: model.providerContract?.api,
+                shape: model.providerContract?.shape,
+                toolCall: model.toolCall,
+                provenance: model.providerContract?.provenance,
+                name: model.name,
+                reasoning: model.reasoning,
+                input: model.inputModalities,
+                contextWindow: model.limits.context,
+                maxTokens: model.limits.output,
+                reasoningEfforts: model.supportedReasoningEfforts
+            ),
+            thinkingLevel: thinkingLevel(request.thinking),
+        )
+    }
+
+    private func credential(_ provider: CredentialProvider) throws -> String {
+        guard let value = try credentialStore.credential(for: provider)?.trimmedNonEmpty else {
+            throw ProviderClientError.missingCredential(provider.rawValue)
+        }
+        return value
+    }
+
+    private func knownProvider(_ value: String) -> LLMProvider? {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
+        case "GEMINI_AUTH": return .gemini
+        case "QWEN_CODE": return .openRouter
+        case let id: return LLMProvider(rawValue: id)
+        }
+    }
+
+    private func normalizedModel(_ model: String, provider: LLMProvider) -> String {
+        switch provider {
+        case .codexAuth:
+            return model.replacingOccurrences(of: "/openai/", with: "")
+        case .openCodeGo:
+            return OpenCodeGoModelCatalog.normalizedModelID(model)
+        default:
+            return model
+        }
+    }
+
+    private func thinkingLevel(
+        _ thinking: ProviderThinkingConfig?,
+        geminiLevel: String? = nil
+    ) -> String? {
+        guard thinking?.enabled != false else { return "off" }
+        let value = (geminiLevel?.trimmedNonEmpty ?? thinking?.effort)?.lowercased()
+        return ["minimal", "low", "medium", "high", "xhigh", "max"].contains(value) ? value : nil
+    }
+
+
+    private func modelsDevFieldKey(providerID: String, fieldName: String) -> String {
+        ModelsDevReasoningPreference.fieldKey(providerID: providerID, fieldName: fieldName)
+    }
+
+    private func migrateLegacyCredentialIfNeeded(providerID: String, destinationKey: String) throws {
+        guard try credentialStore.readSecret(key: destinationKey)?.trimmedNonEmpty == nil else { return }
+        let legacy: CredentialProvider? = switch providerID.lowercased() {
+        case "openai": .openAI
+        case "opencode-go": .openCodeGo
+        case "cline-pass": .clinePass
+        case "alibaba-coding-plan": .alibabaCodingPlan
+        case "zai-coding-plan": .zai
+        case "minimax": .miniMax
+        default: nil
+        }
+        if let legacy, let value = try credentialStore.credential(for: legacy)?.trimmedNonEmpty {
+            try credentialStore.saveSecret(value, key: destinationKey)
+        }
+    }
+
+}

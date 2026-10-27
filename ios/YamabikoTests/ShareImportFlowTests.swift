@@ -1,0 +1,105 @@
+import XCTest
+import GRDB
+@testable import YamabikoChat
+
+@MainActor
+final class ShareImportFlowTests: XCTestCase {
+    private var tempContainerURL: URL!
+
+    override func setUp() {
+        super.setUp()
+        tempContainerURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-import-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempContainerURL, withIntermediateDirectories: true)
+        AppGroupShareStorage.testContainerURL = tempContainerURL
+    }
+
+    override func tearDown() {
+        AppGroupShareStorage.testContainerURL = nil
+        try? FileManager.default.removeItem(at: tempContainerURL)
+        super.tearDown()
+    }
+
+    func testImportSharePayloadCreatesNewConversationAndDraft() throws {
+        let repository = try makeRepository()
+        let store = SharePayloadStore()
+        try SharePayloadPersister.save(text: "shared from Safari", sourceApp: "Safari")
+
+        let appState = AppState()
+        XCTAssertTrue(appState.importSharePayload(from: store, repository: repository))
+
+        let draft = try XCTUnwrap(appState.shareImportDraft)
+        XCTAssertEqual(draft.text, "shared from Safari")
+        XCTAssertEqual(appState.selectedConversationID, draft.conversationID)
+
+        XCTAssertFalse(try appState.initializeConversationSelectionIfNeeded(repository: repository))
+        XCTAssertEqual(appState.selectedConversationID, draft.conversationID)
+        XCTAssertEqual(appState.shareImportDraft, draft)
+
+        let conversation = try repository.conversation(id: draft.conversationID)
+        XCTAssertNotNil(conversation)
+
+        XCTAssertEqual(appState.shareImportText(for: draft.conversationID), "shared from Safari")
+        appState.clearShareImportDraft(for: draft.conversationID)
+        XCTAssertNil(appState.shareImportDraft)
+        XCTAssertNil(appState.shareImportText(for: draft.conversationID))
+    }
+
+    func testImportSharePayloadReturnsFalseWhenNoPayload() throws {
+        let repository = try makeRepository()
+        let store = SharePayloadStore()
+        let appState = AppState()
+
+        XCTAssertFalse(appState.importSharePayload(from: store, repository: repository))
+        XCTAssertNil(appState.shareImportDraft)
+    }
+
+    func testFailedConversationCreationKeepsPendingSharePayload() throws {
+        let dbQueue = try DatabaseQueue()
+        let repository = try makeRepository(dbQueue: dbQueue)
+        try dbQueue.write { db in
+            try db.execute(sql: "DROP TABLE conversations")
+        }
+        let store = SharePayloadStore()
+        try SharePayloadPersister.save(text: "must survive", sourceApp: "Safari")
+
+        let appState = AppState()
+        XCTAssertFalse(appState.importSharePayload(from: store, repository: repository))
+        XCTAssertEqual(store.loadLatest()?.payload.text, "must survive")
+    }
+
+    private func makeRepository(dbQueue: DatabaseQueue? = nil) throws -> ChatRepository {
+        let dbQueue = try dbQueue ?? DatabaseQueue()
+        try AppDatabase.migrator.migrate(dbQueue)
+
+        let settings = SettingsRepository(dbQueue: dbQueue)
+        let conversations = ConversationRepository(dbQueue: dbQueue)
+        let credentials = ShareImportTestCredentialStore()
+        return ChatRepositoryTestSupport.makeRepository(
+            dbQueue: dbQueue,
+            settings: settings,
+            conversations: conversations,
+            credentials: credentials
+        )
+    }
+}
+
+private final class ShareImportTestCredentialStore: SecureCredentialStore {
+    private var storage: [String: String] = [:]
+
+    func saveSecret(_ value: String?, key: String) throws {
+        if let value {
+            storage[key] = value
+        } else {
+            storage.removeValue(forKey: key)
+        }
+    }
+
+    func readSecret(key: String) throws -> String? {
+        storage[key]
+    }
+
+    func deleteSecret(key: String) throws {
+        storage.removeValue(forKey: key)
+    }
+}

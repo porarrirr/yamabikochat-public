@@ -1,0 +1,476 @@
+import Combine
+import CryptoKit
+import Foundation
+import Yams
+import ZIPFoundation
+
+final class AgentSkillRepository: @unchecked Sendable {
+    private struct PersistedState: Codable {
+        var isEnabled: Bool
+        var installedAt: Date
+        var contentHash: String
+    }
+
+    private let fileManager: FileManager
+    private let rootURL: URL
+    private let lock = NSLock()
+    private let subject: CurrentValueSubject<[InstalledAgentSkill], Never>
+
+    init(fileManager: FileManager = .default, rootURL: URL? = nil) {
+        self.fileManager = fileManager
+        if let rootURL {
+            self.rootURL = rootURL
+        } else {
+            let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            self.rootURL = support.appendingPathComponent("YamabikoChat/AgentSkills", isDirectory: true)
+        }
+        try? fileManager.createDirectory(at: self.rootURL, withIntermediateDirectories: true)
+        subject = CurrentValueSubject([])
+        reload()
+    }
+
+    var skillsPublisher: AnyPublisher<[InstalledAgentSkill], Never> {
+        subject.eraseToAnyPublisher()
+    }
+
+    var installedSkills: [InstalledAgentSkill] { subject.value }
+    var enabledSkills: [InstalledAgentSkill] { subject.value.filter(\.isEnabled) }
+
+    func inspect(sourceURL: URL) throws -> AgentSkillInstallPreview {
+        let secured = sourceURL.startAccessingSecurityScopedResource()
+        defer { if secured { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        let stagingParent = fileManager.temporaryDirectory
+            .appendingPathComponent("yamabiko-agent-skill-\(UUID().uuidString)", isDirectory: true)
+        let extracted = stagingParent.appendingPathComponent("extracted", isDirectory: true)
+        try fileManager.createDirectory(at: extracted, withIntermediateDirectories: true)
+        do {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: sourceURL.path, isDirectory: &isDirectory) else {
+                throw AgentSkillError.notFound("選択したSkillが見つかりません。")
+            }
+            if isDirectory.boolValue {
+                try copyValidatedFolder(from: sourceURL, to: extracted)
+            } else if sourceURL.pathExtension.lowercased() == "md" {
+                try copyStandaloneMarkdown(from: sourceURL, to: extracted)
+            } else {
+                try extractValidatedArchive(from: sourceURL, to: extracted)
+            }
+            let skillRoot = try locateSkillRoot(in: extracted)
+            let parsed = try parseAndInventory(root: skillRoot)
+            let canonicalRoot = stagingParent.appendingPathComponent("skill", isDirectory: true)
+            try fileManager.moveItem(at: skillRoot, to: canonicalRoot)
+            return AgentSkillInstallPreview(
+                id: UUID(),
+                manifest: parsed.manifest,
+                files: parsed.files,
+                hasScripts: parsed.files.contains(where: \.isScript),
+                contentHash: parsed.hash,
+                externalURLs: parsed.externalURLs,
+                replacesExisting: fileManager.fileExists(atPath: skillURL(named: parsed.manifest.name).path),
+                stagedRoot: canonicalRoot
+            )
+        } catch {
+            try? fileManager.removeItem(at: stagingParent)
+            throw error
+        }
+    }
+
+    @discardableResult
+    func install(_ preview: AgentSkillInstallPreview, trusted: Bool, allowReplacement: Bool) throws -> InstalledAgentSkill {
+        guard trusted else { throw AgentSkillError.trustRequired }
+        let destination = skillURL(named: preview.manifest.name)
+        let existing = installedSkills.first { $0.manifest.name == preview.manifest.name }
+        if existing != nil, !allowReplacement {
+            throw AgentSkillError.invalidManifest("同名のSkillがあります。置換の確認が必要です。")
+        }
+        let state = PersistedState(
+            isEnabled: existing?.isEnabled ?? true,
+            installedAt: Date(),
+            contentHash: preview.contentHash
+        )
+        let stateData = try JSONEncoder.agentSkill.encode(state)
+        try stateData.write(to: preview.stagedRoot.appendingPathComponent("state.json"), options: .atomic)
+
+        lock.lock()
+        defer { lock.unlock() }
+        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: preview.stagedRoot, backupItemName: nil)
+        } else {
+            try fileManager.moveItem(at: preview.stagedRoot, to: destination)
+        }
+        let installed = InstalledAgentSkill(
+            manifest: preview.manifest,
+            files: preview.files,
+            hasScripts: preview.hasScripts,
+            contentHash: preview.contentHash,
+            isEnabled: state.isEnabled,
+            installedAt: state.installedAt
+        )
+        reloadLocked()
+        DiagnosticsLogger.log("Agent Skill installed", category: .settings, metadata: ["skill": installed.manifest.name])
+        return installed
+    }
+
+    /// Seed each shipped skill once. A user's replacement, disabled state or
+    /// deletion must survive later launches and app updates.
+    func installBundledSkills(from directory: URL) throws {
+        let marker = rootURL.appendingPathComponent(".bundled-skills.json")
+        var seeded = fileManager.fileExists(atPath: marker.path)
+            ? try JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: marker))
+            : Set<String>()
+        let sources = try fileManager.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for source in sources {
+            let preview = try inspect(sourceURL: source)
+            defer { discard(preview) }
+            let name = preview.manifest.name
+            guard !seeded.contains(name) else { continue }
+            if !fileManager.fileExists(atPath: skillURL(named: name).path) {
+                _ = try install(preview, trusted: true, allowReplacement: false)
+            }
+            seeded.insert(name)
+            try JSONEncoder().encode(seeded).write(to: marker, options: .atomic)
+        }
+    }
+
+    func discard(_ preview: AgentSkillInstallPreview) {
+        try? fileManager.removeItem(at: preview.stagedRoot.deletingLastPathComponent())
+    }
+
+    func setEnabled(_ enabled: Bool, name: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let skill = subject.value.first(where: { $0.manifest.name == name }) else {
+            throw AgentSkillError.notFound("Skillが見つかりません: \(name)")
+        }
+        let state = PersistedState(isEnabled: enabled, installedAt: skill.installedAt, contentHash: skill.contentHash)
+        try JSONEncoder.agentSkill.encode(state).write(to: skillURL(named: name).appendingPathComponent("state.json"), options: .atomic)
+        reloadLocked()
+        DiagnosticsLogger.log("Agent Skill enabled state changed", category: .settings, metadata: ["skill": name, "enabled": String(enabled)])
+    }
+
+    func delete(name: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let url = skillURL(named: name)
+        guard fileManager.fileExists(atPath: url.path) else { throw AgentSkillError.notFound("Skillが見つかりません: \(name)") }
+        try fileManager.removeItem(at: url)
+        reloadLocked()
+        DiagnosticsLogger.log("Agent Skill deleted", category: .settings, metadata: ["skill": name])
+    }
+
+    func requestContext(for text: String, conversationID: String?, providerSupportsTools: Bool) throws -> SkillRequestContext? {
+        let enabled = enabledSkills
+        guard !enabled.isEmpty else { return nil }
+        let names = Self.explicitSkillNames(in: text, allowed: Set(enabled.map { $0.manifest.name }))
+        let catalog: [AgentSkillCatalogEntry] = providerSupportsTools
+            ? enabled.map {
+                AgentSkillCatalogEntry(
+                    name: $0.manifest.name,
+                    description: $0.manifest.description,
+                    filePath: skillURL(named: $0.manifest.name).appendingPathComponent("SKILL.md").path
+                )
+            }
+            : []
+        if catalog.isEmpty, names.isEmpty { return nil }
+        var skillFilePaths: [String] = []
+        for name in names {
+            skillFilePaths.append(try rootForEnabledSkill(name: name).appendingPathComponent("SKILL.md").path)
+        }
+        return SkillRequestContext(
+            catalog: catalog,
+            explicitlyRequestedNames: names,
+            skillFilePaths: skillFilePaths,
+            explicitMessageIndices: Array(repeating: 0, count: names.count),
+            conversationID: conversationID,
+            enabledSkillSetHash: Self.hashStrings(enabled.map { "\($0.manifest.name):\($0.contentHash)" }.sorted())
+        )
+    }
+
+    /// Copies only enabled, trusted skill files into the isolated Python filesystem.
+    /// Never grants the worker access to the native installation directory.
+    func pythonFiles() throws -> [PythonSandboxFile] {
+        lock.lock()
+        defer { lock.unlock() }
+        let broker = PythonSandboxFiles()
+        let files = try enabledSkills.flatMap { skill in
+            try broker.read(workspace: skillURL(named: skill.manifest.name))
+                .filter { $0.path != "state.json" }
+                .map { PythonSandboxFile(path: skill.manifest.name + "/" + $0.path, data: $0.data) }
+        }
+        _ = try broker.validate(files)
+        return files
+    }
+
+    func rootForEnabledSkill(name: String) throws -> URL {
+        _ = try requireEnabled(name)
+        return skillURL(named: name)
+    }
+
+    static func explicitSkillNames(in text: String, allowed: Set<String>) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"(?<![A-Za-z0-9_.$@-])(?:[@$]|/skill:)([a-z0-9][a-z0-9-]{0,63})(?![A-Za-z0-9_-])"#) else { return [] }
+        let range = NSRange(text.startIndex..., in: text)
+        var seen = Set<String>()
+        return regex.matches(in: text, range: range).compactMap { match in
+            guard let nameRange = Range(match.range(at: 1), in: text) else { return nil }
+            let name = String(text[nameRange])
+            guard allowed.contains(name), seen.insert(name).inserted else { return nil }
+            return name
+        }
+    }
+
+    private func requireEnabled(_ name: String) throws -> InstalledAgentSkill {
+        guard let skill = enabledSkills.first(where: { $0.manifest.name == name }) else {
+            throw AgentSkillError.notFound("有効なSkillが見つかりません: \(name)")
+        }
+        return skill
+    }
+
+    private func reload() {
+        lock.lock()
+        defer { lock.unlock() }
+        reloadLocked()
+    }
+
+    private func reloadLocked() {
+        let directories = (try? fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        let skills = directories.compactMap { url -> InstalledAgentSkill? in
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+            guard let parsed = try? parseAndInventory(root: url),
+                  let stateData = try? Data(contentsOf: url.appendingPathComponent("state.json")),
+                  let state = try? JSONDecoder.agentSkill.decode(PersistedState.self, from: stateData),
+                  state.contentHash == parsed.hash else { return nil }
+            return InstalledAgentSkill(
+                manifest: parsed.manifest,
+                files: parsed.files,
+                hasScripts: parsed.files.contains(where: \.isScript),
+                contentHash: parsed.hash,
+                isEnabled: state.isEnabled,
+                installedAt: state.installedAt
+            )
+        }.sorted { $0.manifest.name < $1.manifest.name }
+        subject.send(skills)
+    }
+
+    private func extractValidatedArchive(from source: URL, to destination: URL) throws {
+        let size = (try source.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        guard size <= AgentSkillLimits.archiveBytes else { throw AgentSkillError.limitExceeded("ZIPは50 MB以下にしてください。") }
+        guard source.pathExtension.lowercased() == "zip" else { throw AgentSkillError.invalidArchive("Markdown、ZIP、またはフォルダを選択してください。") }
+        let archive: Archive
+        do { archive = try Archive(url: source, accessMode: .read) }
+        catch { throw AgentSkillError.invalidArchive("ZIPを開けません: \(error.localizedDescription)") }
+        var paths = Set<String>()
+        var count = 0
+        var total: Int64 = 0
+        for entry in archive {
+            let path = try Self.normalizedRelativePath(entry.path)
+            guard paths.insert(path).inserted else { throw AgentSkillError.duplicatePath("重複パスがあります: \(path)") }
+            if entry.type == .symlink { throw AgentSkillError.symbolicLink("シンボリックリンクは使用できません: \(path)") }
+            if entry.type == .file {
+                count += 1
+                let bytes = Int64(entry.uncompressedSize)
+                total += bytes
+                guard count <= AgentSkillLimits.fileCount else { throw AgentSkillError.limitExceeded("ファイル数は500以下にしてください。") }
+                guard bytes <= AgentSkillLimits.singleFileBytes else { throw AgentSkillError.limitExceeded("1ファイルは25 MB以下にしてください: \(path)") }
+                guard total <= AgentSkillLimits.expandedBytes else { throw AgentSkillError.limitExceeded("展開後合計は200 MB以下にしてください。") }
+            }
+            let target = destination.appendingPathComponent(path)
+            if entry.type == .directory {
+                try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+            } else {
+                try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                do { _ = try archive.extract(entry, to: target) }
+                catch { throw AgentSkillError.invalidArchive("ZIPの展開に失敗しました: \(path)") }
+            }
+        }
+    }
+
+    private func copyStandaloneMarkdown(from source: URL, to destination: URL) throws {
+        let values = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isSymbolicLink != true else {
+            throw AgentSkillError.symbolicLink("シンボリックリンクは使用できません: \(source.lastPathComponent)")
+        }
+        guard values.isRegularFile == true else {
+            throw AgentSkillError.invalidSkillFile("通常のMarkdownファイルを選択してください。")
+        }
+        let bytes = Int64(values.fileSize ?? 0)
+        guard bytes <= AgentSkillLimits.skillFileBytes else {
+            throw AgentSkillError.limitExceeded("ファイルが読込上限を超えています: \(source.lastPathComponent)")
+        }
+        try fileManager.copyItem(at: source, to: destination.appendingPathComponent("SKILL.md"))
+    }
+
+    private func copyValidatedFolder(from source: URL, to destination: URL) throws {
+        guard let enumerator = fileManager.enumerator(at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]) else {
+            throw AgentSkillError.invalidArchive("フォルダを読み込めません。")
+        }
+        var count = 0
+        var total: Int64 = 0
+        var paths = Set<String>()
+        while let url = enumerator.nextObject() as? URL {
+            let relative = String(url.path.dropFirst(source.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let path = try Self.normalizedRelativePath(relative)
+            guard paths.insert(path).inserted else { throw AgentSkillError.duplicatePath("重複パスがあります: \(path)") }
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true { throw AgentSkillError.symbolicLink("シンボリックリンクは使用できません: \(path)") }
+            let target = destination.appendingPathComponent(path)
+            if values.isDirectory == true {
+                try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+            } else {
+                count += 1
+                let bytes = Int64(values.fileSize ?? 0)
+                total += bytes
+                guard count <= AgentSkillLimits.fileCount else { throw AgentSkillError.limitExceeded("ファイル数は500以下にしてください。") }
+                guard bytes <= AgentSkillLimits.singleFileBytes else { throw AgentSkillError.limitExceeded("1ファイルは25 MB以下にしてください: \(path)") }
+                guard total <= AgentSkillLimits.expandedBytes else { throw AgentSkillError.limitExceeded("合計は200 MB以下にしてください。") }
+                try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fileManager.copyItem(at: url, to: target)
+            }
+        }
+    }
+
+    private func locateSkillRoot(in extracted: URL) throws -> URL {
+        guard let enumerator = fileManager.enumerator(at: extracted, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+            throw AgentSkillError.invalidSkillFile("SKILL.mdを検索できません。")
+        }
+        var matches: [URL] = []
+        while let url = enumerator.nextObject() as? URL, matches.count < 2 {
+            if url.lastPathComponent == "SKILL.md" { matches.append(url) }
+        }
+        guard matches.count == 1, let match = matches.first else {
+            throw AgentSkillError.invalidSkillFile(matches.isEmpty ? "SKILL.mdがありません。" : "複数のSKILL.mdはインストールできません。")
+        }
+        return match.deletingLastPathComponent()
+    }
+
+    private func parseAndInventory(root: URL) throws -> (manifest: AgentSkillManifest, files: [AgentSkillFile], hash: String, externalURLs: [String]) {
+        let skillURL = root.appendingPathComponent("SKILL.md")
+        let markdown = try readUTF8(url: skillURL, limit: AgentSkillLimits.skillFileBytes)
+        let manifest = try Self.parseManifest(markdown)
+        guard let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey], options: [.skipsHiddenFiles]) else {
+            throw AgentSkillError.invalidSkillFile("Skillのファイル一覧を取得できません。")
+        }
+        var files: [AgentSkillFile] = []
+        var hashParts: [String] = []
+        var urls = Set<String>()
+        let urlRegex = try? NSRegularExpression(pattern: #"https?://[^\s)\]>\"']+"#)
+        while let url = enumerator.nextObject() as? URL {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if values.isSymbolicLink == true { throw AgentSkillError.symbolicLink("シンボリックリンクは使用できません。") }
+            guard values.isRegularFile == true else { continue }
+            let relative = String(url.path.dropFirst(root.path.count + 1))
+            if relative == "state.json" { continue }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let script = Self.isScript(path: relative, data: data)
+            files.append(AgentSkillFile(path: relative, size: Int64(data.count), isScript: script))
+            hashParts.append(relative + ":" + SHA256.hash(data: data).hex)
+            if data.count <= Int(AgentSkillLimits.textResourceBytes), let text = String(data: data, encoding: .utf8), let urlRegex {
+                let range = NSRange(text.startIndex..., in: text)
+                for match in urlRegex.matches(in: text, range: range) {
+                    if let matchRange = Range(match.range, in: text) { urls.insert(String(text[matchRange])) }
+                }
+            }
+        }
+        return (manifest, files.sorted { $0.path < $1.path }, Self.hashStrings(hashParts.sorted()), urls.sorted())
+    }
+
+    private static func parseManifest(_ markdown: String) throws -> AgentSkillManifest {
+        let lines = markdown.components(separatedBy: .newlines)
+        guard lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) == "---",
+              let end = lines.dropFirst().firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "---" }) else {
+            throw AgentSkillError.invalidManifest("SKILL.mdのYAMLフロントマターがありません。")
+        }
+        let yamlText = lines[1..<end].joined(separator: "\n")
+        let raw: Any
+        do {
+            guard let loaded = try Yams.load(yaml: yamlText) else {
+                throw AgentSkillError.invalidManifest("YAMLフロントマターが空です。")
+            }
+            raw = loaded
+        }
+        catch { throw AgentSkillError.invalidManifest("YAMLを解析できません: \(error.localizedDescription)") }
+        guard let mapping = raw as? [String: Any] else { throw AgentSkillError.invalidManifest("フロントマターはマップ形式で記述してください。") }
+        guard let name = mapping["name"] as? String,
+              name.range(of: #"^[a-z0-9][a-z0-9-]{0,63}$"#, options: .regularExpression) != nil else {
+            throw AgentSkillError.invalidManifest("nameは小文字英数字とハイフンで1〜64文字にしてください。")
+        }
+        guard let description = mapping["description"] as? String, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AgentSkillError.invalidManifest("descriptionは必須です。")
+        }
+        let metadata = (mapping["metadata"] as? [String: Any])?.reduce(into: [String: String]()) { result, pair in
+            result[pair.key] = String(describing: pair.value)
+        } ?? [:]
+        let allowed: [String]
+        if let value = mapping["allowed-tools"] as? [String] { allowed = value }
+        else if let value = mapping["allowed-tools"] as? String { allowed = value.split(whereSeparator: \.isWhitespace).map(String.init) }
+        else { allowed = [] }
+        return AgentSkillManifest(
+            name: name,
+            description: description,
+            license: mapping["license"].map { String(describing: $0) },
+            compatibility: mapping["compatibility"].map { String(describing: $0) },
+            metadata: metadata,
+            allowedTools: allowed
+        )
+    }
+
+    private func readUTF8(url: URL, limit: Int64) throws -> String {
+        guard fileManager.fileExists(atPath: url.path) else { throw AgentSkillError.notFound("ファイルが見つかりません: \(url.lastPathComponent)") }
+        let size = Int64((try url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        guard size <= limit else { throw AgentSkillError.limitExceeded("ファイルが読込上限を超えています: \(url.lastPathComponent)") }
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8), !text.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw AgentSkillError.resourceNotText("UTF-8テキスト資料だけを読み込めます: \(url.lastPathComponent)")
+        }
+        return text
+    }
+
+    private func skillURL(named name: String) -> URL { rootURL.appendingPathComponent(name, isDirectory: true) }
+
+    private static func normalizedRelativePath(_ raw: String) throws -> String {
+        let value = raw.replacingOccurrences(of: "\\", with: "/")
+        guard !value.isEmpty, !value.hasPrefix("/"), !value.hasPrefix("~"),
+              value.range(of: #"^[A-Za-z]:/"#, options: .regularExpression) == nil else {
+            throw AgentSkillError.unsafePath("絶対パスは使用できません: \(raw)")
+        }
+        let components = value.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !components.isEmpty, !components.contains(".."), !components.contains("."), !components.first!.contains(":") else {
+            throw AgentSkillError.unsafePath("安全でないパスです: \(raw)")
+        }
+        return components.joined(separator: "/")
+    }
+
+    private static func isScript(path: String, data: Data) -> Bool {
+        let extensions = Set(["sh", "bash", "zsh", "fish", "py", "rb", "pl", "js", "mjs", "cjs", "ts", "ps1", "bat", "cmd", "exe"])
+        if extensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()) { return true }
+        return String(data: data.prefix(128), encoding: .utf8)?.hasPrefix("#!") == true
+    }
+
+    private static func hashStrings(_ values: [String]) -> String {
+        SHA256.hash(data: Data(values.joined(separator: "\n").utf8)).hex
+    }
+}
+
+private extension JSONEncoder {
+    static var agentSkill: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+}
+
+private extension JSONDecoder {
+    static var agentSkill: JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+}
+
+private extension Digest {
+    var hex: String { map { String(format: "%02x", $0) }.joined() }
+}

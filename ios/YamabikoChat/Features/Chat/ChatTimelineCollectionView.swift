@@ -1,0 +1,2052 @@
+import Combine
+import SwiftUI
+import UIKit
+
+struct ChatTimelineCollectionView: UIViewControllerRepresentable {
+    @ObservedObject var store: ChatTimelineStore
+    @Binding var isFollowingTail: Bool
+    @Binding var unreadCount: Int
+    let scrollToLatestRequest: Int
+    let topOverlayInset: CGFloat
+    let regeneratableMessageID: Int64?
+    let dualSplitLayout: String
+    let dualSplitRatio: Double
+    let onRoute: (ChatWorkspaceRoute) -> Void
+    let onPreviousVariant: (Int64) -> Void
+    let onNextVariant: (Int64) -> Void
+    let onBranch: (Int64) -> Void
+    let onRegenerate: () -> Void
+    let onAskChatWithSelection: (String) -> Void
+    var onGenUINewTurn: (String) -> Bool = { _ in false }
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+    var onSelectDualSide: (DualResponseSide) -> Void = { _ in }
+
+    func makeUIViewController(context: Context) -> ChatTimelineViewController {
+        let controller = ChatTimelineViewController()
+        controller.onFollowStateChanged = { following, unread in
+            DispatchQueue.main.async {
+                isFollowingTail = following
+                unreadCount = unread
+            }
+        }
+        return controller
+    }
+
+    func updateUIViewController(_ controller: ChatTimelineViewController, context: Context) {
+        controller.applyTimelineTopInset(topOverlayInset)
+        controller.configure(
+            store: store,
+            scrollToLatestRequest: scrollToLatestRequest,
+            regeneratableMessageID: regeneratableMessageID,
+            dualSplitLayout: dualSplitLayout,
+            dualSplitRatio: dualSplitRatio,
+            onRoute: onRoute,
+            onPreviousVariant: onPreviousVariant,
+            onNextVariant: onNextVariant,
+            onBranch: onBranch,
+            onRegenerate: onRegenerate,
+            onAskChatWithSelection: onAskChatWithSelection,
+            onGenUINewTurn: onGenUINewTurn,
+            onEditUserMessage: onEditUserMessage,
+            onSelectUserMessageText: onSelectUserMessageText,
+            onSelectDualSide: onSelectDualSide
+        )
+    }
+}
+
+final class ChatTimelineViewController: UIViewController, UICollectionViewDelegate {
+    private var collectionView: UICollectionView!
+    private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
+    private weak var store: ChatTimelineStore?
+    private var followState: TailFollowState = .followingTail
+    private var lastScrollRequest = -1
+    private var configuredIDs: [String] = []
+    private var unreadCount = 0
+    private var lastViewportSize = CGSize.zero
+    private var pendingContentAnchor: (id: String, offset: CGFloat)?
+    private var pendingViewportOffsetY: CGFloat?
+    private var pendingChangedRowIDs: Set<String> = []
+    private var pendingReconfiguredRowIDs: Set<String> = []
+    private var pendingMeasuredCellHeights: [String: CGFloat] = [:]
+    private var pendingContentChangeUserScrollGeneration: Int?
+    private var parsedRowsRemeasured: Set<String> = []
+    private var pendingLocksViewport = false
+    private var viewportCompensationBottom: CGFloat = 0
+    private var viewportLockTargetY: CGFloat?
+    private var isContentUpdateScheduled = false
+    private var isCompletingRowMeasurement = false
+    private var isReconfiguringRows = false
+    private var isUserScrollInProgress = false
+    private var userScrollGeneration = 0
+    private var lastUserDrivenOffsetY: CGFloat?
+    private var previousRegeneratableMessageID: Int64?
+    private var previousDualSplitLayout = "VERTICAL"
+    private var previousDualSplitRatio = 0.5
+    private var isTimelineVisible = true
+    private var lastPublishedFollowState: (following: Bool, unread: Int)?
+    private var timelineTopInset: CGFloat = 0
+
+    var regeneratableMessageID: Int64?
+    var dualSplitLayout = "VERTICAL"
+    var dualSplitRatio = 0.5
+    var onRoute: (ChatWorkspaceRoute) -> Void = { _ in }
+    var onPreviousVariant: (Int64) -> Void = { _ in }
+    var onNextVariant: (Int64) -> Void = { _ in }
+    var onBranch: (Int64) -> Void = { _ in }
+    var onRegenerate: () -> Void = {}
+    var onAskChatWithSelection: (String) -> Void = { _ in }
+    var onGenUINewTurn: (String) -> Bool = { _ in false }
+    var onEditUserMessage: (String) -> Void = { _ in }
+    var onSelectUserMessageText: (String) -> Void = { _ in }
+    var onSelectDualSide: (DualResponseSide) -> Void = { _ in }
+    var onFollowStateChanged: (Bool, Int) -> Void = { _, _ in }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .amoledSystemBackground
+
+        let layout = ChatTimelineLayout()
+
+        collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        collectionView.accessibilityIdentifier = "chat-timeline"
+        collectionView.translatesAutoresizingMaskIntoConstraints = false
+        collectionView.backgroundColor = .amoledSystemBackground
+        collectionView.alwaysBounceVertical = true
+        // SwiftUI owns the header safe area; UIKit must not add it a second time.
+        collectionView.contentInsetAdjustmentBehavior = .never
+        collectionView.keyboardDismissMode = .interactive
+        collectionView.delegate = self
+        // Streaming rows are measured explicitly in completePendingRowMeasurement().
+        // Leaving this enabled makes invalidateIntrinsicContentSize() start a second,
+        // UIKit-owned resize before our custom layout commits the measured height.
+        collectionView.selfSizingInvalidation = .disabled
+        collectionView.register(ChatTimelineCollectionCell.self, forCellWithReuseIdentifier: "message")
+        view.addSubview(collectionView)
+        NSLayoutConstraint.activate([
+            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            collectionView.topAnchor.constraint(equalTo: view.topAnchor),
+            collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
+        dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView) { [weak self] collectionView, indexPath, id in
+            guard let self,
+                  let row = self.store?.row(id: id)
+            else { return nil }
+            guard let cell = collectionView.dequeueReusableCell(
+                withReuseIdentifier: "message",
+                for: indexPath
+            ) as? ChatTimelineCollectionCell else { return nil }
+            cell.backgroundConfiguration = UIBackgroundConfiguration.clear()
+            cell.onMeasuredContentHeightChange = { [weak self] height in
+                self?.applyMeasuredCellHeight(height, rowID: id)
+            }
+            cell.contentConfiguration = UIHostingConfiguration {
+                ChatTimelineRowView(
+                    store: row,
+                    regeneratableMessageID: self.regeneratableMessageID,
+                    dualSplitLayout: self.dualSplitLayout,
+                    dualSplitRatio: self.dualSplitRatio,
+                    onRoute: self.onRoute,
+                    onPreviousVariant: self.onPreviousVariant,
+                    onNextVariant: self.onNextVariant,
+                    onBranch: self.onBranch,
+                    onRegenerate: self.onRegenerate,
+                    onAskChatWithSelection: self.onAskChatWithSelection,
+                    onGenUINewTurn: self.onGenUINewTurn,
+                    onEditUserMessage: self.onEditUserMessage,
+                    onSelectUserMessageText: self.onSelectUserMessageText,
+                    onSelectDualSide: { [weak self] side in self?.onSelectDualSide(side) },
+                    onIntrinsicHeightChange: { [weak self] height in
+                        self?.applyIntrinsicHeight(height, rowID: id)
+                    },
+                    onContentLayoutChange: { [weak self] in
+                        self?.remeasureRow(rowID: id)
+                    }
+                )
+                .id(row.id)
+                .environment(\.markdownPresentationCache, row.markdownPresentationCache)
+            }
+            .margins(.all, 0)
+            cell.requestContentHeightMeasurement()
+            return cell
+        }
+    }
+
+    /// Reserves room for the translucent header that floats above the timeline.
+    /// The header covers the status bar too, so the inset is measured from the
+    /// top of the window rather than from the scroll view's safe area.
+    func applyTimelineTopInset(_ inset: CGFloat) {
+        loadViewIfNeeded()
+        let clamped = max(0, inset)
+        let delta = clamped - timelineTopInset
+        guard abs(delta) > TailFollowPolicy.offsetTolerance else { return }
+        timelineTopInset = clamped
+        updateTimelineContentInsets()
+        guard collectionView.bounds.height > 0,
+              collectionView.contentSize.height > 0 else { return }
+        // Every row moved down by `delta`, so the same content stays visible.
+        collectionView.layoutIfNeeded()
+        let adjustedInset = collectionView.adjustedContentInset
+        let lowerBound = -adjustedInset.top
+        let upperBound = max(
+            lowerBound,
+            collectionView.contentSize.height - collectionView.bounds.height + adjustedInset.bottom
+        )
+        let target = TailFollowPolicy.restoredOffset(
+            anchorMinY: collectionView.contentOffset.y + delta,
+            offsetWithinViewport: 0,
+            lowerBound: lowerBound,
+            upperBound: upperBound
+        )
+        collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: target), animated: false)
+    }
+
+    private func updateTimelineContentInsets() {
+        guard let layout = collectionView.collectionViewLayout as? ChatTimelineLayout else { return }
+        let horizontal: CGFloat = collectionView.bounds.width >= 700 ? 28 : 18
+        let insets = UIEdgeInsets(
+            top: 20 + timelineTopInset,
+            left: horizontal,
+            bottom: 24,
+            right: horizontal
+        )
+        guard insets != layout.contentInsets else { return }
+        layout.contentInsets = insets
+        layout.invalidateLayout()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        maintainViewportLockIfNeeded()
+        let viewportSize = collectionView.bounds.size
+        guard viewportSize != lastViewportSize else { return }
+        let widthChanged = abs(viewportSize.width - lastViewportSize.width)
+            > TailFollowPolicy.offsetTolerance
+        lastViewportSize = viewportSize
+        if widthChanged,
+           let layout = collectionView.collectionViewLayout as? ChatTimelineLayout {
+            updateTimelineContentInsets()
+            layout.resetMeasuredHeights()
+            layout.invalidateLayout()
+        }
+        guard !isUserScrolling, case .followingTail = followState else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  !self.isUserScrolling,
+                  case .followingTail = self.followState
+            else { return }
+            self.collectionView.layoutIfNeeded()
+            self.pinToTail()
+            self.publishFollowState()
+        }
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        isTimelineVisible = true
+        // Viewport compensation is only valid for the exact visible streaming
+        // frame that created it. A cached conversation can otherwise restore a
+        // temporary bottom inset after navigating back to it.
+        cancelPendingViewportRestoreForNavigation()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        isTimelineVisible = false
+        cancelPendingViewportRestoreForNavigation()
+    }
+
+    func configure(
+        store: ChatTimelineStore,
+        scrollToLatestRequest: Int,
+        regeneratableMessageID: Int64?,
+        dualSplitLayout: String,
+        dualSplitRatio: Double,
+        onRoute: @escaping (ChatWorkspaceRoute) -> Void,
+        onPreviousVariant: @escaping (Int64) -> Void,
+        onNextVariant: @escaping (Int64) -> Void,
+        onBranch: @escaping (Int64) -> Void,
+        onRegenerate: @escaping () -> Void,
+        onAskChatWithSelection: @escaping (String) -> Void,
+        onGenUINewTurn: @escaping (String) -> Bool = { _ in false },
+        onEditUserMessage: @escaping (String) -> Void,
+        onSelectUserMessageText: @escaping (String) -> Void,
+        onSelectDualSide: @escaping (DualResponseSide) -> Void = { _ in }
+    ) {
+        let storeChanged = self.store !== store
+        if storeChanged {
+            self.store?.onRowContentWillChange = nil
+            self.store?.onRowContentDidChange = nil
+            followState = .followingTail
+            unreadCount = 0
+            pendingContentAnchor = nil
+            pendingViewportOffsetY = nil
+            pendingChangedRowIDs.removeAll()
+            pendingReconfiguredRowIDs.removeAll()
+            pendingMeasuredCellHeights.removeAll()
+            pendingContentChangeUserScrollGeneration = nil
+            parsedRowsRemeasured.removeAll()
+            pendingLocksViewport = false
+            isUserScrollInProgress = false
+            lastUserDrivenOffsetY = nil
+            clearViewportCompensation()
+            store.onRowContentWillChange = { [weak self] rowID, kind in
+                self?.prepareForRowContentChange(rowID: rowID, kind: kind)
+            }
+            store.onRowContentDidChange = { [weak self] rowID, kind in
+                self?.finishRowContentChange(rowID: rowID, kind: kind)
+            }
+            // A newly selected conversation renders from its persisted rows.
+            // Presentation-only stream frames belong to the previous attachment
+            // of this controller and must not keep their provisional cell height.
+            store.clearTransientStreamingSnapshots()
+        }
+        self.store = store
+        let regeneratableMessageChanged = previousRegeneratableMessageID != regeneratableMessageID
+        let dualLayoutChanged = previousDualSplitLayout != dualSplitLayout
+            || previousDualSplitRatio != dualSplitRatio
+        previousRegeneratableMessageID = regeneratableMessageID
+        previousDualSplitLayout = dualSplitLayout
+        previousDualSplitRatio = dualSplitRatio
+        self.regeneratableMessageID = regeneratableMessageID
+        self.dualSplitLayout = dualSplitLayout
+        self.dualSplitRatio = dualSplitRatio
+        self.onRoute = onRoute
+        self.onPreviousVariant = onPreviousVariant
+        self.onNextVariant = onNextVariant
+        self.onBranch = onBranch
+        self.onRegenerate = onRegenerate
+        self.onAskChatWithSelection = onAskChatWithSelection
+        self.onGenUINewTurn = onGenUINewTurn
+        self.onEditUserMessage = onEditUserMessage
+        self.onSelectUserMessageText = onSelectUserMessageText
+        self.onSelectDualSide = onSelectDualSide
+
+        let scrollToLatest = storeChanged || scrollToLatestRequest != lastScrollRequest
+        if scrollToLatest {
+            lastScrollRequest = scrollToLatestRequest
+            followState = .followingTail
+            unreadCount = 0
+        }
+
+        let shouldReconfigure = regeneratableMessageChanged
+            || dualLayoutChanged
+        apply(
+            ids: store.orderedIDs,
+            reconfigureAll: shouldReconfigure,
+            completion: scrollToLatest ? { [weak self] in self?.moveToLatestOnce() } : nil
+        )
+    }
+
+    private func prepareForRowContentChange(rowID: String, kind: ChatTimelineRowChangeKind) {
+        pendingChangedRowIDs.insert(rowID)
+        guard !isUserScrolling else {
+            cancelPendingViewportRestoreForUserScroll()
+            return
+        }
+        if pendingContentAnchor == nil {
+            pendingContentAnchor = captureVisibleAnchor()
+            pendingViewportOffsetY = collectionView.contentOffset.y
+            pendingContentChangeUserScrollGeneration = userScrollGeneration
+        }
+        switch kind {
+        case .streamUpdate:
+            if isTimelineVisible, case .detached = followState {
+                pendingLocksViewport = true
+            }
+        case .completion:
+            // A stream frame may need temporary bottom inset to hold a detached
+            // reader's viewport while the row is remeasured. Completion is the
+            // terminal measurement pass, so it must remove that compensation
+            // instead of turning it into permanent scrollable whitespace.
+            pendingLocksViewport = false
+        case .normalUpdate:
+            break
+        }
+    }
+
+    private func finishRowContentChange(rowID: String, kind: ChatTimelineRowChangeKind) {
+        pendingChangedRowIDs.insert(rowID)
+        pendingReconfiguredRowIDs.insert(rowID)
+        guard !isContentUpdateScheduled else { return }
+        isContentUpdateScheduled = true
+        applyPendingRowReconfigurationsIfNeeded()
+    }
+
+    private func finishExistingRowMeasurement(rowID: String) {
+        if let indexPath = dataSource.indexPath(for: rowID),
+           let cell = collectionView.cellForItem(at: indexPath) as? ChatTimelineCollectionCell {
+            // A final parse or asynchronous artifact can change an existing
+            // hosting view without replacing its content configuration.
+            cell.requestContentHeightMeasurement()
+        }
+        pendingChangedRowIDs.insert(rowID)
+        guard !isContentUpdateScheduled else { return }
+        isContentUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.applyPendingRowReconfigurationsIfNeeded()
+        }
+    }
+
+    private func applyPendingRowReconfigurationsIfNeeded() {
+        isReconfiguringRows = true
+        defer { isReconfiguringRows = false }
+        // A presentation-only height callback does not need a copy of the
+        // entire conversation's diffable snapshot during scrolling.
+        guard !pendingReconfiguredRowIDs.isEmpty else {
+            completePendingRowMeasurement()
+            return
+        }
+        var snapshot = dataSource.snapshot()
+        let availableIDs = Set(snapshot.itemIdentifiers)
+        let reconfiguredIDs = pendingReconfiguredRowIDs.filter(availableIDs.contains)
+        if !reconfiguredIDs.isEmpty {
+            pendingReconfiguredRowIDs.subtract(reconfiguredIDs)
+            // Rebuild only the changed hosting configuration. The diffable-data
+            // source completion runs after the configuration provider has read
+            // the latest row snapshot, so manual sizing cannot measure the
+            // previous SwiftUI streaming frame.
+            snapshot.reconfigureItems(Array(reconfiguredIDs))
+            dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
+                guard let self else { return }
+                if self.pendingReconfiguredRowIDs.isEmpty {
+                    self.completePendingRowMeasurement()
+                } else {
+                    // Updates received during the snapshot still need their own configuration pass.
+                    self.applyPendingRowReconfigurationsIfNeeded()
+                }
+            }
+        } else {
+            completePendingRowMeasurement()
+        }
+    }
+
+    private func applyIntrinsicHeight(_ height: CGFloat, rowID: String) {
+        guard height.isFinite, height > 0, configuredIDs.contains(rowID) else { return }
+        let row = store?.row(id: rowID)
+        // Completed Markdown (including MathJax) can outgrow UIKit's cached
+        // hosting size. This preference measures the complete SwiftUI row, so
+        // commit it directly to keep its first and last blocks inside the cell.
+        // Active streams still use the current hosting-cell measurement: a late
+        // preference from an older token frame must not replace the newer height.
+        if row?.hasGenUIContent == true || row?.streamingSnapshot?.isFinal != false {
+            pendingMeasuredCellHeights[rowID] = ceil(height)
+        }
+        prepareForRowContentChange(rowID: rowID, kind: .normalUpdate)
+        finishPresentationMeasurement(rowID: rowID)
+    }
+
+    private func applyMeasuredCellHeight(_ height: CGFloat, rowID: String) {
+        guard height.isFinite, height > 0, configuredIDs.contains(rowID) else { return }
+        pendingMeasuredCellHeights[rowID] = ceil(height)
+        prepareForRowContentChange(rowID: rowID, kind: .normalUpdate)
+        finishPresentationMeasurement(rowID: rowID)
+    }
+
+    private func remeasureRow(rowID: String) {
+        guard configuredIDs.contains(rowID) else { return }
+        if store?.row(id: rowID)?.streamingSnapshot?.isFinal == false {
+            guard parsedRowsRemeasured.insert(rowID).inserted,
+                  !isCompletingRowMeasurement
+            else { return }
+        }
+        prepareForRowContentChange(rowID: rowID, kind: .normalUpdate)
+        finishPresentationMeasurement(rowID: rowID)
+    }
+
+    private func finishPresentationMeasurement(rowID: String) {
+        if store?.row(id: rowID)?.streamingSnapshot?.isFinal == false {
+            // Streaming frames must keep content replacement and height
+            // measurement in the same run-loop turn. Deferring only the height
+            // pass makes the rendered token frame and its cell bounds alternate.
+            finishRowContentChange(rowID: rowID, kind: .normalUpdate)
+        } else {
+            // A completed Markdown view already owns its parsed presentation.
+            // Measure that existing hosting cell without rebuilding it and
+            // restarting the final parse.
+            finishExistingRowMeasurement(rowID: rowID)
+        }
+    }
+
+    private func completePendingRowMeasurement() {
+        // Consume one immutable batch. A Mermaid/attachment callback can arrive
+        // synchronously while layoutIfNeeded() below is measuring this batch.
+        // Clearing the queue up front lets that callback enqueue a second pass;
+        // clearing it at the end would silently discard the newer height.
+        let changedRowIDs = pendingChangedRowIDs
+        let measuredCellHeights = pendingMeasuredCellHeights
+        let contentAnchor = pendingContentAnchor
+        let viewportOffsetY = pendingViewportOffsetY
+        let contentChangeUserScrollGeneration = pendingContentChangeUserScrollGeneration
+        let locksViewport = pendingLocksViewport
+        let measurementOffsetY = collectionView.contentOffset.y
+        pendingContentAnchor = nil
+        pendingViewportOffsetY = nil
+        pendingChangedRowIDs.removeAll()
+        pendingReconfiguredRowIDs.removeAll()
+        pendingMeasuredCellHeights.removeAll()
+        pendingContentChangeUserScrollGeneration = nil
+        pendingLocksViewport = false
+        isContentUpdateScheduled = false
+
+        isCompletingRowMeasurement = true
+        UIView.performWithoutAnimation {
+            let context = ChatTimelineLayoutInvalidationContext()
+            let indexPaths = changedRowIDs.compactMap { id -> IndexPath? in
+                guard let index = configuredIDs.firstIndex(of: id) else { return nil }
+                return IndexPath(item: index, section: 0)
+            }
+            for indexPath in indexPaths {
+                guard let id = dataSource.itemIdentifier(for: indexPath) else { continue }
+                if let measuredHeight = measuredCellHeights[id] {
+                    context.preferredHeights[indexPath] = measuredHeight
+                    continue
+                }
+                guard let cell = collectionView.cellForItem(at: indexPath),
+                      let originalAttributes = collectionView.layoutAttributesForItem(at: indexPath)
+                else { continue }
+                cell.contentView.invalidateIntrinsicContentSize()
+                cell.setNeedsLayout()
+                cell.layoutIfNeeded()
+                let fittedAttributes = cell.preferredLayoutAttributesFitting(originalAttributes)
+                context.preferredHeights[indexPath] = fittedAttributes.size.height
+            }
+            if !context.preferredHeights.isEmpty {
+                context.invalidateItems(at: Array(context.preferredHeights.keys))
+                collectionView.collectionViewLayout.invalidateLayout(with: context)
+                // Item-only invalidation updates the attributes but UIKit does
+                // not ask this custom layout for a new collection content size.
+                // Fully invalidate after preserving the measured heights so the
+                // scrollable range grows with the streamed cell.
+                collectionView.collectionViewLayout.invalidateLayout()
+            }
+            collectionView.layoutIfNeeded()
+            let userScrolledSinceCapture = contentChangeUserScrollGeneration.map {
+                $0 != userScrollGeneration
+            } ?? false
+            if isUserScrolling || userScrolledSinceCapture {
+                cancelPendingViewportRestoreForUserScroll()
+                // UIKit may adjust contentOffset as soon as invalidation starts,
+                // before this pass reaches layoutIfNeeded(). Preserve the last
+                // offset delivered by the scroll delegate, which is the actual
+                // finger/deceleration position, rather than that adjusted value.
+                // A live drag can be outside the content bounds (rubber banding).
+                // Clamping it here snaps the viewport away from the finger.
+                let preservedOffsetY = isUserScrolling
+                    ? TailFollowPolicy.offsetDuringUserInteraction(
+                        current: measurementOffsetY,
+                        lastUserDriven: lastUserDrivenOffsetY,
+                        hasActiveDrag: isUserScrollInProgress
+                    )
+                    : clampedOffset(measurementOffsetY)
+                if TailFollowPolicy.shouldAdjustOffset(
+                    current: collectionView.contentOffset.y,
+                    target: preservedOffsetY
+                ) {
+                    collectionView.setContentOffset(
+                        CGPoint(x: 0, y: preservedOffsetY),
+                        animated: false
+                    )
+                }
+            } else {
+                restorePosition(
+                    anchor: contentAnchor,
+                    clampsToContentBounds: !locksViewport,
+                    lockedOffsetY: viewportOffsetY
+                )
+            }
+        }
+        isCompletingRowMeasurement = false
+    }
+
+    private func apply(
+        ids: [String],
+        reconfigureAll: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        let idsChanged = configuredIDs != ids
+        // Composer/focus changes often reconfigure the representable without
+        // changing the timeline. Avoid snapshot/anchor work in those updates.
+        guard idsChanged || reconfigureAll || completion != nil else { return }
+        let previousIDs = Set(configuredIDs)
+        let anchor = captureVisibleAnchor()
+        let capturedUserScrollGeneration = userScrollGeneration
+
+        if idsChanged {
+            (collectionView.collectionViewLayout as? ChatTimelineLayout)?.remapMeasuredHeights(
+                from: configuredIDs,
+                to: ids
+            )
+            configuredIDs = ids
+            var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
+            snapshot.appendSections([0])
+            snapshot.appendItems(ids)
+            if reconfigureAll {
+                let retainedIDs = ids.filter(previousIDs.contains)
+                if !retainedIDs.isEmpty {
+                    snapshot.reconfigureItems(retainedIDs)
+                }
+            }
+            if case .detached = followState {
+                unreadCount += ids.lazy.filter { !previousIDs.contains($0) }.count
+            }
+            dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
+                guard let self else { return }
+                if self.userScrollGeneration == capturedUserScrollGeneration,
+                   !self.isUserScrolling {
+                    self.restorePosition(anchor: anchor)
+                }
+                completion?()
+            }
+        } else if reconfigureAll, !configuredIDs.isEmpty {
+            var snapshot = dataSource.snapshot()
+            snapshot.reconfigureItems(configuredIDs)
+            dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
+                guard let self else { return }
+                if self.userScrollGeneration == capturedUserScrollGeneration,
+                   !self.isUserScrolling {
+                    self.restorePosition(anchor: anchor)
+                }
+                completion?()
+            }
+        } else {
+            completion?()
+        }
+    }
+
+    private func captureVisibleAnchor() -> (id: String, offset: CGFloat)? {
+        guard let first = collectionView.indexPathsForVisibleItems.sorted().first,
+              let id = dataSource.itemIdentifier(for: first),
+              let attributes = collectionView.layoutAttributesForItem(at: first)
+        else { return nil }
+        return (id, attributes.frame.minY - collectionView.contentOffset.y)
+    }
+
+    private func restorePosition(
+        anchor: (id: String, offset: CGFloat)?,
+        clampsToContentBounds: Bool = true,
+        lockedOffsetY: CGFloat? = nil
+    ) {
+        collectionView.layoutIfNeeded()
+        switch followState {
+        case .followingTail:
+            clearViewportCompensation()
+            pinToTail()
+        case .detached:
+            // A shrinking row can leave the viewport entirely inside temporary
+            // bottom compensation. There is then no visible row to anchor, but
+            // completion must still remove the inset and clamp to real content.
+            var targetY = lockedOffsetY ?? collectionView.contentOffset.y
+            if let anchor,
+               let index = configuredIDs.firstIndex(of: anchor.id),
+               let attributes = collectionView.layoutAttributesForItem(at: IndexPath(item: index, section: 0)) {
+                targetY = attributes.frame.minY - anchor.offset
+            }
+            if !clampsToContentBounds {
+                viewportLockTargetY = lockedOffsetY ?? targetY
+                maintainViewportLockIfNeeded()
+                publishFollowState()
+                return
+            }
+            clearViewportCompensation()
+            let restoredY = clampedOffset(targetY)
+            if TailFollowPolicy.shouldAdjustOffset(current: collectionView.contentOffset.y, target: restoredY) {
+                collectionView.setContentOffset(CGPoint(x: 0, y: restoredY), animated: false)
+            }
+        }
+        publishFollowState()
+    }
+
+    private func moveToLatestOnce() {
+        guard !isUserScrolling, case .followingTail = followState else {
+            publishFollowState()
+            return
+        }
+        clearViewportCompensation()
+        UIView.performWithoutAnimation {
+            collectionView.layoutIfNeeded()
+            pinToTail()
+        }
+        unreadCount = 0
+        publishFollowState()
+    }
+
+    private func pinToTail() {
+        let inset = collectionView.adjustedContentInset
+        let y = max(-inset.top, collectionView.contentSize.height - collectionView.bounds.height + inset.bottom)
+        if TailFollowPolicy.shouldAdjustOffset(current: collectionView.contentOffset.y, target: y) {
+            collectionView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        }
+    }
+
+    private func clampedOffset(_ value: CGFloat) -> CGFloat {
+        let inset = collectionView.adjustedContentInset
+        let lower = -inset.top
+        let upper = max(lower, collectionView.contentSize.height - collectionView.bounds.height + inset.bottom)
+        return TailFollowPolicy.restoredOffset(
+            anchorMinY: value,
+            offsetWithinViewport: 0,
+            lowerBound: lower,
+            upperBound: upper
+        )
+    }
+
+    private var isNearTail: Bool {
+        let inset = collectionView.adjustedContentInset
+        let visibleBottom = collectionView.contentOffset.y + collectionView.bounds.height - inset.bottom
+        return TailFollowPolicy.isNearTail(distance: collectionView.contentSize.height - visibleBottom)
+    }
+
+    private var isAtTail: Bool {
+        let inset = collectionView.adjustedContentInset
+        let visibleBottom = collectionView.contentOffset.y + collectionView.bounds.height - inset.bottom
+        return TailFollowPolicy.isNearTail(
+            distance: collectionView.contentSize.height - visibleBottom,
+            threshold: TailFollowPolicy.offsetTolerance
+        )
+    }
+
+    private var isUserScrolling: Bool {
+        isUserScrollInProgress
+            || collectionView?.isTracking == true
+            || collectionView?.isDragging == true
+            || collectionView?.isDecelerating == true
+    }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        userScrollGeneration &+= 1
+        isUserScrollInProgress = true
+        lastUserDrivenOffsetY = scrollView.contentOffset.y
+        cancelPendingViewportRestoreForUserScroll()
+        detachAtVisibleAnchor()
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        // Layout and inset changes also invoke this delegate. They must not
+        // replace the last finger-driven position during a measurement pass.
+        // Touch-down alone (isTracking) has not started a user-driven scroll.
+        guard isUserScrollInProgress, !isCompletingRowMeasurement, !isReconfiguringRows else { return }
+        lastUserDrivenOffsetY = scrollView.contentOffset.y
+        if isAtTail {
+            followState = .followingTail
+            unreadCount = 0
+        } else {
+            detachAtVisibleAnchor()
+        }
+        publishFollowState()
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        guard !decelerate else { return }
+        isUserScrollInProgress = false
+        lastUserDrivenOffsetY = nil
+        settleFollowState()
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        isUserScrollInProgress = false
+        lastUserDrivenOffsetY = nil
+        settleFollowState()
+    }
+
+    private func settleFollowState() {
+        // The wider "near tail" threshold is for the latest-message affordance.
+        // Resuming automatic movement requires actually reaching the tail;
+        // even a small upward drag means the reader chose a different position.
+        if isAtTail {
+            followState = .followingTail
+            unreadCount = 0
+        } else {
+            detachAtVisibleAnchor()
+        }
+        publishFollowState()
+    }
+
+    private func detachAtVisibleAnchor() {
+        detach(using: captureVisibleAnchor())
+    }
+
+    private func detach(using anchor: (id: String, offset: CGFloat)?) {
+        guard let anchor else { return }
+        followState = .detached(
+            anchorMessageID: numericMessageID(for: anchor.id),
+            offset: anchor.offset
+        )
+    }
+
+    private func numericMessageID(for rowID: String) -> Int64 {
+        Int64(rowID.dropFirst(2)) ?? 0
+    }
+
+    private func publishFollowState() {
+        let following = isNearTail
+        guard lastPublishedFollowState?.following != following
+            || lastPublishedFollowState?.unread != unreadCount else { return }
+        lastPublishedFollowState = (following, unreadCount)
+        onFollowStateChanged(following, unreadCount)
+    }
+
+    private func maintainViewportLockIfNeeded() {
+        guard !isUserScrolling, let targetY = viewportLockTargetY else { return }
+        let inset = collectionView.adjustedContentInset
+        let lower = -inset.top
+        let naturalUpper = max(
+            lower,
+            collectionView.contentSize.height - collectionView.bounds.height
+                + inset.bottom - viewportCompensationBottom
+        )
+        let requiredCompensation = max(0, targetY - naturalUpper)
+        if abs(requiredCompensation - viewportCompensationBottom) > TailFollowPolicy.offsetTolerance {
+            collectionView.contentInset.bottom += requiredCompensation - viewportCompensationBottom
+            viewportCompensationBottom = requiredCompensation
+        }
+        if TailFollowPolicy.shouldAdjustOffset(current: collectionView.contentOffset.y, target: targetY) {
+            collectionView.setContentOffset(CGPoint(x: 0, y: targetY), animated: false)
+        }
+    }
+
+    private func clearViewportCompensation() {
+        viewportLockTargetY = nil
+        guard viewportCompensationBottom > 0 else { return }
+        collectionView.contentInset.bottom -= viewportCompensationBottom
+        viewportCompensationBottom = 0
+    }
+
+    private func cancelPendingViewportRestoreForUserScroll() {
+        pendingContentAnchor = nil
+        pendingViewportOffsetY = nil
+        pendingLocksViewport = false
+        pendingContentChangeUserScrollGeneration = nil
+        clearViewportCompensation()
+    }
+
+    private func cancelPendingViewportRestoreForNavigation() {
+        pendingContentAnchor = nil
+        pendingViewportOffsetY = nil
+        pendingChangedRowIDs.removeAll()
+        pendingReconfiguredRowIDs.removeAll()
+        pendingMeasuredCellHeights.removeAll()
+        pendingContentChangeUserScrollGeneration = nil
+        pendingLocksViewport = false
+        clearViewportCompensation()
+        collectionView.layoutIfNeeded()
+        let boundedOffsetY = clampedOffset(collectionView.contentOffset.y)
+        if TailFollowPolicy.shouldAdjustOffset(
+            current: collectionView.contentOffset.y,
+            target: boundedOffsetY
+        ) {
+            collectionView.setContentOffset(CGPoint(x: 0, y: boundedOffsetY), animated: false)
+        }
+    }
+}
+
+final class ChatTimelineLayoutInvalidationContext: UICollectionViewLayoutInvalidationContext {
+    var preferredHeights: [IndexPath: CGFloat] = [:]
+}
+
+final class ChatTimelineLayout: UICollectionViewLayout {
+    var contentInsets = UIEdgeInsets(top: 20, left: 18, bottom: 24, right: 18)
+
+    private let estimatedHeight: CGFloat = 120
+    private let itemSpacing: CGFloat = 22
+    private var measuredHeights: [IndexPath: CGFloat] = [:]
+    private var itemAttributes: [UICollectionViewLayoutAttributes] = []
+    private var calculatedContentSize = CGSize.zero
+    private var firstDirtyItem = 0
+    private var preparedWidth: CGFloat?
+    private var preparedInsets = UIEdgeInsets.zero
+
+    #if DEBUG
+    private(set) var preparedItemCount = 0
+    private(set) var lastElementLookupCount = 0
+    #endif
+
+    override class var invalidationContextClass: AnyClass {
+        ChatTimelineLayoutInvalidationContext.self
+    }
+
+    func resetMeasuredHeights() {
+        measuredHeights.removeAll()
+        firstDirtyItem = 0
+    }
+
+    func remapMeasuredHeights(from previousIDs: [String], to nextIDs: [String]) {
+        let unchangedCount = zip(previousIDs, nextIDs).prefix { $0 == $1 }.count
+        firstDirtyItem = min(firstDirtyItem, unchangedCount)
+        guard !measuredHeights.isEmpty else { return }
+        var heightsByID: [String: CGFloat] = [:]
+        for (indexPath, height) in measuredHeights where previousIDs.indices.contains(indexPath.item) {
+            heightsByID[previousIDs[indexPath.item]] = height
+        }
+        var remapped: [IndexPath: CGFloat] = [:]
+        for (index, id) in nextIDs.enumerated() {
+            if let height = heightsByID[id] {
+                remapped[IndexPath(item: index, section: 0)] = height
+            }
+        }
+        measuredHeights = remapped
+    }
+
+    override func prepare() {
+        super.prepare()
+        guard let collectionView else { return }
+        let itemCount = collectionView.numberOfSections > 0
+            ? collectionView.numberOfItems(inSection: 0)
+            : 0
+        let itemWidth = max(
+            1,
+            collectionView.bounds.width - contentInsets.left - contentInsets.right
+        )
+        if preparedWidth != collectionView.bounds.width || preparedInsets != contentInsets {
+            firstDirtyItem = 0
+        }
+        preparedWidth = collectionView.bounds.width
+        preparedInsets = contentInsets
+        let start = min(firstDirtyItem, min(itemAttributes.count, itemCount))
+        var y = start > 0 ? itemAttributes[start - 1].frame.maxY + itemSpacing : contentInsets.top
+        if start < itemAttributes.count {
+            itemAttributes.removeSubrange(start...)
+        }
+        for item in start..<itemCount {
+            let indexPath = IndexPath(item: item, section: 0)
+            let height = measuredHeights[indexPath] ?? estimatedHeight
+            let attributes = UICollectionViewLayoutAttributes(forCellWith: indexPath)
+            attributes.frame = CGRect(x: contentInsets.left, y: y, width: itemWidth, height: height)
+            itemAttributes.append(attributes)
+            #if DEBUG
+            preparedItemCount += 1
+            #endif
+            y += height + itemSpacing
+        }
+        if itemCount > 0 {
+            y -= itemSpacing
+        }
+        y += contentInsets.bottom
+        firstDirtyItem = itemCount
+        calculatedContentSize = CGSize(width: collectionView.bounds.width, height: max(0, y))
+    }
+
+    override var collectionViewContentSize: CGSize {
+        calculatedContentSize
+    }
+
+    override func layoutAttributesForElements(in rect: CGRect) -> [UICollectionViewLayoutAttributes]? {
+        #if DEBUG
+        lastElementLookupCount = 0
+        #endif
+        // Frames are ordered and disjoint. Scrolling should visit visible rows,
+        // not filter and sort every message in the conversation on every frame.
+        var lower = 0
+        var upper = itemAttributes.count
+        while lower < upper {
+            #if DEBUG
+            lastElementLookupCount += 1
+            #endif
+            let middle = (lower + upper) / 2
+            if itemAttributes[middle].frame.maxY < rect.minY {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        var visible: [UICollectionViewLayoutAttributes] = []
+        for index in lower..<itemAttributes.count {
+            #if DEBUG
+            lastElementLookupCount += 1
+            #endif
+            let attributes = itemAttributes[index]
+            if attributes.frame.minY > rect.maxY { break }
+            if attributes.frame.intersects(rect) { visible.append(attributes) }
+        }
+        return visible
+    }
+
+    override func layoutAttributesForItem(at indexPath: IndexPath) -> UICollectionViewLayoutAttributes? {
+        guard indexPath.section == 0, itemAttributes.indices.contains(indexPath.item) else { return nil }
+        return itemAttributes[indexPath.item]
+    }
+
+    override func shouldInvalidateLayout(
+        forPreferredLayoutAttributes preferredAttributes: UICollectionViewLayoutAttributes,
+        withOriginalAttributes originalAttributes: UICollectionViewLayoutAttributes
+    ) -> Bool {
+        abs(preferredAttributes.size.height - originalAttributes.size.height)
+            > TailFollowPolicy.offsetTolerance
+    }
+
+    override func invalidationContext(
+        forPreferredLayoutAttributes preferredAttributes: UICollectionViewLayoutAttributes,
+        withOriginalAttributes originalAttributes: UICollectionViewLayoutAttributes
+    ) -> UICollectionViewLayoutInvalidationContext {
+        let context = super.invalidationContext(
+            forPreferredLayoutAttributes: preferredAttributes,
+            withOriginalAttributes: originalAttributes
+        ) as! ChatTimelineLayoutInvalidationContext
+        context.preferredHeights[preferredAttributes.indexPath] = preferredAttributes.size.height
+        return context
+    }
+
+    override func invalidateLayout(with context: UICollectionViewLayoutInvalidationContext) {
+        if let context = context as? ChatTimelineLayoutInvalidationContext {
+            for (indexPath, height) in context.preferredHeights where height.isFinite && height > 0 {
+                guard measuredHeights[indexPath] != height else { continue }
+                measuredHeights[indexPath] = height
+                firstDirtyItem = min(firstDirtyItem, indexPath.item)
+            }
+        }
+        super.invalidateLayout(with: context)
+    }
+
+    override func shouldInvalidateLayout(forBoundsChange newBounds: CGRect) -> Bool {
+        guard let collectionView else { return false }
+        return abs(newBounds.width - collectionView.bounds.width) > TailFollowPolicy.offsetTolerance
+    }
+}
+
+final class ChatTimelineCollectionCell: UICollectionViewCell {
+    var onMeasuredContentHeightChange: ((CGFloat) -> Void)?
+    private var lastReportedContentHeight: CGFloat?
+    private var lastMeasuredWidth: CGFloat?
+    private var lastMeasuredContentHeight: CGFloat?
+    private var needsContentHeightMeasurement = true
+    private var needsInitialHostingFitting = true
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        // An asynchronous Markdown/WebKit size update must never paint over a
+        // neighboring message before the layout commits the new row height.
+        clipsToBounds = true
+        contentView.clipsToBounds = true
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self, UITraitLegibilityWeight.self]) {
+            (cell: ChatTimelineCollectionCell, _: UITraitCollection) in
+            cell.requestContentHeightMeasurement()
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    #if DEBUG
+    private(set) var contentHeightMeasurementCount = 0
+    #endif
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        onMeasuredContentHeightChange = nil
+        lastReportedContentHeight = nil
+        lastMeasuredWidth = nil
+        lastMeasuredContentHeight = nil
+        needsContentHeightMeasurement = true
+        needsInitialHostingFitting = true
+        #if DEBUG
+        contentHeightMeasurementCount = 0
+        #endif
+    }
+
+    func requestContentHeightMeasurement() {
+        needsContentHeightMeasurement = true
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // UIHostingConfiguration can replace/reset the content view on reuse.
+        contentView.clipsToBounds = true
+        let widthChanged = lastMeasuredWidth.map {
+            abs($0 - bounds.width) > TailFollowPolicy.offsetTolerance
+        } ?? true
+        // UICollectionView can lay out a visible cell repeatedly while its
+        // scroll position changes. Measuring an unchanged hosting tree here is
+        // proportional to the complete message length, so a very long answer
+        // would block each scroll frame on a synchronous full-cell fitting pass.
+        guard needsContentHeightMeasurement || widthChanged else { return }
+        let height = measuredContentHeight(for: bounds.width)
+        guard height.isFinite,
+              height > 0,
+              abs(height - bounds.height) > TailFollowPolicy.offsetTolerance,
+              lastReportedContentHeight.map({
+                  abs($0 - height) > TailFollowPolicy.offsetTolerance
+              }) ?? true
+        else { return }
+        lastReportedContentHeight = height
+        onMeasuredContentHeightChange?(height)
+    }
+
+    override func preferredLayoutAttributesFitting(
+        _ layoutAttributes: UICollectionViewLayoutAttributes
+    ) -> UICollectionViewLayoutAttributes {
+        // The initial superclass pass commits a recycled hosting view's new
+        // identity before it is displayed. Keep that pass, but avoid repeating
+        // its full-tree fitting for every streaming or scroll layout update.
+        if needsInitialHostingFitting {
+            needsInitialHostingFitting = false
+            _ = super.preferredLayoutAttributesFitting(layoutAttributes)
+            needsContentHeightMeasurement = true
+        }
+        let attributes = layoutAttributes.copy() as! UICollectionViewLayoutAttributes
+        let height = measuredContentHeight(for: layoutAttributes.size.width)
+        attributes.frame = CGRect(
+            x: layoutAttributes.frame.minX,
+            y: layoutAttributes.frame.minY,
+            width: layoutAttributes.frame.width,
+            height: height
+        )
+        return attributes
+    }
+
+    private func measuredContentHeight(for width: CGFloat) -> CGFloat {
+        if !needsContentHeightMeasurement, lastMeasuredWidth == width,
+           let lastMeasuredContentHeight {
+            return lastMeasuredContentHeight
+        }
+        lastMeasuredWidth = width
+        #if DEBUG
+        contentHeightMeasurementCount += 1
+        #endif
+        let measuredSize = contentView.systemLayoutSizeFitting(
+            CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel
+        )
+        let height = ceil(measuredSize.height)
+        needsContentHeightMeasurement = false
+        lastMeasuredContentHeight = height
+        return height
+    }
+}
+
+private struct ChatTimelineRowView: View {
+    @ObservedObject var store: ChatTimelineRowStore
+    let regeneratableMessageID: Int64?
+    let dualSplitLayout: String
+    let dualSplitRatio: Double
+    let onRoute: (ChatWorkspaceRoute) -> Void
+    let onPreviousVariant: (Int64) -> Void
+    let onNextVariant: (Int64) -> Void
+    let onBranch: (Int64) -> Void
+    let onRegenerate: () -> Void
+    let onAskChatWithSelection: (String) -> Void
+    var onGenUINewTurn: (String) -> Bool = { _ in false }
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+    let onSelectDualSide: (DualResponseSide) -> Void
+    let onIntrinsicHeightChange: (CGFloat) -> Void
+    let onContentLayoutChange: () -> Void
+
+    private var shouldReportIntrinsicHeight: Bool {
+        if case let .dual(message) = store.item {
+            return [message.modelAToolActivity, message.modelBToolActivity]
+                .compactMap { $0 }.flatMap(\.steps).contains { $0.genUIDocument != nil }
+        }
+        guard case let .message(message) = store.item else { return false }
+        let hasAttachments = (
+            try? JSONDecoder().decode(
+                [String].self,
+                from: Data(message.displayAttachmentsJSON.utf8)
+            )
+        )?.isEmpty == false
+        // Attachment previews and parsed multi-block assistant Markdown can
+        // expand after their initial estimate. Plain rows stay on the existing
+        // fitted-size path so unrelated late hosting layouts cannot perturb an
+        // active scroll position.
+        let presentedText = store.streamingSnapshot?.text.trimmedNonEmpty
+            ?? message.displayText
+        return hasAttachments
+            || (store.streamingSnapshot?.toolActivity?.steps ?? message.displayToolActivity?.steps ?? [])
+                .contains { $0.genUIDocument != nil }
+            || (message.message.role != "user" && presentedText.contains("\n\n"))
+    }
+
+    var body: some View {
+        ChatTimelineTopPinnedLayout(usesIntrinsicHeight: shouldReportIntrinsicHeight) {
+            Group {
+                switch store.item {
+                case let .message(message):
+                    ChatMessageRow(
+                        message: message,
+                        streamingSnapshot: store.streamingSnapshot,
+                        streamingMarkdownBlocks: store.streamingMarkdownBlocks,
+                        canRegenerate: regeneratableMessageID == message.id,
+                        onRoute: onRoute,
+                        onPreviousVariant: onPreviousVariant,
+                        onNextVariant: onNextVariant,
+                        onBranch: onBranch,
+                        onRegenerate: onRegenerate,
+                        onEditUserMessage: onEditUserMessage,
+                        onSelectUserMessageText: onSelectUserMessageText,
+                        onMarkdownLayoutChange: shouldReportIntrinsicHeight
+                            ? store.contentLayoutDidChange
+                            : {}
+                    )
+                case let .dual(message):
+                    DualChatMessageRow(
+                        message: message,
+                        splitLayout: dualSplitLayout,
+                        splitRatio: dualSplitRatio,
+                        onRoute: onRoute,
+                        onEditUserMessage: onEditUserMessage,
+                        onSelectUserMessageText: onSelectUserMessageText,
+                        onSelectSide: onSelectDualSide
+                    )
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ChatTimelineIntrinsicHeightPreference.self,
+                        value: proxy.size.height
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .environment(\.onAskChatWithSelection, onAskChatWithSelection)
+        .environment(\.onGenUIPrefill, onEditUserMessage)
+        .environment(\.onGenUINewTurn, onGenUINewTurn)
+        .environment(\.onGenUIRoute, onRoute)
+        .environmentObject(store)
+        .transaction { transaction in
+            transaction.animation = nil
+        }
+        .onChange(of: store.contentLayoutRevision) { _, _ in
+            // Child WebKit state alone does not invalidate UIHostingConfiguration's
+            // cached fitting size when UIKit self-sizing is disabled. Remeasure
+            // after the row's observed layout revision has reached SwiftUI.
+            DispatchQueue.main.async { onContentLayoutChange() }
+        }
+        .onPreferenceChange(ChatTimelineIntrinsicHeightPreference.self) { height in
+            guard shouldReportIntrinsicHeight else { return }
+            onIntrinsicHeightChange(height)
+        }
+    }
+}
+
+private struct ChatTimelineIntrinsicHeightPreference: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ChatTimelineTopPinnedLayout: Layout {
+    let usesIntrinsicHeight: Bool
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard let subview = subviews.first else { return .zero }
+        let contentSize = subview.sizeThatFits(.init(width: proposal.width, height: nil))
+        let proposedHeight = proposal.height.flatMap { $0.isFinite ? $0 : nil }
+        return CGSize(
+            width: proposal.width ?? contentSize.width,
+            height: usesIntrinsicHeight ? contentSize.height : (proposedHeight ?? contentSize.height)
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard let subview = subviews.first else { return }
+        subview.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: .init(width: bounds.width, height: nil)
+        )
+    }
+}
+
+struct ChatMessageRow: View {
+    let message: FullChatMessage
+    let streamingSnapshot: ChatStreamingSnapshot?
+    let streamingMarkdownBlocks: [NativeMarkdownBlock]?
+    let canRegenerate: Bool
+    let onRoute: (ChatWorkspaceRoute) -> Void
+    let onPreviousVariant: (Int64) -> Void
+    let onNextVariant: (Int64) -> Void
+    let onBranch: (Int64) -> Void
+    let onRegenerate: () -> Void
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+    let onMarkdownLayoutChange: () -> Void
+
+    @State private var filePreviewURL: URL?
+
+    var isReadOnly = false
+
+    private var isUser: Bool { message.message.role == "user" }
+    private var isStreaming: Bool { streamingSnapshot?.isFinal == false }
+    private var responseText: String {
+        if let text = streamingSnapshot?.text, !text.isEmpty { return text }
+        return message.displayText
+    }
+    private var thinkingText: String? {
+        let value = streamingSnapshot?.thinking.trimmedNonEmpty ?? message.displayThinkingStream?.trimmedNonEmpty
+        return value
+    }
+    private var toolSteps: [ToolActivityStep] {
+        streamingSnapshot?.toolActivity?.steps ?? message.displayToolActivity?.steps ?? []
+    }
+    private var isToolRunning: Bool {
+        toolSteps.contains { $0.status == .running }
+    }
+    private var rotationNotices: [ProviderRotationNotice] {
+        streamingSnapshot?.toolActivity?.rotationNotices
+            ?? message.displayToolActivity?.rotationNotices
+            ?? []
+    }
+    private var artifacts: [ChatArtifactPresentationItem] {
+        ChatArtifactPresentation.items(from: responseText, isStreaming: isStreaming)
+    }
+    private var responseSegments: [ChatResponseContentSegment] {
+        ChatResponseContentPresentation.segments(from: responseText, artifacts: artifacts)
+    }
+
+    private var showsThinkingProgress: Bool {
+        isStreaming && responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isToolRunning
+    }
+
+    var body: some View {
+        Group {
+            if isUser {
+                HStack(alignment: .top) {
+                    Spacer(minLength: 48)
+                    VStack(alignment: .trailing, spacing: 8) {
+                        if !attachmentItems.isEmpty {
+                            MessageAttachmentList(attachments: attachmentItems, isOutgoing: true)
+                        }
+                        if !responseText.isEmpty {
+                            Text(responseText)
+                                .font(.body)
+                                .lineSpacing(2)
+                                .textSelection(.enabled)
+                                .padding(.horizontal, 15)
+                                .padding(.vertical, 11)
+                                .background(Color(uiColor: .amoledSecondarySystemBackground))
+                                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                                .contextMenu {
+                                    Button {
+                                        UIPasteboard.general.string = responseText
+                                    } label: {
+                                        Label(L10n.text("コピーする"), systemImage: "doc.on.doc")
+                                    }
+                                    if !isReadOnly {
+                                        Button {
+                                            onEditUserMessage(responseText)
+                                        } label: {
+                                            Label(L10n.text("編集する"), systemImage: "pencil")
+                                        }
+                                    }
+                                    if !isReadOnly {
+                                        Button {
+                                            onSelectUserMessageText(responseText)
+                                        } label: {
+                                            Label(L10n.text("テキストを選択する"), systemImage: "selection.pin.in.out")
+                                        }
+                                    }
+                                }
+                        }
+                    }
+                    .frame(maxWidth: 520, alignment: .trailing)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(rotationNotices) { notice in
+                        ProviderRotationNoticeView(notice: notice)
+                    }
+                    if thinkingText != nil || toolSteps.contains(where: { $0.subagent == nil }) {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 16) {
+                                activityControls
+                            }
+                            .fixedSize(horizontal: true, vertical: false)
+                            VStack(alignment: .leading, spacing: 0) {
+                                activityControls
+                            }
+                        }
+                    }
+                    if !toolSteps.compactMap(\.subagent).isEmpty {
+                        SubagentFleetView(runs: toolSteps.compactMap(\.subagent), onLayoutChange: onMarkdownLayoutChange)
+                    }
+
+                    if !previewAttachmentItems.isEmpty {
+                        MessageAttachmentList(attachments: previewAttachmentItems, isOutgoing: false)
+                    }
+
+                    ForEach(toolSteps.filter { $0.genUIDocument != nil }) { step in
+                        if let document = step.genUIDocument {
+                            GenUITimelineView(document: document, toolCallID: step.id)
+                                .id(step.id)
+                        }
+                    }
+
+                    if UserFacingErrorFormatter.looksLikeChatError(responseText) {
+                        Text(responseText)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                            .padding(12)
+                            .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    } else if artifacts.isEmpty, !responseText.isEmpty {
+                        NativeMarkdownView(
+                            markdownText: responseText,
+                            isStreaming: isStreaming,
+                            preparsedBlocks: streamingMarkdownBlocks,
+                            onFinalParse: onMarkdownLayoutChange,
+                            onOpenMermaid: { blockID, source in
+                                onRoute(.mermaidViewer(
+                                    id: "\(message.id)-\(blockID)",
+                                    source: source
+                                ))
+                            }
+                        )
+                    } else {
+                        ForEach(responseSegments) { segment in
+                            switch segment {
+                            case let .markdown(segmentID, markdown):
+                                NativeMarkdownView(
+                                    markdownText: markdown,
+                                    isStreaming: isStreaming,
+                                    preparsedBlocks: nil,
+                                    onFinalParse: onMarkdownLayoutChange,
+                                    onOpenMermaid: { blockID, source in
+                                        onRoute(.mermaidViewer(
+                                            id: "\(message.id)-\(segmentID)-\(blockID)",
+                                            source: source
+                                        ))
+                                    }
+                                )
+                            case let .artifact(artifact):
+                                artifactView(artifact)
+                            }
+                        }
+                    }
+
+                    if isStreaming,
+                       responseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       thinkingText == nil,
+                       !isToolRunning {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(L10n.text("応答を待っています…"))
+                                .font(.subheadline)
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 8)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("chat-response-progress")
+                    }
+
+                    if !isStreaming || !generatedFileItems.isEmpty {
+                        HStack(spacing: 8) {
+                            if !isStreaming {
+                                ChatMessageActions(
+                                    message: message,
+                                    copyText: responseText,
+                                    canRegenerate: canRegenerate,
+                                    onPreviousVariant: onPreviousVariant,
+                                    onNextVariant: onNextVariant,
+                                    onBranch: onBranch,
+                                    onRegenerate: onRegenerate,
+                                    isReadOnly: isReadOnly
+                                )
+                            }
+                            if !generatedFileItems.isEmpty {
+                                Spacer(minLength: 0)
+                                generatedFilesMenu
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: 760, alignment: .leading)
+            }
+        }
+        .environment(\.chatFileURLs, isUser ? [] : attachmentItems.compactMap(\.url))
+        .environment(\.onOpenChatFile) { filePreviewURL = $0 }
+        .quickLookPreview($filePreviewURL)
+        // A message-wide context menu intercepts the long press before SwiftUI's
+        // selectable Text can resolve the character under the user's finger.
+        // Message commands remain available in ChatMessageActions below the body.
+    }
+
+    private var generatedFilesMenu: some View {
+        Menu {
+            ForEach(generatedFileItems) { item in
+                if let url = item.url {
+                    Button {
+                        filePreviewURL = url
+                    } label: {
+                        Label(item.displayName, systemImage: "doc")
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "paperclip")
+                Text(generatedFileItems.count, format: .number)
+                    .monospacedDigit()
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.format("生成ファイル %d件", generatedFileItems.count))
+        .accessibilityIdentifier("chat-generated-files-menu")
+    }
+
+    private var generatedFileItems: [ChatAttachmentItem] {
+        attachmentItems.filter { !$0.isImage && !$0.isSVG && !$0.isHTML }
+    }
+
+    private var previewAttachmentItems: [ChatAttachmentItem] {
+        attachmentItems.filter { $0.isImage || $0.isSVG || $0.isHTML }
+    }
+
+    @ViewBuilder
+    private var activityControls: some View {
+        if let thinkingText {
+            Button {
+                onRoute(.thinkingInspector(messageID: message.id, text: thinkingText))
+            } label: {
+                Label {
+                    Text(showsThinkingProgress ? L10n.text("思考中") : L10n.text("Thinking"))
+                } icon: {
+                    if showsThinkingProgress {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "brain.head.profile")
+                    }
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("chat-thinking-inspector")
+        }
+        if !toolSteps.filter({ $0.subagent == nil }).isEmpty {
+            ChatRunSummaryButton(steps: toolSteps.filter { $0.subagent == nil }) {
+                onRoute(.runInspector(messageID: message.id, steps: toolSteps.filter { $0.subagent == nil }))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func artifactView(_ artifact: ChatArtifactPresentationItem) -> some View {
+        switch artifact.block {
+        case let .svg(source):
+            SvgDiagramView(
+                source: source,
+                onExpand: {
+                    onRoute(.artifactViewer(id: artifact.id, block: artifact.block))
+                },
+                onLayoutChange: onMarkdownLayoutChange
+            )
+        case .html:
+            Button {
+                onRoute(.artifactViewer(id: artifact.id, block: artifact.block))
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: artifact.block.systemImage)
+                        .font(.title3)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(artifact.block.title)
+                            .font(.subheadline.weight(.semibold))
+                        Text(L10n.text("専用ビューアで開く"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(13)
+                .background(Color(uiColor: .amoledSecondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var attachmentPaths: [String] {
+        guard let data = message.displayAttachmentsJSON.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return values
+    }
+
+    private var attachmentItems: [ChatAttachmentItem] {
+        attachmentPaths.map(ChatAttachmentItem.init(rawValue:))
+    }
+}
+
+private struct ProviderRotationNoticeView: View {
+    let notice: ProviderRotationNotice
+
+    private var title: String {
+        if notice.changedModel && notice.changedKey {
+            return L10n.text("GeminiのモデルとAPIキーを切り替えました")
+        }
+        if notice.changedModel {
+            return L10n.text("Geminiのモデルを切り替えました")
+        }
+        return L10n.text("GeminiのAPIキーを切り替えました")
+    }
+
+    private var detail: String {
+        var parts: [String] = []
+        if notice.changedModel {
+            parts.append("\(notice.fromModel) → \(notice.toModel)")
+        }
+        if notice.changedKey {
+            parts.append("\(keyLabel(notice.fromKeyID)) → \(keyLabel(notice.toKeyID))")
+        }
+        parts.append(
+            notice.reason == .authenticationFailed
+                ? L10n.text("認証エラーのため")
+                : L10n.text("利用制限のため")
+        )
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.orange.opacity(0.16), lineWidth: 0.5)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title)。\(detail)")
+    }
+
+    private func keyLabel(_ keyID: String) -> String {
+        if keyID == "default" {
+            return L10n.text("メインAPIキー")
+        }
+        let name = keyID.hasPrefix("slot:") ? String(keyID.dropFirst("slot:".count)) : keyID
+        return L10n.format("APIキー「%@」", name)
+    }
+}
+
+private struct ChatRunSummaryButton: View {
+    let steps: [ToolActivityStep]
+    let action: () -> Void
+
+    private var isRunning: Bool { steps.contains { $0.status == .running } }
+    private var hasFailure: Bool {
+        ToolActivityFailurePresentationPolicy.shouldHighlightAggregateFailure(in: steps)
+    }
+    private var webCount: Int { steps.filter(\.isWebActivity).count }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                if isRunning {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: hasFailure ? "exclamationmark.circle" : (webCount > 0 ? "globe" : "terminal"))
+                }
+                Text(isRunning ? L10n.text("ツールを実行中") : L10n.format("%d 件のツール実行", steps.count))
+                    .font(.subheadline.weight(.medium))
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .foregroundStyle(hasFailure ? Color.red : Color.secondary)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ChatMessageActions: View {
+    let message: FullChatMessage
+    let copyText: String
+    let canRegenerate: Bool
+    let onPreviousVariant: (Int64) -> Void
+    let onNextVariant: (Int64) -> Void
+    let onBranch: (Int64) -> Void
+    let onRegenerate: () -> Void
+
+    var isReadOnly = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            actionButton("doc.on.doc", label: L10n.text("コピー")) {
+                UIPasteboard.general.string = copyText
+            }
+            if !isReadOnly {
+                actionButton("arrow.branch", label: L10n.text("分岐")) { onBranch(message.id) }
+            }
+            if canRegenerate {
+                actionButton("arrow.clockwise", label: L10n.text("再生成"), action: onRegenerate)
+            }
+            if message.variantCount > 1 {
+                Spacer(minLength: 6)
+                Button { onPreviousVariant(message.id) } label: { Image(systemName: "chevron.left").frame(width: 36, height: 36) }
+                    .disabled(!message.canSelectPreviousVariant)
+                Text("\(message.selectedVariantOrdinal)/\(message.variantCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Button { onNextVariant(message.id) } label: { Image(systemName: "chevron.right").frame(width: 36, height: 36) }
+                    .disabled(!message.canSelectNextVariant)
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+    }
+
+    private func actionButton(_ icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Group {
+                if message.variantCount > 1 {
+                    Image(systemName: icon)
+                } else {
+                    Label(label, systemImage: icon)
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+            .padding(.horizontal, message.variantCount > 1 ? 0 : 10)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel(label)
+    }
+}
+
+private struct DualChatMessageRow: View {
+    let message: DualChatMessage
+    let splitLayout: String
+    let splitRatio: Double
+    let onRoute: (ChatWorkspaceRoute) -> Void
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+    let onSelectSide: (DualResponseSide) -> Void
+
+    var body: some View {
+        switch message.parsedRole {
+        case .user:
+            HStack {
+                Spacer(minLength: 48)
+                VStack(alignment: .trailing, spacing: 8) {
+                    if !userAttachmentItems.isEmpty {
+                        MessageAttachmentList(
+                            attachments: userAttachmentItems,
+                            isOutgoing: true
+                        )
+                    }
+                    if !message.userText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(message.userText)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 15)
+                            .padding(.vertical, 11)
+                            .background(Color(uiColor: .amoledSecondarySystemBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                            .contextMenu {
+                                Button {
+                                    UIPasteboard.general.string = message.userText
+                                } label: {
+                                    Label(L10n.text("コピーする"), systemImage: "doc.on.doc")
+                                }
+                                Button {
+                                    onEditUserMessage(message.userText)
+                                } label: {
+                                    Label(L10n.text("編集する"), systemImage: "pencil")
+                                }
+                                Button {
+                                    onSelectUserMessageText(message.userText)
+                                } label: {
+                                    Label(L10n.text("テキストを選択する"), systemImage: "selection.pin.in.out")
+                                }
+                            }
+                    }
+                }
+                .frame(maxWidth: 520, alignment: .trailing)
+            }
+        case .dualModel:
+            responseColumns
+        case .legacy:
+            VStack(alignment: .leading, spacing: 12) {
+                if !userAttachmentItems.isEmpty {
+                    MessageAttachmentList(attachments: userAttachmentItems, isOutgoing: false)
+                }
+                if let userText = message.userText.trimmedNonEmpty {
+                    Text(userText)
+                        .font(.body)
+                        .textSelection(.enabled)
+                }
+                Divider()
+                responseColumns
+            }
+        }
+    }
+
+    private var resolvedSplitLayout: String {
+        splitLayout.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "HORIZONTAL"
+            ? "HORIZONTAL"
+            : "VERTICAL"
+    }
+
+    private var resolvedSplitRatio: Double {
+        guard splitRatio.isFinite else { return 0.5 }
+        return min(max(splitRatio, 0.1), 0.9)
+    }
+
+    private var responseColumns: some View {
+        DualSplitContainer(layout: resolvedSplitLayout, splitRatio: resolvedSplitRatio) {
+            responseColumn(side: .a)
+        } second: {
+            responseColumn(side: .b)
+        }
+    }
+
+    private var userAttachmentItems: [ChatAttachmentItem] {
+        message.attachments.map(ChatAttachmentItem.init(rawValue:))
+    }
+
+    private func responseColumn(side: DualResponseSide) -> some View {
+        let presentation = DualResponsePresentation(message: message, side: side)
+        let title: String
+        switch side {
+        case .a:
+            title = "A · \(ProviderCatalog.displayName(for: message.providerA)) · \(message.modelAName)"
+        case .b:
+            title = "B · \(ProviderCatalog.displayName(for: message.providerB)) · \(message.modelBName)"
+        }
+        return DualResponseColumn(
+            title: title,
+            presentation: presentation,
+            messageID: message.id ?? message.createdAtMs,
+            side: side,
+            onRoute: onRoute
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { onSelectSide(side) })
+    }
+}
+
+private struct DualSplitContainer<First: View, Second: View>: View {
+    let layout: String
+    let splitRatio: Double
+    let first: () -> First
+    let second: () -> Second
+
+    init(
+        layout: String,
+        splitRatio: Double,
+        @ViewBuilder first: @escaping () -> First,
+        @ViewBuilder second: @escaping () -> Second
+    ) {
+        self.layout = layout
+        self.splitRatio = splitRatio
+        self.first = first
+        self.second = second
+    }
+
+    var body: some View {
+        if layout == "HORIZONTAL" {
+            VStack(alignment: .leading, spacing: 12) {
+                first()
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                second()
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+        } else {
+            DualRatioLayout(ratio: splitRatio, spacing: 12) {
+                first()
+                second()
+            }
+        }
+    }
+}
+
+private struct DualRatioLayout: Layout {
+    let ratio: Double
+    let spacing: CGFloat
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        guard subviews.count == 2 else { return .zero }
+        let intrinsicWidth = subviews.reduce(CGFloat.zero) {
+            $0 + $1.sizeThatFits(.unspecified).width
+        } + spacing
+        let width = max(proposal.width ?? intrinsicWidth, 0)
+        let paneWidths = resolvedPaneWidths(totalWidth: width)
+        let firstSize = subviews[0].sizeThatFits(.init(width: paneWidths.0, height: proposal.height))
+        let secondSize = subviews[1].sizeThatFits(.init(width: paneWidths.1, height: proposal.height))
+        return CGSize(width: width, height: max(firstSize.height, secondSize.height))
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        guard subviews.count == 2 else { return }
+        let paneWidths = resolvedPaneWidths(totalWidth: bounds.width)
+        subviews[0].place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: .init(width: paneWidths.0, height: proposal.height)
+        )
+        subviews[1].place(
+            at: CGPoint(x: bounds.minX + paneWidths.0 + spacing, y: bounds.minY),
+            anchor: .topLeading,
+            proposal: .init(width: paneWidths.1, height: proposal.height)
+        )
+    }
+
+    private func resolvedPaneWidths(totalWidth: CGFloat) -> (CGFloat, CGFloat) {
+        DualSplitLayoutMetrics.paneWidths(
+            totalWidth: totalWidth,
+            spacing: spacing,
+            ratio: ratio
+        )
+    }
+}
+
+enum DualSplitLayoutMetrics {
+    static func paneWidths(
+        totalWidth: CGFloat,
+        spacing: CGFloat,
+        ratio: Double
+    ) -> (first: CGFloat, second: CGFloat) {
+        let available = max(0, totalWidth - spacing)
+        let clampedRatio = min(max(CGFloat(ratio), 0.1), 0.9)
+        return (available * clampedRatio, available * (1 - clampedRatio))
+    }
+}
+
+private struct DualResponseColumn: View {
+    let title: String
+    let presentation: DualResponsePresentation
+    let messageID: Int64
+    let side: DualResponseSide
+    let onRoute: (ChatWorkspaceRoute) -> Void
+
+    private var thinkingText: String? {
+        presentation.thinking?.trimmedNonEmpty
+    }
+
+    private var attachmentItems: [ChatAttachmentItem] {
+        presentation.attachmentPaths.map(ChatAttachmentItem.init(rawValue:))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let thinkingText {
+                Button {
+                    onRoute(.thinkingInspector(messageID: messageID, text: thinkingText, side: side))
+                } label: {
+                    Label(L10n.text("Thinking"), systemImage: "brain.head.profile")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .frame(minHeight: 44)
+            }
+            if !presentation.toolSteps.compactMap(\.subagent).isEmpty {
+                SubagentFleetView(runs: presentation.toolSteps.compactMap(\.subagent))
+            }
+            if !presentation.toolSteps.filter({ $0.subagent == nil }).isEmpty {
+                ChatRunSummaryButton(steps: presentation.toolSteps.filter { $0.subagent == nil }) {
+                    onRoute(.runInspector(messageID: messageID, steps: presentation.toolSteps.filter { $0.subagent == nil }, side: side))
+                }
+            }
+            if !attachmentItems.isEmpty {
+                MessageAttachmentList(attachments: attachmentItems, isOutgoing: false)
+            }
+            ForEach(presentation.toolSteps.filter { $0.genUIDocument != nil }) { step in
+                if let document = step.genUIDocument {
+                    GenUITimelineView(document: document, toolCallID: "\(title)-\(step.id)")
+                        .id(step.id)
+                }
+            }
+            responseContent
+        }
+        .padding(14)
+        .background(Color(uiColor: .amoledSecondarySystemBackground).opacity(0.65))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var responseContent: some View {
+        switch presentation.status {
+        case .pending:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text(L10n.text("応答待ち"))
+                    .foregroundStyle(.secondary)
+            }
+        case .failed:
+            if !presentation.text.isEmpty {
+                NativeMarkdownView(
+                    markdownText: presentation.text,
+                    onOpenMermaid: { blockID, source in
+                        onRoute(.mermaidViewer(
+                            id: "\(messageID)-\(title)-\(blockID)",
+                            source: source
+                        ))
+                    }
+                )
+            }
+            ChatErrorCard(text: presentation.error?.trimmedNonEmpty ?? L10n.text("応答の生成に失敗しました。"))
+        case .canceled:
+            Text(L10n.text("キャンセルしました"))
+                .foregroundStyle(.secondary)
+        case .completed:
+            if UserFacingErrorFormatter.looksLikeChatError(presentation.text) {
+                ChatErrorCard(text: presentation.text)
+            } else {
+                NativeMarkdownView(
+                    markdownText: presentation.text.trimmedNonEmpty ?? L10n.text("応答がありません"),
+                    onOpenMermaid: { blockID, source in
+                        onRoute(.mermaidViewer(
+                            id: "\(messageID)-\(title)-\(blockID)",
+                            source: source
+                        ))
+                    }
+                )
+            }
+        }
+    }
+}

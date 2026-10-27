@@ -1,0 +1,157 @@
+import Foundation
+import GRDB
+
+final class AppServices {
+    private static let resolutionLock = NSLock()
+    private static var resolvedInstance: AppServices?
+
+    static func resolve() throws -> AppServices {
+        resolutionLock.lock()
+        defer { resolutionLock.unlock() }
+        if let resolvedInstance { return resolvedInstance }
+        let instance = try AppServices()
+        resolvedInstance = instance
+        return instance
+    }
+
+    let onboardingStore: OnboardingStateStore
+    let dbQueue: DatabaseQueue
+    let credentialStore: SecureCredentialStore
+
+    let settingsRepository: SettingsRepository
+    let conversationRepository: ConversationRepository
+    let attachmentRepository: AttachmentRepository
+    let skillRepository: AgentSkillRepository
+    let openRouterModelService: OpenRouterModelService
+    let requestSettingsResolver: ProviderRequestSettingsResolver
+    let modelsDevCatalogRepository: ModelsDevCatalogRepository
+    let codexAuthRepository: CodexAuthRepository
+    let superGrokAuthRepository: SuperGrokAuthRepository
+    let providerGateway: ProviderGateway
+    let chatRepository: ChatRepository
+    let sharePayloadStore: SharePayloadStore
+    let userQuestionCoordinator: UserQuestionCoordinator
+
+    private init() throws {
+        DiagnosticsLogger.initialize()
+        // Migrations insert default settings even on a brand-new installation.
+        let hadDatabase = FileManager.default.fileExists(atPath: try AppDatabase.databaseURL().path)
+        onboardingStore = OnboardingStateStore(hasExistingInstallation: hadDatabase)
+        #if DEBUG
+        if AppStoreScreenshotRouting.isEnabled, ProcessInfo.processInfo.arguments.contains("-UIPolishFixture") {
+            // Each visual review starts with the same demo data, isolated from saved conversations.
+            dbQueue = try DatabaseQueue()
+            try AppDatabase.migrator.migrate(dbQueue)
+        } else {
+            dbQueue = try AppDatabase.makeDatabaseQueue()
+        }
+        #else
+        dbQueue = try AppDatabase.makeDatabaseQueue()
+        #endif
+
+        let keychain = KeychainStore()
+        try keychain.hardenExistingSecrets()
+        credentialStore = keychain
+        settingsRepository = SettingsRepository(dbQueue: dbQueue)
+        let localConversationRepository = ConversationRepository(dbQueue: dbQueue)
+        conversationRepository = localConversationRepository
+        let localAttachmentRepository = AttachmentRepository()
+        attachmentRepository = localAttachmentRepository
+        try localAttachmentRepository.prepareProtectedStorage()
+        try AppGroupShareStorage.prepareProtectedStorage()
+        try ConversationExportService.removeAbandonedExports()
+        let staleSecretIDs = try localConversationRepository.secretConversationIDs()
+        var staleSecretPaths: [String] = []
+        for id in staleSecretIDs {
+            staleSecretPaths.append(
+                contentsOf: try localConversationRepository.attachmentPathsForSecretConversation(id: id)
+            )
+        }
+        try localAttachmentRepository.deleteOwnedFiles(paths: staleSecretPaths)
+        for id in staleSecretIDs {
+            try localAttachmentRepository.deleteConversationArtifacts(conversationID: id)
+        }
+        try localConversationRepository.purgeSecretConversations()
+        do {
+            try EditorWorkspaceStore.shared.deleteOrphans(
+                validSessionIDs: try conversationRepository.allConversationIDs().map(String.init)
+            )
+        } catch {
+            DiagnosticsLogger.log("Editor workspace orphan cleanup failed", category: .app, error: error)
+        }
+        let repository = AgentSkillRepository()
+        skillRepository = repository
+        do {
+            guard let bundledSkills = Bundle.main.url(forResource: "BundledAgentSkills", withExtension: nil) else {
+                throw AgentSkillError.notFound("同梱Skillが見つかりません。")
+            }
+            try repository.installBundledSkills(from: bundledSkills)
+        } catch {
+            DiagnosticsLogger.log("Bundled Agent Skills installation failed", level: .error, category: .settings, error: error)
+        }
+        openRouterModelService = OpenRouterModelService(credentialStore: credentialStore)
+        Task { [openRouterModelService] in
+            _ = await openRouterModelService.getAvailableModels()
+        }
+        userQuestionCoordinator = UserQuestionCoordinator()
+        let askUserQuestionTool = AskUserQuestionTool(coordinator: userQuestionCoordinator)
+        // Pi owns skill discovery and its standard read tool.
+        let pythonTool = PythonExecuteTool(attachments: attachmentRepository, skillRepository: repository)
+        let editorTool = StrReplaceEditorTool(attachments: attachmentRepository)
+        let webReader = FetchUrlTool()
+        let clientWebTools = LocalToolRegistry(
+            executors: LocalToolRegistry.builtInExecutors(reader: webReader, python: pythonTool, editor: editorTool, questions: askUserQuestionTool)
+        )
+        // Recreate per request: web tools share a short-lived document cache; pythonTool is reused
+        // (tied to attachmentRepository and the latest enabled skills).
+        let makeLocalTools: @Sendable () -> LocalToolRegistry = { [pythonTool, editorTool, askUserQuestionTool] in
+            let webReader = FetchUrlTool()
+            return LocalToolRegistry(
+                executors: LocalToolRegistry.builtInExecutors(reader: webReader, python: pythonTool, editor: editorTool, questions: askUserQuestionTool)
+            )
+        }
+        let localTools = makeLocalTools()
+        modelsDevCatalogRepository = ModelsDevCatalogRepository()
+        let modelsDevCredentials = credentialStore
+        let codexAuth = CodexAuthRepository(credentialStore: credentialStore)
+        codexAuthRepository = codexAuth
+        requestSettingsResolver = ProviderRequestSettingsResolver(
+            modelService: openRouterModelService,
+            skillRepository: skillRepository,
+            modelsDevCatalogRepository: modelsDevCatalogRepository,
+            localToolRegistry: clientWebTools,
+            modelsDevReasoningEffort: { providerID, modelID in
+                try? modelsDevCredentials.readSecret(
+                    key: ModelsDevReasoningPreference.storageKey(providerID: providerID, modelID: modelID)
+                )
+            },
+            codexModelsProvider: { codexAuth.cachedModels() }
+        )
+        superGrokAuthRepository = SuperGrokAuthRepository(credentialStore: credentialStore)
+        providerGateway = ProviderGateway(
+            settingsRepository: settingsRepository,
+            credentialStore: credentialStore,
+            codexAuthRepository: codexAuthRepository,
+            superGrokAuthRepository: superGrokAuthRepository,
+            modelsDevCatalogRepository: modelsDevCatalogRepository,
+            openRouterModelService: openRouterModelService,
+            localTools: localTools,
+            localToolFactory: makeLocalTools
+        )
+        chatRepository = ChatRepository(
+            conversations: conversationRepository,
+            settings: settingsRepository,
+            providers: providerGateway,
+            credentialStore: credentialStore,
+            modelService: openRouterModelService,
+            modelsDevCatalogRepository: modelsDevCatalogRepository,
+            skillRepository: skillRepository,
+            requestSettingsResolver: requestSettingsResolver,
+            codexAuthRepository: codexAuthRepository,
+            superGrokAuthRepository: superGrokAuthRepository,
+            attachmentRepository: attachmentRepository
+        )
+        sharePayloadStore = SharePayloadStore()
+
+    }
+}
