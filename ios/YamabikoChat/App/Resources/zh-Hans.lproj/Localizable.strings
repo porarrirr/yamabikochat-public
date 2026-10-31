@@ -735,3 +735,11 @@
 "外部サイトに接続しますか？" = "要连接外部网站吗？";
 "接続" = "连接";
 "生成された表示から外部へ接続します。接続先のURLには会話の内容が含まれている可能性があります。" = "此生成的视图将连接到外部网站。目标 URL 可能包含你的对话内容。";
+
+// Third-party license documents
+"npm 著作権・ライセンス全文" = "npm 版权及完整许可证";
+"Swift ライブラリのライセンス全文" = "Swift 库完整许可证";
+"Python・WebAssembly コアのライセンス" = "Python 与 WebAssembly 核心许可证";
+"Python パッケージのライセンス" = "Python 软件包许可证";
+"Pyodide ライセンス" = "Pyodide 许可证";
+"Pyodide ソースと変更内容" = "Pyodide 源代码与修改";

@@ -15,7 +15,10 @@ xcuserdata/
 *.ipa
 /ios/Vendor/
 /ios/PiRuntime/bundle/
-/ios/YamabikoChat.xcodeproj/
+# Keep the shared Swift lock for reproducible builds and license attribution.
+/ios/YamabikoChat.xcodeproj/**
+!/ios/YamabikoChat.xcodeproj/**/
+!/ios/YamabikoChat.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 node_modules/
 
 # Python

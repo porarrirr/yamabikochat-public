@@ -732,3 +732,11 @@
 "外部サイトに接続しますか？" = "Se connecter à un site externe ?";
 "接続" = "Se connecter";
 "生成された表示から外部へ接続します。接続先のURLには会話の内容が含まれている可能性があります。" = "Cette vue générée va se connecter à un site externe. L’URL de destination peut contenir des parties de votre conversation.";
+
+// Third-party license documents
+"npm 著作権・ライセンス全文" = "Droits d’auteur et licences complètes npm";
+"Swift ライブラリのライセンス全文" = "Licences complètes des bibliothèques Swift";
+"Python・WebAssembly コアのライセンス" = "Licences du cœur Python et WebAssembly";
+"Python パッケージのライセンス" = "Licences des paquets Python";
+"Pyodide ライセンス" = "Licence de Pyodide";
+"Pyodide ソースと変更内容" = "Sources et modifications de Pyodide";

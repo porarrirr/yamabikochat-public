@@ -115,7 +115,7 @@ npm ci --prefix ios/PiRuntime
 npm test --prefix ios/PiRuntime
 npm ci --prefix ios/GenUIRuntimeTests --ignore-scripts
 npm test --prefix ios/GenUIRuntimeTests
-python3 -m unittest ios/PythonTests/test_yamabiko_runtime.py
+python3 -m unittest ios/PythonTests/test_yamabiko_runtime.py ios/PythonTests/test_third_party_notices.py
 npm run check:contracts --prefix ios/PiRuntime
 ```
 

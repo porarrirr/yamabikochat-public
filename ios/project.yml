@@ -107,12 +107,19 @@ targets:
         script: scripts/copy-legal-notices.sh
         inputFiles:
           - $(SRCROOT)/scripts/copy-legal-notices.sh
+          - $(SRCROOT)/../scripts/generate-third-party-notices.py
+          - $(SRCROOT)/YamabikoChat.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
           - $(SRCROOT)/../LICENSE
           - $(SRCROOT)/../THIRD_PARTY_NOTICES.md
           - $(SRCROOT)/../third_party/nodejs-mobile/LICENSE
           - $(SRCROOT)/../third_party/npm-licenses.md
           - $(SRCROOT)/../third_party/pi-subagents-LICENSE.txt
           - $(SRCROOT)/../third_party/pyodide-LICENSE.txt
+          - $(SRCROOT)/../third_party/npm-license-texts.md
+          - $(SRCROOT)/../third_party/swift-license-texts.md
+          - $(SRCROOT)/../third_party/python-core-license-texts.md
+          - $(SRCROOT)/../third_party/python-package-license-texts.md
+          - $(SRCROOT)/../third_party/PYODIDE-SOURCES.md
           - $(SRCROOT)/YamabikoChat/Python/Resources/Fonts/licenses
           - $(SRCROOT)/YamabikoChat/Python/Resources/Fonts/licenses/OFL-notonastaliqurdu.txt
           - $(SRCROOT)/YamabikoChat/Python/Resources/Fonts/licenses/OFL-notosansarabic.txt
@@ -127,6 +134,11 @@ targets:
           - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/npm-licenses.md
           - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/PI_SUBAGENTS_LICENSE.txt
           - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/PYODIDE_LICENSE.txt
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/npm-license-texts.md
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/swift-license-texts.md
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/python-core-license-texts.md
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/python-package-license-texts.md
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/PYODIDE-SOURCES.md
           - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/legal/NOTO_FONTS_LICENSES.txt
   YamabikoShareExtension:
     type: app-extension

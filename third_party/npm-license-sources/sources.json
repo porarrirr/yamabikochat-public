@@ -1,0 +1,70 @@
+{
+  "files": {
+    "pi-MIT.txt": {
+      "source": "https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/LICENSE",
+      "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48"
+    },
+    "standardwebhooks-MIT.txt": {
+      "source": "https://raw.githubusercontent.com/standard-webhooks/standard-webhooks/ab6844147ce9cdb0d2dbf2e60d1ea85001fd2554/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "data-uri-to-buffer-MIT.txt": {
+      "source": "npm:data-uri-to-buffer@4.0.1/README.md#license",
+      "sha256": "819021ebdb731965692b2f38206ed1c96a956469827173dc668a1c6ba3e97097"
+    },
+    "aws-Apache-2.0.txt": {
+      "source": "npm:@aws-sdk/core@3.978.1/LICENSE",
+      "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d"
+    },
+    "esbuild-MIT.txt": {
+      "source": "npm:esbuild@0.28.2/LICENSE.md",
+      "sha256": "b40ec5baec7bb34fa5b1c09521fa3cd52d5fad7adafed74932a2010d3612a681"
+    },
+    "proxy-agents-MIT.txt": {
+      "source": "https://raw.githubusercontent.com/TooTallNate/proxy-agents/84e41e433b422cbe9f073952d8e16052eb9b0251/packages/agent-base/LICENSE",
+      "sha256": "8d8c55319c7729d57be811c747452636688d54f19701ee0752b6b15ad3771d9a"
+    }
+  },
+  "packages": {
+    "@aws-sdk/credential-provider-http@3.972.74": "aws-Apache-2.0.txt",
+    "@aws-sdk/credential-provider-login@3.972.79": "aws-Apache-2.0.txt",
+    "@aws-sdk/nested-clients@3.997.46": "aws-Apache-2.0.txt",
+    "@earendil-works/chord@1.0.2": "pi-MIT.txt",
+    "@esbuild/aix-ppc64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/android-arm@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/android-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/android-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/darwin-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/darwin-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/freebsd-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/freebsd-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-arm@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-ia32@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-loong64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-mips64el@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-ppc64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-riscv64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-s390x@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/linux-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/netbsd-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/netbsd-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/openbsd-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/openbsd-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/openharmony-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/sunos-x64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/win32-arm64@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/win32-ia32@0.28.2": "esbuild-MIT.txt",
+    "@esbuild/win32-x64@0.28.2": "esbuild-MIT.txt",
+    "@earendil-works/pi-agent-core@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-ai@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-codemode@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-coding-agent@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-mcp@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-telemetry@1.0.2": "pi-MIT.txt",
+    "@earendil-works/pi-tui@1.0.2": "pi-MIT.txt",
+    "data-uri-to-buffer@4.0.1": "data-uri-to-buffer-MIT.txt",
+    "proxy-agent-negotiate@1.1.0": "proxy-agents-MIT.txt",
+    "standardwebhooks@1.1.1": "standardwebhooks-MIT.txt"
+  }
+}

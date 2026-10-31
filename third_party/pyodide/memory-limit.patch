@@ -1,0 +1,5 @@
+--- a/Makefile.envs
++++ b/Makefile.envs
+@@ -165 +165 @@
+-	-s MAXIMUM_MEMORY=4GB \
++	-s MAXIMUM_MEMORY=512MB \

@@ -1,0 +1,50 @@
+{
+  "cpython-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/python/cpython/v3.14.2/LICENSE",
+    "sha256": "b0e25a78cffb43f4d92de8b61ccfa1f1f98ecbc22330b54b5251e7b6ba010231"
+  },
+  "expat-COPYING.txt": {
+    "source": "https://raw.githubusercontent.com/python/cpython/v3.14.2/Modules/expat/COPYING",
+    "sha256": "122f2c27000472a201d337b9b31f7eb2b52d091b02857061a8880371612d9534"
+  },
+  "emscripten-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/emscripten-core/emscripten/5.0.3/LICENSE",
+    "sha256": "2fd38dc06e484cdd7a3f1e2f6577f5d53062052a2fd85131b56b89fbd673731c"
+  },
+  "musl-COPYRIGHT.txt": {
+    "source": "https://raw.githubusercontent.com/emscripten-core/emscripten/5.0.3/system/lib/libc/musl/COPYRIGHT",
+    "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+  },
+  "compiler-rt-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/emscripten-core/emscripten/5.0.3/system/lib/compiler-rt/LICENSE.TXT",
+    "sha256": "1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d"
+  },
+  "libcxx-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/emscripten-core/emscripten/5.0.3/system/lib/libcxx/LICENSE.TXT",
+    "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+  },
+  "libcxxabi-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/emscripten-core/emscripten/5.0.3/system/lib/libcxxabi/LICENSE.TXT",
+    "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c"
+  },
+  "libffi-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/libffi/libffi/f08493d249d2067c8b3207ba46693dd858f95db3/LICENSE",
+    "sha256": "2c9c2acb9743e6b007b91350475308aee44691d96aa20eacef8e199988c8c388"
+  },
+  "hiwire-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/pyodide/hiwire/6a1e67280a15d929ebeceee54a6358c9c8d5f697/LICENSE",
+    "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+  },
+  "liblzma-COPYING.txt": {
+    "source": "https://raw.githubusercontent.com/tukaani-project/xz/v5.2.2/COPYING",
+    "sha256": "48398016e20f91676c11e50d5066d2668afda3c161a75dcfd47311f52f220f14"
+  },
+  "zstd-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/python/cpython-source-deps/zstd-1.5.7/LICENSE",
+    "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+  },
+  "libmpdec-LICENSE.txt": {
+    "source": "https://raw.githubusercontent.com/python/cpython/v3.14.2/Modules/_decimal/libmpdec/basearith.c",
+    "sha256": "b07528d8b1dbf1e2d2741052996f0876e23342ce2d30d0effa39c5457716c25a"
+  }
+}

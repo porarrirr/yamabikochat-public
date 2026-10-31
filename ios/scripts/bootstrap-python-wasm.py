@@ -4,6 +4,7 @@
 The npm archive authenticates the upstream package lock; every wheel is then
 checked against that lock. No package or interpreter is downloaded by the app.
 """
+import argparse
 import base64
 import hashlib
 import io
@@ -11,6 +12,7 @@ import json
 from pathlib import Path
 import tarfile
 import urllib.request
+import zipfile
 
 VERSION = "314.0.7"
 INTEGRITY = "0YvXxEhfEdpLfb/XkM2BFAeMROq0iMUX2bzzH9pOttyMcWkwq+HbE5uyuGD82LN7y2q+SNvi/6V5JEsOlD2R1A=="
@@ -51,6 +53,9 @@ def download(url):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--update-notices', action='store_true', help='Refresh committed wheel license texts')
+    arguments = parser.parse_args()
     fonts = Path(__file__).resolve().parents[1] / "YamabikoChat" / "Python" / "Resources" / "Fonts"
     for line in (fonts / "SHA256SUMS").read_text().splitlines():
         expected, filename = line.split(None, 1)
@@ -86,7 +91,10 @@ def main():
 
     for name in ("numpy", "matplotlib", "pillow"):
         include(name)
-    for name, package in selected.items():
+    notices = ['# Bundled Python package license texts', '',
+               f'Collected from the SHA-256-verified wheels in the Pyodide {VERSION} package lock.',
+               'Includes wheel metadata and embedded library/font notices. Original wheel files retain these notices as well.', '']
+    for name, package in sorted(selected.items()):
         filename = package["file_name"]
         destination = ROOT / filename
         content = destination.read_bytes() if destination.exists() else download(
@@ -95,6 +103,23 @@ def main():
         if hashlib.sha256(content).hexdigest() != package["sha256"]:
             raise SystemExit(f"Pyodide package checksum mismatch: {name}")
         destination.write_bytes(content)
+        with zipfile.ZipFile(io.BytesIO(content)) as wheel:
+            licenses = [path for path in wheel.namelist() if not path.endswith('/') and (
+                Path(path).name.lower().startswith(('license', 'licence', 'copying', 'notice'))
+                or '/licenses/' in path.lower() and not path.endswith(('.py', '.pyc'))
+            )]
+            if not licenses:
+                raise SystemExit(f'Missing Python package license: {name}')
+            notices += [f'## {name} {package["version"]}', '', f'Wheel: {filename}',
+                        f'SHA-256: {package["sha256"]}', '']
+            for path in sorted(licenses):
+                notices += [f'### {path}', '', '````', wheel.read(path).decode('utf-8').rstrip(), '````', '']
+    notice_path = Path(__file__).resolve().parents[2] / 'third_party/python-package-license-texts.md'
+    notice_text = '\n'.join(line.rstrip() for line in '\n'.join(notices).splitlines()) + '\n'
+    if arguments.update_notices:
+        notice_path.write_text(notice_text)
+    elif not notice_path.exists() or notice_path.read_text() != notice_text:
+        raise SystemExit('Python license texts changed; run bootstrap-python-wasm.py --update-notices and review the notices')
     # Only these bundled packages can be resolved. No runtime CDN fallback.
     lock["packages"] = selected
     (ROOT / "pyodide-lock.json").write_text(json.dumps(lock, sort_keys=True))

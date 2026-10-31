@@ -7,6 +7,8 @@ if [[ -z "${BUILT_PRODUCTS_DIR:-}" || -z "${UNLOCALIZED_RESOURCES_FOLDER_PATH:-}
 fi
 
 src_root="$(cd "$(dirname "$0")/../.." && pwd)"
+python3 "${src_root}/scripts/generate-third-party-notices.py" --check
+
 dest="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/legal"
 mkdir -p "$dest"
 
@@ -16,6 +18,10 @@ cp "${src_root}/third_party/nodejs-mobile/LICENSE" "${dest}/NODEJS_LICENSE.txt"
 cp "${src_root}/third_party/npm-licenses.md" "${dest}/npm-licenses.md"
 cp "${src_root}/third_party/pi-subagents-LICENSE.txt" "${dest}/PI_SUBAGENTS_LICENSE.txt"
 cp "${src_root}/third_party/pyodide-LICENSE.txt" "${dest}/PYODIDE_LICENSE.txt"
+
+for notice in npm-license-texts.md swift-license-texts.md python-core-license-texts.md python-package-license-texts.md PYODIDE-SOURCES.md; do
+    cp "${src_root}/third_party/${notice}" "${dest}/${notice}"
+done
 
 font_license_root="${src_root}/ios/YamabikoChat/Python/Resources/Fonts/licenses"
 font_license_output="${dest}/NOTO_FONTS_LICENSES.txt"

@@ -18,6 +18,12 @@ private enum LegalDocument: String, CaseIterable, Identifiable {
     case projectLicense
     case thirdPartyNotices
     case npmLicenses
+    case npmLicenseTexts
+    case swiftLicenseTexts
+    case pythonCoreLicenses
+    case pythonPackageLicenses
+    case pyodideLicense
+    case pyodideSources
     case nodeLicense
     case notoFontLicenses
 
@@ -31,6 +37,18 @@ private enum LegalDocument: String, CaseIterable, Identifiable {
             return L10n.text("第三者ソフトウェア")
         case .npmLicenses:
             return L10n.text("Pi runtime npm ライセンス")
+        case .npmLicenseTexts:
+            return L10n.text("npm 著作権・ライセンス全文")
+        case .swiftLicenseTexts:
+            return L10n.text("Swift ライブラリのライセンス全文")
+        case .pythonCoreLicenses:
+            return L10n.text("Python・WebAssembly コアのライセンス")
+        case .pythonPackageLicenses:
+            return L10n.text("Python パッケージのライセンス")
+        case .pyodideLicense:
+            return L10n.text("Pyodide ライセンス")
+        case .pyodideSources:
+            return L10n.text("Pyodide ソースと変更内容")
         case .nodeLicense:
             return L10n.text("Node.js / NodeMobile ライセンス")
         case .notoFontLicenses:
@@ -46,6 +64,18 @@ private enum LegalDocument: String, CaseIterable, Identifiable {
             return "THIRD_PARTY_NOTICES"
         case .npmLicenses:
             return "npm-licenses"
+        case .npmLicenseTexts:
+            return "npm-license-texts"
+        case .swiftLicenseTexts:
+            return "swift-license-texts"
+        case .pythonCoreLicenses:
+            return "python-core-license-texts"
+        case .pythonPackageLicenses:
+            return "python-package-license-texts"
+        case .pyodideLicense:
+            return "PYODIDE_LICENSE"
+        case .pyodideSources:
+            return "PYODIDE-SOURCES"
         case .nodeLicense:
             return "NODEJS_LICENSE"
         case .notoFontLicenses:
@@ -55,9 +85,9 @@ private enum LegalDocument: String, CaseIterable, Identifiable {
 
     var fileExtension: String {
         switch self {
-        case .thirdPartyNotices, .npmLicenses:
+        case .thirdPartyNotices, .npmLicenses, .npmLicenseTexts, .swiftLicenseTexts, .pythonCoreLicenses, .pythonPackageLicenses, .pyodideSources:
             return "md"
-        case .projectLicense, .nodeLicense, .notoFontLicenses:
+        case .projectLicense, .nodeLicense, .notoFontLicenses, .pyodideLicense:
             return "txt"
         }
     }

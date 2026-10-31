@@ -5,6 +5,11 @@ YamabikoChat original code is licensed under the MIT License. See [LICENSE](LICE
 This file lists third-party software that is bundled, restored at build time, or otherwise redistributed with YamabikoChat. Those components remain under their own licenses. Short license texts are reproduced at the end of this file. The Node.js composite license is kept separately in [third_party/nodejs-mobile/LICENSE](third_party/nodejs-mobile/LICENSE).
 
 Production npm packages pulled in by the Pi Agent runtime are listed in [third_party/npm-licenses.md](third_party/npm-licenses.md).
+Their full copyright notices and licenses are preserved in [third_party/npm-license-texts.md](third_party/npm-license-texts.md).
+Swift notices and license texts are preserved in [third_party/swift-license-texts.md](third_party/swift-license-texts.md).
+Python core and scientific-wheel notices are preserved in [third_party/python-core-license-texts.md](third_party/python-core-license-texts.md) and [third_party/python-package-license-texts.md](third_party/python-package-license-texts.md).
+Pyodide source availability, exact revision, and the MPL-2.0 memory-limit patch are described in [third_party/PYODIDE-SOURCES.md](third_party/PYODIDE-SOURCES.md).
+These documents are copied into the app's `legal/` resources and exposed in Settings.
 
 ## Runtime and vendored assets
 
@@ -34,9 +39,12 @@ Mermaid's MIT license text is bundled next to the Mermaid browser asset.
 
 | Component | Version | SPDX | Source |
 | --- | --- | --- | --- |
-| GRDB.swift | 7.x (from 7.0.0) | MIT | https://github.com/groue/GRDB.swift |
+| GRDB.swift | 7.10.0 (resolved; from 7.0.0) | MIT | https://github.com/groue/GRDB.swift |
 | Yams | 6.2.2 | MIT | https://github.com/jpsim/Yams |
 | ZIPFoundation | 0.9.20 | MIT | https://github.com/weichsel/ZIPFoundation |
+| swift-markdown | 0.6.0 | Apache-2.0 | https://github.com/swiftlang/swift-markdown |
+| swift-cmark | 0.8.0 | BSD-2-Clause and included third-party terms | https://github.com/swiftlang/swift-cmark |
+| libyaml (vendored by Yams) | 0.2.5 | MIT | https://github.com/yaml/libyaml |
 
 ### Embedded Python runtime
 
@@ -66,13 +74,38 @@ licenses screen.
 
 ## Pi runtime npm packages
 
-The bundled `PiRuntime/bundle/main.js` is produced from the production dependencies in `ios/PiRuntime/package-lock.json`. Those packages are MIT, Apache-2.0, BSD-3-Clause, ISC, BlueOak-1.0.0, or 0BSD. See [third_party/npm-licenses.md](third_party/npm-licenses.md) for package names, versions, and SPDX identifiers.
+The bundled `PiRuntime/bundle/main.js` is produced from the production dependencies in `ios/PiRuntime/package-lock.json`. Those packages are MIT, Apache-2.0, BSD-3-Clause, ISC, BlueOak-1.0.0, Unlicense, or 0BSD. See [third_party/npm-licenses.md](third_party/npm-licenses.md) for package names, versions, and SPDX identifiers.
 
 The root `esbuild` development dependency is used only at build time. Production
 transitive packages are included in the npm inventory above; desktop compiler
 integrations are not executed by the mobile host.
 
 The pi-subagents copyright and license are retained in `legal/PI_SUBAGENTS_LICENSE.txt` and [third_party/pi-subagents-LICENSE.txt](third_party/pi-subagents-LICENSE.txt).
+
+## Distribution and regeneration
+
+Run `npm ci --prefix ios/PiRuntime`, then `python3 scripts/generate-third-party-notices.py`
+to regenerate npm and Swift notices. `--check` verifies the committed output,
+installed npm versions, supplemental license hashes, and resolved Swift revisions.
+Refresh pinned files in `third_party/swift-licenses/` whenever Swift resolution changes.
+Supplemental npm licenses retain upstream provenance in `third_party/npm-license-sources/sources.json`.
+
+Python bootstrap verifies each wheel and checks its collected license texts against
+the committed notices. After a reviewed dependency update, use
+`python3 ios/scripts/bootstrap-python-wasm.py --update-notices` to refresh them.
+
+The Pi runtime uses security overrides for undici 8.12.2 and minimatch 11.0.1.
+Pi remains at 1.0.2; these overrides do not replace provider routing or protocol logic.
+
+## Artwork and trademarks
+
+App Store badges are Apple artwork, subject to Apple's marketing guidelines:
+https://developer.apple.com/app-store/marketing/guidelines/
+
+Provider logos and names identify their respective services. They are not
+relicensed under the project's MIT license, and no trademark rights or endorsement
+are granted. Screenshots show the app's demo fixtures; included third-party marks
+retain their owners' rights.
 
 ## License texts
 

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "grdb.swift",
+    "version": "7.10.0",
+    "revision": "36e30a6f1ef10e4194f6af0cff90888526f0c115",
+    "source": "https://github.com/groue/GRDB.swift/tree/36e30a6f1ef10e4194f6af0cff90888526f0c115",
+    "files": [
+      "grdb.swift/LICENSE"
+    ]
+  },
+  {
+    "name": "swift-cmark",
+    "version": "0.8.0",
+    "revision": "924936d0427cb25a61169739a7660230bffa6ea6",
+    "source": "https://github.com/swiftlang/swift-cmark/tree/924936d0427cb25a61169739a7660230bffa6ea6",
+    "files": [
+      "swift-cmark/COPYING"
+    ]
+  },
+  {
+    "name": "swift-markdown",
+    "version": "0.6.0",
+    "revision": "ea79e83c8744d2b50b0dc2d5bbd1e857e1253bf9",
+    "source": "https://github.com/swiftlang/swift-markdown/tree/ea79e83c8744d2b50b0dc2d5bbd1e857e1253bf9",
+    "files": [
+      "swift-markdown/LICENSE.txt",
+      "swift-markdown/NOTICE.txt"
+    ]
+  },
+  {
+    "name": "yams",
+    "version": "6.2.2",
+    "revision": "a27b21e0c81c5bf42049b897a62aaf387e80f279",
+    "source": "https://github.com/jpsim/Yams/tree/a27b21e0c81c5bf42049b897a62aaf387e80f279",
+    "files": [
+      "yams/LICENSE",
+      "yams/libyaml-LICENSE.txt"
+    ]
+  },
+  {
+    "name": "zipfoundation",
+    "version": "0.9.20",
+    "revision": "22787ffb59de99e5dc1fbfe80b19c97a904ad48d",
+    "source": "https://github.com/weichsel/ZIPFoundation/tree/22787ffb59de99e5dc1fbfe80b19c97a904ad48d",
+    "files": [
+      "zipfoundation/LICENSE"
+    ]
+  }
+]

@@ -1,10 +1,10 @@
 # Pi runtime npm production licenses
 
-Generated from `ios/PiRuntime/package-lock.json`.
-Includes Pi Coding Agent and pi-subagents, used by the embedded mobile extension host.
-Build-only development dependencies are not listed.
+Generated from `ios/PiRuntime/package-lock.json` by `scripts/generate-third-party-notices.py`.
+Full copyright notices and license texts: [npm-license-texts.md](npm-license-texts.md).
+Includes production transitive dependencies conservatively, including optional build helpers.
 
-Count: 153 packages.
+Count: 154 packages.
 
 | Package | Version | License |
 | --- | --- | --- |
@@ -39,15 +39,15 @@ Count: 153 packages.
 | `@earendil-works/pi-telemetry` | 1.0.2 | MIT |
 | `@earendil-works/pi-tui` | 1.0.2 | MIT |
 | `@esbuild/aix-ppc64` | 0.28.2 | MIT |
-| `@esbuild/android-arm` | 0.28.2 | MIT |
 | `@esbuild/android-arm64` | 0.28.2 | MIT |
+| `@esbuild/android-arm` | 0.28.2 | MIT |
 | `@esbuild/android-x64` | 0.28.2 | MIT |
 | `@esbuild/darwin-arm64` | 0.28.2 | MIT |
 | `@esbuild/darwin-x64` | 0.28.2 | MIT |
 | `@esbuild/freebsd-arm64` | 0.28.2 | MIT |
 | `@esbuild/freebsd-x64` | 0.28.2 | MIT |
-| `@esbuild/linux-arm` | 0.28.2 | MIT |
 | `@esbuild/linux-arm64` | 0.28.2 | MIT |
+| `@esbuild/linux-arm` | 0.28.2 | MIT |
 | `@esbuild/linux-ia32` | 0.28.2 | MIT |
 | `@esbuild/linux-loong64` | 0.28.2 | MIT |
 | `@esbuild/linux-mips64el` | 0.28.2 | MIT |
@@ -65,6 +65,7 @@ Count: 153 packages.
 | `@esbuild/win32-ia32` | 0.28.2 | MIT |
 | `@esbuild/win32-x64` | 0.28.2 | MIT |
 | `@google/genai` | 2.21.0 | Apache-2.0 |
+| `@isaacs/nonrecursive-glob-match` | 1.0.3 | BlueOak-1.0.0 |
 | `@js-temporal/polyfill` | 0.5.1 | ISC |
 | `@protobufjs/aspromise` | 1.1.2 | BSD-3-Clause |
 | `@protobufjs/base64` | 1.1.2 | BSD-3-Clause |
@@ -129,7 +130,7 @@ Count: 153 packages.
 | `long` | 5.3.2 | Apache-2.0 |
 | `lru-cache` | 11.4.0 | BlueOak-1.0.0 |
 | `marked` | 18.0.11 | MIT |
-| `minimatch` | 10.2.6 | BlueOak-1.0.0 |
+| `minimatch` | 11.0.1 | BlueOak-1.0.0 |
 | `ms` | 2.1.3 | MIT |
 | `node-domexception` | 1.0.0 | MIT |
 | `node-fetch` | 3.3.2 | MIT |
@@ -154,8 +155,8 @@ Count: 153 packages.
 | `ts-algebra` | 2.0.0 | MIT |
 | `tslib` | 2.8.1 | 0BSD |
 | `typebox` | 1.3.27 | MIT |
-| `undici` | 8.10.2 | MIT |
 | `undici-types` | 8.9.0 | MIT |
+| `undici` | 8.12.2 | MIT |
 | `web-streams-polyfill` | 3.3.3 | MIT |
 | `which` | 2.0.2 | ISC |
 | `ws` | 8.21.3 | MIT |

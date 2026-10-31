@@ -21,9 +21,10 @@ jobs:
         run: |
           npm ci --prefix ios/PiRuntime
           npm test --prefix ios/PiRuntime
+          npm audit --omit=dev --prefix ios/PiRuntime --audit-level=moderate
       - name: GenUI
         run: |
           npm ci --prefix ios/GenUIRuntimeTests --ignore-scripts
           npm test --prefix ios/GenUIRuntimeTests
       - name: Python
-        run: python3 -m unittest ios/PythonTests/test_yamabiko_runtime.py
+        run: python3 -m unittest ios/PythonTests/test_yamabiko_runtime.py ios/PythonTests/test_third_party_notices.py
