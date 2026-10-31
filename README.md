@@ -12,9 +12,21 @@ A native SwiftUI AI chat client. Use multiple models in one app with your own AP
 
 <a href="https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018"><img src="assets/readme/app-store-badge-en.svg" alt="Download on the App Store" width="180"></a>
 
-[Get the iPhone and iPad app](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018) · [Build from source](#development-and-setup) · [MIT License](LICENSE)
+[Get the iPhone and iPad app](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018) · [Screenshots](#screenshots) · [Build from source](#development-and-setup) · [MIT License](LICENSE)
 
 </div>
+
+## Screenshots
+
+Demo conversations in the Japanese UI. Screenshots may differ from the current App Store release.
+
+| Chat, code, and math | Interactive GenUI | Dark mode | Conversation library |
+| :---: | :---: | :---: | :---: |
+| <img src="assets/readme/iphone-chat.png" alt="iPhone chat showing a Swift Fibonacci example, a formula, and a table" width="200"> | <img src="assets/readme/iphone-genui.png" alt="Interactive GenUI loan repayment example with a comparison chart" width="200"> | <img src="assets/readme/iphone-dark.png" alt="GenUI cards and SVG graphics displayed in dark mode" width="200"> | <img src="assets/readme/iphone-list.png" alt="Conversation library with sample chats, projects, and search" width="200"> |
+
+### iPad split layout
+
+<img src="assets/readme/ipad-split.png" alt="iPad split layout with the conversation sidebar and a chat containing Swift code and math" width="760">
 
 ## Features
 

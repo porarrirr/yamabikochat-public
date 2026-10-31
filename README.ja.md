@@ -13,9 +13,21 @@ SwiftUI 製の AI チャットクライアント。
 
 <a href="https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018"><img src="assets/readme/app-store-badge-ja.svg" alt="App Store からダウンロード" width="180"></a>
 
-[iPhone・iPad 用アプリを入手](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018) · [ソースからビルド](#開発環境とセットアップ) · [MIT License](LICENSE)
+[iPhone・iPad 用アプリを入手](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018) · [スクリーンショット](#スクリーンショット) · [ソースからビルド](#開発環境とセットアップ) · [MIT License](LICENSE)
 
 </div>
+
+## スクリーンショット
+
+日本語 UI とデモ会話を使った画面です。現在の App Store 配信版と表示が異なる場合があります。
+
+| チャット・コード・数式 | インタラクティブな GenUI | ダークモード | 会話ライブラリ |
+| :---: | :---: | :---: | :---: |
+| <img src="assets/readme/iphone-chat.png" alt="Swift のフィボナッチ数列のコード、数式、表を表示する iPhone のチャット画面" width="200"> | <img src="assets/readme/iphone-genui.png" alt="返済期間ごとの比較グラフを表示する GenUI のローン計算デモ" width="200"> | <img src="assets/readme/iphone-dark.png" alt="ダークモードで GenUI のカードと SVG 図形を表示した画面" width="200"> | <img src="assets/readme/iphone-list.png" alt="デモ会話、プロジェクト、検索欄を備えた会話ライブラリ" width="200"> |
+
+### iPad の分割表示
+
+<img src="assets/readme/ipad-split.png" alt="会話一覧のサイドバーと Swift コード・数式を含むチャットを並べた iPad の画面" width="760">
 
 ## できること
 
