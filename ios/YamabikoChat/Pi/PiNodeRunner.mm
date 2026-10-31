@@ -6,6 +6,8 @@
 #import <fcntl.h>
 #import <os/log.h>
 
+
+
 NSErrorDomain const PiNodeRunnerErrorDomain = @"PiNodeRunnerErrorDomain";
 
 @implementation PiNodeRunner
@@ -21,6 +23,8 @@ static NSFileHandle *PiLifecycleAcknowledgements;
 static NSMutableData *PiLifecycleAckBuffer;
 static NSMutableDictionary<NSString *, NSNumber *> *PiLifecycleBackgroundTasks;
 static NSUInteger PiLifecycleGeneration = 0;
+// Holds requested before the engine installs its pipe are replayed at installation.
+static NSUInteger PiListenerHolds = 0;
 
 + (void)finishLifecycleTask:(NSString *)generation {
     NSNumber *task = PiLifecycleBackgroundTasks[generation];
@@ -31,7 +35,11 @@ static NSUInteger PiLifecycleGeneration = 0;
 
 + (void)sendLifecycleState:(NSString *)state {
     NSString *generation = [NSString stringWithFormat:@"%lu", (unsigned long)++PiLifecycleGeneration];
-    if ([state isEqualToString:@"pause"]) {
+    // A release in the background closes the listener exactly like a pause.
+    BOOL closesListener = [state isEqualToString:@"pause"] ||
+        ([state isEqualToString:@"release"] &&
+         UIApplication.sharedApplication.applicationState == UIApplicationStateBackground);
+    if (closesListener) {
         UIBackgroundTaskIdentifier task = [UIApplication.sharedApplication
             beginBackgroundTaskWithName:@"Pi listener suspension" expirationHandler:^{
                 os_log_info(OS_LOG_DEFAULT, "Pi listener background execution allowance expired");
@@ -93,6 +101,20 @@ static NSUInteger PiLifecycleGeneration = 0;
         }];
     [self sendLifecycleState:UIApplication.sharedApplication.applicationState == UIApplicationStateBackground
         ? @"pause" : @"resume"];
+    for (NSUInteger hold = 0; hold < PiListenerHolds; hold++) [self sendLifecycleState:@"hold"];
+}
+
++ (void)holdListener {
+    NSAssert(NSThread.isMainThread, @"Pi listener holds are main-thread owned");
+    PiListenerHolds++;
+    if (PiLifecycleWriteFD >= 0) [self sendLifecycleState:@"hold"];
+}
+
++ (void)releaseListener {
+    NSAssert(NSThread.isMainThread, @"Pi listener holds are main-thread owned");
+    NSAssert(PiListenerHolds > 0, @"Pi listener released without a hold");
+    PiListenerHolds--;
+    if (PiLifecycleWriteFD >= 0) [self sendLifecycleState:@"release"];
 }
 
 #if DEBUG

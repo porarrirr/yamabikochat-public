@@ -376,6 +376,21 @@ actor PiAgentRuntime {
         self.startEngine = startEngine
     }
 
+    /// The listener closes on didEnterBackground and reopens on willEnterForeground. Work that
+    /// starts while the app is already in the background (App Intents with `openAppWhenRun ==
+    /// false`) never sees that resume, so it keeps the listener open for its own duration.
+    static func withListenerHeld<T: Sendable>(_ operation: () async throws -> T) async throws -> T {
+        await MainActor.run { PiNodeRunner.holdListener() }
+        do {
+            let result = try await operation()
+            await MainActor.run { PiNodeRunner.releaseListener() }
+            return result
+        } catch {
+            await MainActor.run { PiNodeRunner.releaseListener() }
+            throw error
+        }
+    }
+
     func verifyReady() async throws {
         _ = try await startIfNeeded()
     }

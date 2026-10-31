@@ -6,10 +6,15 @@ import { once } from "node:events";
 // iOS may reclaim a listening TCP socket while suspended without notifying Node.
 // Lifecycle commands travel over an anonymous pipe, independent of that socket.
 // Only the HTTP listener changes; the Pi agent, runs and credentials stay alive.
+// "hold"/"release" bracket native work that starts while the app is already in
+// the background (App Intents run without a foreground transition), so the
+// listener stays open for that work even though the app never resumes.
 export function createRuntimeListener({ createServer, port, log }) {
   let server = null;
   let activeRequests = 0;
   let finishPause = null;
+  let foreground = false;
+  let holds = 0;
   const closeListener = () => {
     if (!server) return;
     const closing = server;
@@ -23,39 +28,56 @@ export function createRuntimeListener({ createServer, port, log }) {
     finishPause?.();
     finishPause = null;
   };
+  const pause = () => {
+    if (activeRequests === 0) { closeListener(); return; }
+    // Tool-result POSTs still need the listener while an accepted Pi run is
+    // finishing within iOS's background execution allowance.
+    if (finishPause) return;
+    return new Promise((resolve) => { finishPause = resolve; });
+  };
+  const open = () => {
+    completePause();
+    if (server) return;
+    server = createServer();
+    server.on("request", (_req, res) => {
+      activeRequests++;
+      res.once("close", () => {
+        activeRequests--;
+        if (finishPause && activeRequests === 0) {
+          closeListener();
+          completePause();
+        }
+      });
+    });
+    server.on("listening", () => log("serverListening", { port }));
+    server.on("error", (error) => {
+      log("serverError", { port, errorCode: error.code, errorMessage: error.message });
+      // Do not silently retry on another port or leave a failed listener cached.
+      throw error;
+    });
+    const ready = once(server, "listening");
+    server.listen(port, "127.0.0.1");
+    return ready;
+  };
   return (state) => {
     if (state === "pause") {
-      if (activeRequests === 0) { closeListener(); return; }
-      // Tool-result POSTs still need the listener while an accepted Pi run is
-      // finishing within iOS's background execution allowance.
-      if (finishPause) return;
-      return new Promise((resolve) => { finishPause = resolve; });
+      foreground = false;
+      if (holds > 0) return;
+      return pause();
     } else if (state === "suspend") {
       closeListener();
       completePause();
     } else if (state === "resume") {
-      completePause();
-      if (server) return;
-      server = createServer();
-      server.on("request", (_req, res) => {
-        activeRequests++;
-        res.once("close", () => {
-          activeRequests--;
-          if (finishPause && activeRequests === 0) {
-            closeListener();
-            completePause();
-          }
-        });
-      });
-      server.on("listening", () => log("serverListening", { port }));
-      server.on("error", (error) => {
-        log("serverError", { port, errorCode: error.code, errorMessage: error.message });
-        // Do not silently retry on another port or leave a failed listener cached.
-        throw error;
-      });
-      const ready = once(server, "listening");
-      server.listen(port, "127.0.0.1");
-      return ready;
+      foreground = true;
+      return open();
+    } else if (state === "hold") {
+      holds++;
+      return open();
+    } else if (state === "release") {
+      if (holds === 0) throw new Error("Runtime listener release without hold");
+      holds--;
+      if (holds > 0 || foreground) return;
+      return pause();
     } else {
       throw new Error(`Invalid runtime lifecycle state: ${state}`);
     }

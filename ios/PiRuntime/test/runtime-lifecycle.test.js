@@ -113,6 +113,46 @@ test("native pipe drives bundled runtime through repeated suspension with unchan
   }
 });
 
+test("held listener serves background work without a foreground resume", async (t) => {
+  const port = await availablePort();
+  const servers = [];
+  let streamingResponse;
+  const transition = createRuntimeListener({
+    port, log() {},
+    createServer() {
+      const server = http.createServer((req, res) => {
+        if (req.url === "/stream") { streamingResponse = res; res.write("first"); }
+        else res.end("healthy");
+      });
+      servers.push(server);
+      return server;
+    }
+  });
+  t.after(() => { for (const server of servers) { server.closeAllConnections(); server.close(); } });
+  transition("pause"); // A Shortcut can launch or wake the app directly into the background.
+  await transition("hold");
+  assert.equal(await get(port), "healthy");
+  transition("pause"); // A repeated background notification must not close a held listener.
+  assert.equal(await get(port), "healthy");
+  await transition("hold");
+  transition("release");
+  assert.equal(await get(port), "healthy"); // Another holder still needs the listener.
+  const request = http.get({ host: "127.0.0.1", port, path: "/stream", agent: false });
+  const [response] = await once(request, "response");
+  response.resume();
+  const released = transition("release");
+  assert.equal(await get(port), "healthy"); // An accepted run drains like a normal pause.
+  streamingResponse.end("last");
+  await released;
+  await assert.rejects(get(port), { code: "ECONNREFUSED" });
+  transition("resume");
+  await once(servers.at(-1), "listening");
+  await transition("hold");
+  transition("release"); // Releasing in the foreground keeps the app's listener open.
+  assert.equal(await get(port), "healthy");
+  assert.throws(() => transition("release"), /release without hold/);
+});
+
 test("idle native lifecycle pipe leaves the libuv worker available for file work", async (t) => {
   const port = await availablePort();
   const source = new URL("../src/runtime-lifecycle.js", import.meta.url).href;

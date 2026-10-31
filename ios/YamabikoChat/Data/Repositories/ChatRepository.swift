@@ -1665,6 +1665,9 @@ final class ChatRepository {
             provider: normalizedProvider,
             settings: settings,
             stream: false,
+            // Every run needs its own session identity, as chat turns have. Providers such as
+            // OpenCode Go reject requests without it (x-opencode-session).
+            promptCacheKey: "shortcut-\(UUID().uuidString)",
             modelsDevReasoningEffort: effortOverride.modelsDevEffort,
             allowedFunctionTools: allowedTools.map(ShortcutTool.functionNames(allowing:))
         )

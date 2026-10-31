@@ -451,8 +451,8 @@
 "Shortcuts: GenUI" = "GenUI";
 "Shortcuts: モデルに聞く説明" = "プロンプトをモデルに送り、生成テキストを返します。アプリを開きません。";
 "Shortcuts: モデルに聞いて保存説明" = "プロンプトをモデルに送り、返答を返しつつ新規チャットに保存します。";
-"Shortcuts: モデルに聞く要約" = "\(\.$prompt) を \(\.$provider) / \(\.$model) で聞く";
-"Shortcuts: モデルに聞いて保存要約" = "\(\.$prompt) を \(\.$provider) / \(\.$model) で聞いて保存";
+"Shortcuts: ${provider} の ${model} に ${prompt} を聞く" = "${provider} の ${model} に ${prompt} を聞く";
+"Shortcuts: ${provider} の ${model} に ${prompt} を聞いて保存" = "${provider} の ${model} に ${prompt} を聞いて保存";
 "Shortcuts: ${prompt} を ${applicationName} で聞く" = "${prompt} を ${applicationName} で聞く";
 "Shortcuts: ${applicationName} に ${prompt} を聞く" = "${applicationName} に ${prompt} を聞く";
 "Shortcuts: ${prompt} を ${applicationName} で聞いて保存" = "${prompt} を ${applicationName} で聞いて保存";

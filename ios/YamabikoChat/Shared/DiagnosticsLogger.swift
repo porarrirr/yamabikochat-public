@@ -277,17 +277,21 @@ enum DiagnosticsLogger {
             try? manager.moveItem(at: url, to: previous)
         }
 
-        if manager.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            if let data = text.data(using: .utf8) {
-                try? handle.write(contentsOf: data)
+        // The app's default data protection is Complete, so writes fail while the device is
+        // locked (for example a Shortcut started from the Lock Screen). Report those losses to
+        // the unified log, the only channel still available at that point.
+        do {
+            if manager.fileExists(atPath: url.path) {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: Data(text.utf8))
+            } else {
+                try text.write(to: url, atomically: true, encoding: .utf8)
             }
-            return
+        } catch {
+            systemLogger.error("Diagnostics log write failed: \(String(describing: error), privacy: .public)")
         }
-
-        try? text.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private static func logFileURL() -> URL {

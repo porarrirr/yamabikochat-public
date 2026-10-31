@@ -11,6 +11,11 @@ typedef NS_ERROR_ENUM(PiNodeRunnerErrorDomain, PiNodeRunnerError) {
 @interface PiNodeRunner : NSObject
 + (BOOL)startEngineWithArguments:(NSArray<NSString *> *)arguments
                          error:(NSError * _Nullable * _Nullable)error NS_SWIFT_NAME(startEngine(arguments:));
+/// Keeps the runtime listener open while the app is in the background, for work such as
+/// App Intents that starts there without a foreground transition. Main thread only; balance
+/// every hold with a release.
++ (void)holdListener;
++ (void)releaseListener;
 #if DEBUG
 + (NSDictionary<NSString *, NSString *> *)engineDiagnostics;
 #endif

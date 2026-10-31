@@ -38,10 +38,11 @@ struct RunYamabikoModelIntent: AppIntent {
     var allowedTools: [ShortcutTool]?
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Shortcuts: モデルに聞く要約") {
-            \.$prompt
-            \.$provider
-            \.$model
+        // Parameters missing from both the sentence and this list are hidden in the Shortcuts editor.
+        Summary("Shortcuts: \(\.$provider) の \(\.$model) に \(\.$prompt) を聞く") {
+            \.$systemPrompt
+            \.$reasoningEffort
+            \.$allowedTools
         }
     }
 

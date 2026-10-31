@@ -78,6 +78,26 @@ final class ShortcutRunTests: XCTestCase {
         XCTAssertEqual(request.messages.last?.content, "hello shortcut")
     }
 
+    func testEachShortcutRunCarriesItsOwnSessionIdentity() async throws {
+        let runtime = successRuntime()
+        let fixture = try makeFixture(runtime: runtime)
+        try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
+
+        for save in [false, true] {
+            _ = try await fixture.repository.runShortcut(
+                prompt: "hello",
+                provider: "OPENROUTER",
+                model: "openai/gpt-4o-mini",
+                saveToNewConversation: save
+            )
+        }
+
+        let keys = runtime.calls.map { $0.request.metadata["promptCacheKey"] }
+        XCTAssertEqual(keys.count, 2)
+        XCTAssertTrue(keys.allSatisfy { $0?.hasPrefix("shortcut-") == true }, "\(keys)")
+        XCTAssertNotEqual(keys[0], keys[1])
+    }
+
     func testRunShortcutSaveCreatesConversationMessagesThinkingAndTokenUsage() async throws {
         let titleGenerator = ConversationTitleGeneratorSpy(generatedTitle: "Saved shortcut title")
         let fixture = try makeFixture(

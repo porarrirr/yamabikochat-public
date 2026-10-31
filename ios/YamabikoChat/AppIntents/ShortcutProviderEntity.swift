@@ -23,10 +23,23 @@ struct ShortcutProviderEntity: AppEntity {
 struct ShortcutProviderEntityQuery: EntityStringQuery {
     func entities(for identifiers: [String]) async throws -> [ShortcutProviderEntity] {
         let options = try await providerOptions()
-        return identifiers.compactMap { identifier in
+        let entities = identifiers.compactMap { identifier in
             options.first { $0.key.caseInsensitiveCompare(identifier) == .orderedSame }
                 .map(ShortcutProviderEntity.init)
         }
+        // Shortcuts stops the action with its own error when a saved provider no longer resolves.
+        let unresolved = identifiers.filter { identifier in
+            !entities.contains { $0.id.caseInsensitiveCompare(identifier) == .orderedSame }
+        }
+        if !unresolved.isEmpty {
+            DiagnosticsLogger.log(
+                "Shortcut provider parameter did not resolve",
+                level: .warning,
+                category: .chat,
+                metadata: ["unresolvedProviders": unresolved.joined(separator: ",")]
+            )
+        }
+        return entities
     }
 
     func entities(matching string: String) async throws -> [ShortcutProviderEntity] {
@@ -41,7 +54,9 @@ struct ShortcutProviderEntityQuery: EntityStringQuery {
     }
 
     private func providerOptions() async throws -> [ProviderDisplay] {
-        let catalog = try await AppServices.resolve().modelsDevCatalogRepository.load()
-        return ShortcutModelOptionsBuilder.providerOptions(catalogProviders: catalog.providers)
+        try await ShortcutIntentSupport.logged("provider options") {
+            let catalog = try await AppServices.resolve().modelsDevCatalogRepository.load()
+            return ShortcutModelOptionsBuilder.providerOptions(catalogProviders: catalog.providers)
+        }
     }
 }

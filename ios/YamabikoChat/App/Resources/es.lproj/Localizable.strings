@@ -450,8 +450,8 @@
 "Shortcuts: GenUI" = "GenUI";
 "Shortcuts: モデルに聞く説明" = "Envía un prompt a un modelo y devuelve el texto generado sin abrir la app.";
 "Shortcuts: モデルに聞いて保存説明" = "Envía un prompt a un modelo, devuelve el texto y lo guarda en un chat nuevo.";
-"Shortcuts: モデルに聞く要約" = "Preguntar \(\.$prompt) con \(\.$provider) / \(\.$model)";
-"Shortcuts: モデルに聞いて保存要約" = "Preguntar y guardar \(\.$prompt) con \(\.$provider) / \(\.$model)";
+"Shortcuts: ${provider} の ${model} に ${prompt} を聞く" = "Preguntar a ${provider} ${model}: ${prompt}";
+"Shortcuts: ${provider} の ${model} に ${prompt} を聞いて保存" = "Preguntar a ${provider} ${model} y guardar: ${prompt}";
 "Shortcuts: ${prompt} を ${applicationName} で聞く" = "Preguntar ${prompt} con ${applicationName}";
 "Shortcuts: ${applicationName} に ${prompt} を聞く" = "Preguntar a ${applicationName} sobre ${prompt}";
 "Shortcuts: ${prompt} を ${applicationName} で聞いて保存" = "Preguntar y guardar ${prompt} con ${applicationName}";
