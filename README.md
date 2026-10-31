@@ -1,14 +1,73 @@
+<div align="center">
+
+<img src="assets/readme/icon.png" alt="YamabikoChat アプリアイコン" width="112">
+
 # YamabikoChat
 
-iPhone / iPad 向けの SwiftUI 製 AI チャットアプリです。複数モデルの比較、モデル同士の会話、Pi Agents によるツール実行、インタラクティブ UI に対応しています。プロバイダーの利用には、ご自身の API キーまたは対応アカウントが必要です。
+**iPhone・iPad で、AI と話す。回答を比べる。ツールで作業を進める。**
 
-## 公開内容
+SwiftUI 製の AI チャットクライアント。
+自分の API キーや対応アカウントで、複数のモデルをひとつのアプリから使えます。
 
-アプリ・共有拡張のソース、テスト、GenUI ソースと生成物、ビルド補助、依存ライブラリのライセンスを収録しています。個人メモ、開発レビュー記録、診断結果、App Store 提出資料、会話データ、認証情報、署名設定、非公開リポジトリの Git 履歴は収録しません。
+<a href="https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018"><img src="assets/readme/app-store-badge-ja.svg" alt="App Store からダウンロード" width="180"></a>
 
-Bundle ID と App Group は `org.example.yamabikochat` 系の開発用値です。実機配布では `ios/project.yml`、両ターゲットの entitlements、`AppConstants.swift`、Info.plist の識別子を自分のものに揃え、Xcode で自分の開発チームを指定してください。アプリ内のサポートと案内先はこの公開リポジトリに設定しています。再配布する場合は自分の案内先・プライバシーポリシー・利用条件に更新してください。
+[iPhone・iPad 用アプリを入手](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018) · [ソースからビルド](#開発環境とセットアップ) · [MIT License](LICENSE)
 
-著作権表示と依存元の出典はライセンスのため保持しています。
+</div>
+
+## できること
+
+| 機能 | 内容 |
+| --- | --- |
+| チャット | ストリーミング応答、メッセージ編集、再生成、回答バリアントに対応。 |
+| デュアル | 同じプロンプトを 2 つのモデルに送り、回答を並べて比較。 |
+| 自動会話 | モデル・話題・ターン数を指定し、モデル同士の会話を進行。 |
+| ツールとサブエージェント | Web 検索、Python、ファイル編集、ユーザーへの質問、作業の分担。 |
+| リッチな回答表示 | Markdown、表、コード、数式、Mermaid、SVG、GenUI によるインタラクティブな UI。 |
+| 会話の整理 | プロジェクト、履歴検索、モデルプリセット、トークン使用量の確認。 |
+| iOS との連携 | Siri・ショートカット、Spotlight、共有拡張、画像・ファイル添付。 |
+| iPad と多言語 | 分割表示、ダークモード、日本語・英語・简体中文・スペイン語・フランス語。 |
+
+## アプリを使う
+
+1. [App Store から YamabikoChat をインストール](https://apps.apple.com/jp/app/yamabikochat-ai%E3%83%81%E3%83%A3%E3%83%83%E3%83%88/id6771687018)します。
+2. 設定でプロバイダーを選び、自分の API キーを登録するか、対応アカウントでサインインします。
+3. モデルを選んで会話を開始します。用途に応じてデュアル・自動会話やツールを設定できます。
+
+接続先には Google Gemini、OpenRouter、ChatGPT plan、xAI、Apple Intelligence、Sarashina、PLaMo、カスタムエンドポイントを用意しています。models.dev カタログから追加のプロバイダー・モデルも参照できます。利用できる機能やモデルは、プロバイダーの契約、認証方法、端末・OS、Pi ランタイムの対応状況によって異なります。プロバイダーの利用料金は各サービスの条件に従います。
+
+App Store 版の利用に Xcode やソースのセットアップは不要です。このリポジトリは開発・検証用の公開ソースで、ストア配信版と更新時期が異なる場合があります。
+
+## データと実行の仕組み
+
+会話・設定は端末内に保存し、API キーと認証トークンは iOS Keychain で管理します。AI へのリクエストは選択したプロバイダーへ送信します。検索やリモートツールを有効にすると、そのツールの接続先にも必要な情報が送信されます。
+
+AI 実行、プロバイダー認証、使用量、コンテキスト管理は内蔵の **Pi Agents** ランタイムを通します。未対応のモデルは理由を表示し、別のモデルや通信方式へ自動で置き換えません。Python は WebKit Worker 内の Pyodide で実行します。
+
+- [プライバシーポリシー](ios/PRIVACY.md)・[利用条件](ios/TERMS.md)
+- [認証情報と会話の境界](ios/PiRuntime/SECURITY.md)
+- [Python の隔離設計](ios/docs/python-security.md)
+
+## リポジトリ構成
+
+| パス | 内容 |
+| --- | --- |
+| `ios/YamabikoChat/` | SwiftUI アプリ本体、データ管理、ネイティブツール。 |
+| `ios/YamabikoShareExtension/` | 他のアプリからテキストや URL を受け取る共有拡張。 |
+| `ios/PiRuntime/` | Pi Agents ランタイム、プロバイダー連携、JavaScript テスト。 |
+| `ios/GenUIAssets/` | GenUI ウィジェット・トークン・アイコンの正本。 |
+| `ios/YamabikoTests/`・`ios/YamabikoUITests/` | Swift の単体・UI テスト。 |
+| `ios/GenUIRuntimeTests/`・`ios/PythonTests/` | DOM・Python ランタイムのテスト。 |
+| `ios/scripts/`・`scripts/` | ビルド補助、上流契約・公開内容のチェック。 |
+| `third_party/` | 依存ソフトウェアのライセンス。 |
+
+公開対象はアプリ・共有拡張・ランタイムのソース、生成済み UI 資産、テスト、ビルド補助です。個人メモ、開発レビュー記録、App Store 提出資料、会話データ、認証情報、署名設定は含めません。著作権表示と依存元の出典は保持しています。
+
+## 自分の設定でビルド・再配布する
+
+Bundle ID と App Group は `org.example.yamabikochat` 系の開発用値です。実機配布では `ios/project.yml`、両ターゲットの entitlements、`AppConstants.swift`、Info.plist の識別子を自分のものに揃え、Xcode で自分の開発チームを指定してください。
+
+アプリ内のサポートと案内先はこの公開リポジトリに設定しています。再配布する場合は自分の案内先・プライバシーポリシー・利用条件に更新してください。
 
 ## 開発環境とセットアップ
 
