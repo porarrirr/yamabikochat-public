@@ -100,7 +100,7 @@ final class OpenCodeGoUsageRepository {
 
     private static var userAgent: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-        let identifier = Bundle.main.bundleIdentifier ?? "com.porarri.yamabikochat.ios"
+        let identifier = Bundle.main.bundleIdentifier ?? "org.example.yamabikochat.ios"
         return "YamabikoChat/\(version) (iOS \(UIDevice.current.systemVersion)) \(identifier)"
     }
 }

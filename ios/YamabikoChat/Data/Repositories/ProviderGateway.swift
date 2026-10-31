@@ -14,7 +14,7 @@ final class ProviderGateway {
     static let openRouterAttributionHeaders = [
         // OpenRouter can group attribution by origin. The shared apps.apple.com
         // origin can identify another iOS app even when our title is supplied.
-        "HTTP-Referer": AppConstants.marketingURL.absoluteString,
+        "HTTP-Referer": "https://github.com/porarrirr/yamabikochat-public",
         "X-OpenRouter-Title": "yamabikochat",
         "X-Title": "yamabikochat"
     ]
@@ -835,6 +835,9 @@ final class ProviderGateway {
             piProvider = "openrouter"
             apiKey = try credential(.openRouter)
             headers = Self.openRouterAttributionHeaders
+        case .plamo:
+            piProvider = "plamo"
+            apiKey = try credential(.plamo)
         case .sarashina:
             piProvider = "sarashina"
             apiKey = try credential(.sarashina)

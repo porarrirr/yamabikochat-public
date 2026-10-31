@@ -4,6 +4,47 @@ import XCTest
 
 final class ChatPerformancePolicyTests: XCTestCase {
     @MainActor
+    func testDualSubmissionReplacesProvisionalBubble() {
+        let store = ChatTimelineStore()
+        store.showPendingUserMessage(conversationID: 1, text: "dual", attachments: [])
+        store.update(dualMessages: [DualChatMessage(
+            id: 3, conversationId: 1, role: "user", userText: "dual",
+            modelAText: "", modelBText: "", modelAName: "a", modelBName: "b",
+            providerA: "a", providerB: "b"
+        )])
+        XCTAssertEqual(store.orderedIDs, ["d-3"])
+    }
+
+    @MainActor
+    func testSubmittedBubbleAppearsImmediatelyAndReconcilesWithPersistence() {
+        let store = ChatTimelineStore()
+        let old = FullChatMessage(id: 1,
+            message: ChatMessage(id: 1, conversationId: 1, role: "user", text: "hello"),
+            thinkingStream: nil, variants: [])
+        store.update(messages: [old])
+        store.showPendingUserMessage(conversationID: 1, text: "hello", attachments: [])
+        XCTAssertEqual(store.orderedIDs.count, 2)
+        store.update(messages: [old])
+        XCTAssertEqual(store.orderedIDs.count, 2, "An old identical message must not consume the submitted bubble")
+        let committed = FullChatMessage(id: 2,
+            message: ChatMessage(id: 2, conversationId: 1, role: "user", text: "hello"),
+            thinkingStream: nil, variants: [])
+        store.update(messages: [old, committed])
+        XCTAssertEqual(store.orderedIDs, ["m-1", "m-2"])
+        store.clearPendingUserMessage()
+        XCTAssertEqual(store.orderedIDs.count, 2)
+    }
+
+    @MainActor
+    func testFailedSubmissionRemovesOnlyTheProvisionalBubble() {
+        let store = ChatTimelineStore()
+        store.showPendingUserMessage(conversationID: 1, text: "draft", attachments: ["/tmp/image.png"])
+        XCTAssertEqual(store.orderedIDs, ["m--1"])
+        store.clearPendingUserMessage()
+        XCTAssertTrue(store.orderedIDs.isEmpty)
+    }
+
+    @MainActor
     func testThinkingTranscriptUpdatesPublishLatestStateWithoutRemeasuringTheAnswer() {
         let store = ChatTimelineStore()
         store.update(messages: [FullChatMessage(id: 1,

@@ -179,6 +179,9 @@ enum AppDatabase {
                 t.column("geminiThinkingEnabled", .boolean).notNull().defaults(to: false)
                 t.column("geminiThinkingBudget", .integer).notNull().defaults(to: 0)
                 t.column("geminiThinkingLevel", .text).notNull().defaults(to: "")
+                t.column("plamoWebSearchEnabled", .boolean).notNull().defaults(to: false)
+                t.column("sarashinaReasoningEffort", .text).notNull().defaults(to: "medium")
+                t.column("plamoReasoningEffort", .text).notNull().defaults(to: "none")
                 t.column("geminiGoogleSearchEnabled", .boolean).notNull().defaults(to: false)
                 t.column("geminiCodeExecutionEnabled", .boolean).notNull().defaults(to: false)
                 t.column("geminiURLContextEnabled", .boolean).notNull().defaults(to: false)
@@ -1101,6 +1104,24 @@ enum AppDatabase {
             guard !columns.contains("dualside") else { return }
             try db.alter(table: "conversation_execution_metrics") { t in
                 t.add(column: "dualSide", .text)
+            }
+        }
+        migrator.registerMigration("v38_plamo_settings") { db in
+            let columns = Set(try db.columns(in: "settings").map(\.name))
+            try db.alter(table: "settings") { t in
+                if !columns.contains("plamoWebSearchEnabled") {
+                    t.add(column: "plamoWebSearchEnabled", .boolean).notNull().defaults(to: false)
+                }
+                if !columns.contains("plamoReasoningEffort") {
+                    t.add(column: "plamoReasoningEffort", .text).notNull().defaults(to: "none")
+                }
+            }
+        }
+        migrator.registerMigration("v39_sarashina_thinking") { db in
+            let columns = Set(try db.columns(in: "settings").map(\.name))
+            guard !columns.contains("sarashinaReasoningEffort") else { return }
+            try db.alter(table: "settings") { t in
+                t.add(column: "sarashinaReasoningEffort", .text).notNull().defaults(to: "medium")
             }
         }
         return migrator

@@ -2,6 +2,81 @@ import XCTest
 @testable import YamabikoChat
 
 final class ProviderRequestSettingsResolverTests: XCTestCase {
+    func testSarashinaThinkingEffortAndConversationOverrides() async throws {
+        let resolver = makeResolver()
+        var settings = AppSettings()
+        settings.sarashinaReasoningEffort = "high"
+        let thinking = "sarashina3.2-mini-thinking"
+        let resolved = try await resolver.resolve(settings: settings, provider: "SARASHINA", model: thinking)
+        XCTAssertEqual(resolved.thinking?.effort, "high")
+        for model in ["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"] {
+            let plain = try await resolver.resolve(settings: settings, provider: "SARASHINA", model: model)
+            XCTAssertNil(plain.thinking)
+        }
+        settings.dualCodexReasoningEffortA = "low"
+        settings.autoCodexReasoningEffortB = "medium"
+        for (context, effort): (AppSettings.ReasoningContext, String) in [(.dualA, "low"), (.autoB, "medium")] {
+            let overridden = try await resolver.resolve(settings: settings, provider: "SARASHINA", model: thinking, context: context)
+            XCTAssertEqual(overridden.thinking?.effort, effort)
+        }
+    }
+
+    func testPlamoSearchIsProviderOnlyAcrossExecutionModesAndSuppressesAllFunctions() async throws {
+        let resolver = makeResolver()
+        var settings = AppSettings()
+        settings.plamoWebSearchEnabled = true
+        settings.plamoReasoningEffort = "medium"
+        settings.clientWebSearchToolEnabled = true
+        settings.pythonToolEnabled = true
+        settings.genUIToolEnabled = true
+        settings.subagents.enabled = true
+        for context: AppSettings.ReasoningContext in [.default, .dualA, .dualB, .autoA, .autoB] {
+            for scope: ProviderRequestToolScope in [.all, .providerOnly] {
+                let resolved = try await resolver.resolve(
+                    settings: settings, provider: "PLAMO", model: "plamo-3.1-prime",
+                    context: context, toolScope: scope, enablesUserQuestions: true
+                )
+                XCTAssertEqual(resolved.tools, [ProviderTool(type: "plamo_web_search", payload: [:])])
+                XCTAssertEqual(resolved.metadata["supportsClientTools"], "false")
+                XCTAssertEqual(resolved.metadata["subagentsEnabled"], "false")
+                XCTAssertEqual(resolved.thinking?.effort, "medium")
+            }
+        }
+        let withoutTools = try await resolver.resolve(
+            settings: settings, provider: "PLAMO", model: "plamo-3.1-prime", toolScope: .none
+        )
+        XCTAssertTrue(withoutTools.tools.isEmpty)
+        for model in ["plamo-3.0-prime", "plamo-3.1-prime"] {
+            settings.plamoWebSearchEnabled = false
+            let resolved = try await resolver.resolve(settings: settings, provider: "PLAMO", model: model)
+            XCTAssertFalse(resolved.tools.contains { $0.type == "plamo_web_search" })
+            XCTAssertTrue(resolved.tools.contains { $0.type == "function" })
+        }
+        settings.plamoWebSearchEnabled = true
+        let older = try await resolver.resolve(settings: settings, provider: "PLAMO", model: "plamo-3.0-prime")
+        XCTAssertFalse(older.tools.contains { $0.type == "plamo_web_search" })
+        XCTAssertEqual(older.metadata["supportsClientTools"], "true")
+    }
+
+    func testPlamoSearchAndReasoningOverridesInDualAndAutoConversations() async throws {
+        let resolver = makeResolver()
+        var settings = AppSettings()
+        settings.plamoWebSearchEnabled = true
+        settings.plamoReasoningEffort = "none"
+        settings.dualGoogleSearchEnabledA = false
+        settings.dualCodexReasoningEffortA = "medium"
+        settings.autoGoogleSearchEnabledB = false
+        settings.autoCodexReasoningEffortB = "medium"
+        for context: AppSettings.ReasoningContext in [.dualA, .autoB] {
+            let resolved = try await resolver.resolve(
+                settings: settings, provider: "PLAMO", model: "plamo-3.1-prime", context: context
+            )
+            XCTAssertFalse(resolved.tools.contains { $0.type == "plamo_web_search" })
+            XCTAssertEqual(resolved.thinking?.effort, "medium")
+            XCTAssertEqual(resolved.metadata["supportsClientTools"], "true")
+        }
+    }
+
     func testGeminiRemovedComputerUseAndJSONSettingsAreNotResolved() async throws {
         let resolver = makeResolver()
         var settings = AppSettings()

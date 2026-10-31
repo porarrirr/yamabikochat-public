@@ -4,16 +4,15 @@ import CoreSpotlight
 import Foundation
 
 struct ConversationIndexPlan {
-    let current: [Int64: ConversationListEntry]
+    let current: [Int64: ExternalConversationSummary]
     let removedIDs: [Int64]
-    let changed: [ConversationListEntry]
+    let changed: [ExternalConversationSummary]
 
-    init(previous: [Int64: ConversationListEntry], entries: [ConversationListEntry]) {
-        let visible = entries.filter { !$0.isSecret }
-        let currentEntries = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0) })
+    init(previous: [Int64: ExternalConversationSummary], entries: [ExternalConversationSummary]) {
+        let currentEntries = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
         current = currentEntries
         removedIDs = previous.keys.filter { currentEntries[$0] == nil }
-        changed = visible.filter {
+        changed = entries.filter {
             previous[$0.id]?.title != $0.title || previous[$0.id]?.updatedAtMs != $0.updatedAtMs
         }
     }
@@ -22,20 +21,20 @@ struct ConversationIndexPlan {
 @MainActor
 final class ConversationSpotlightIndexer {
     private var observation: AnyCancellable?
-    private var pending: [ConversationListEntry]?
+    private var pending: [ExternalConversationSummary]?
     private var task: Task<Void, Never>?
-    private var indexed: [Int64: ConversationListEntry] = [:]
+    private var indexed: [Int64: ExternalConversationSummary] = [:]
     private var initialized = false
 
     init(repository: ConversationRepository) {
         guard #available(iOS 18.0, *) else { return }
-        observation = repository.observeConversationList()
+        observation = repository.observeExternalConversationSummaries()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] entries in self?.enqueue(entries) }
     }
 
-    private func enqueue(_ entries: [ConversationListEntry]) {
-        pending = entries.filter { !$0.isSecret }
+    private func enqueue(_ entries: [ExternalConversationSummary]) {
+        pending = entries
         guard task == nil else { return }
         task = Task { [weak self] in
             guard let self else { return }
@@ -48,7 +47,7 @@ final class ConversationSpotlightIndexer {
     }
 
     @available(iOS 18.0, *)
-    private func reconcile(_ entries: [ConversationListEntry]) async {
+    private func reconcile(_ entries: [ExternalConversationSummary]) async {
         let index = CSSearchableIndex.default()
         do {
             // Remove stale entries once per launch, scoped to our own entity type.
@@ -61,10 +60,7 @@ final class ConversationSpotlightIndexer {
             if !plan.removedIDs.isEmpty {
                 try await index.deleteAppEntities(identifiedBy: plan.removedIDs.map(Int.init), ofType: ConversationEntity.self)
             }
-            let changed = plan.changed.map {
-                ConversationEntity(id: $0.id, title: $0.title,
-                                   updatedAt: Date(timeIntervalSince1970: Double($0.updatedAtMs) / 1000))
-            }
+            let changed = plan.changed.map(ConversationEntity.init)
             if !changed.isEmpty { try await index.indexAppEntities(changed) }
             indexed = plan.current
         } catch {

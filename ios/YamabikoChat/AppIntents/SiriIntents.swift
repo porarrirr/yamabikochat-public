@@ -1,28 +1,6 @@
 import AppIntents
 import Foundation
 
-struct AskYamabikoIntent: AppIntent {
-    static var title: LocalizedStringResource = "やまびこに質問"
-    static var description = IntentDescription("設定済みのプロバイダとモデルで質問し、回答を返します。")
-    static var openAppWhenRun = false
-
-    @Parameter(title: "質問", requestValueDialog: "何を質問しますか？")
-    var prompt: String
-    @Parameter(title: "新しい会話に保存", default: false)
-    var saveToConversation: Bool
-
-    static var parameterSummary: some ParameterSummary {
-        Summary("やまびこに\(\.$prompt)を質問") {
-            \.$saveToConversation
-        }
-    }
-
-    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
-        let result = try await SiriConversationService.ask(prompt: prompt, save: saveToConversation)
-        return .result(value: result.text, dialog: IntentDialog(stringLiteral: result.text))
-    }
-}
-
 struct OpenConversationIntent: AppIntent {
     static var openAppWhenRun = true
     static var title: LocalizedStringResource = "会話を開く"

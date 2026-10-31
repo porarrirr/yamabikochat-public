@@ -98,6 +98,8 @@ final class WKRenderedPageContentLoader: RenderedPageContentLoading, @unchecked 
 
     @MainActor
     func load(html: String, sourceURL: URL, timeout: TimeInterval) async throws -> RenderedPageLoadResult {
+        // Shortcut runs reach this without the app UI bootstrap.
+        try await YamabikoWebKitSupport.prepareNetworkPolicy()
         let session = WKRenderedPageSession(html: html, sourceURL: sourceURL, timeout: timeout)
         return try await withTaskCancellationHandler {
             try await session.start()
@@ -131,7 +133,6 @@ private final class WKRenderedPageSession: NSObject, WKNavigationDelegate {
             self.continuation = continuation
 
             let configuration = YamabikoWebKitSupport.makeConfiguration()
-            configuration.websiteDataStore = .nonPersistent()
             configuration.defaultWebpagePreferences.allowsContentJavaScript = false
             configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
             configuration.mediaTypesRequiringUserActionForPlayback = .all

@@ -2,6 +2,17 @@ import XCTest
 @testable import YamabikoChat
 
 final class UserFacingErrorFormatterTests: XCTestCase {
+    func testSarashinaThinkingLimitExplainsProviderTokenLimitAndRecovery() {
+        let error = ProviderClientError.providerFailure(
+            statusCode: nil, code: "SARASHINA_OUTPUT_LIMIT_BEFORE_ANSWER", message: "Output limit reached"
+        )
+        let formatted = UserFacingErrorFormatter.format(error)
+        XCTAssertEqual(formatted.title, L10n.text("Sarashina APIの出力上限に達しました"))
+        XCTAssertEqual(formatted.summary, L10n.text("API側の上限は思考と回答を合わせて8,000トークンです。今回は思考中に上限に達し、回答が返されませんでした。思考レベルをlowまたはmediumに下げて、再度お試しください。"))
+        XCTAssertTrue(formatted.detail.contains("SARASHINA_OUTPUT_LIMIT_BEFORE_ANSWER"))
+        XCTAssertNil(formatted.chatGPTUsageURL)
+    }
+
     func testChatGPTPlanLimitOffersOfficialUsageAction() {
         let error = UserFacingErrorFormatter.format("Pi provider failed: subscription_sharing_usage_limit_exceeded: limit reached")
         XCTAssertEqual(error.title, "ChatGPTの利用上限に達しました")

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ProjectListScreen: View {
     @Environment(\.appAccent) private var appAccent
+    @Environment(\.windowControlsLeadingInset) private var windowControlsLeadingInset
     @ObservedObject var viewModel: ConversationListViewModel
     var onBack: () -> Void
     var onSelectProject: (Int64) -> Void
@@ -118,6 +119,7 @@ struct ProjectListScreen: View {
             .accessibilityLabel(Text(L10n.text("新しいプロジェクト")))
         }
         .padding(.horizontal, 16)
+        .padding(.leading, windowControlsLeadingInset)
         .padding(.top, 8)
         .padding(.bottom, 10)
     }

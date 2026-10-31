@@ -47,3 +47,17 @@ __pycache__/
 *.rej
 *.swp
 *~
+
+# Private notes and distribution material
+/AGENTS.md
+/memo/
+/memos/
+/docs/design-reviews/
+/ios/AppStoreCreative/
+/ios/AppStoreScreenshots/
+/ios/AppStoreReviewNotes.md
+/ios/Performance-*
+/ios/node-mobile-release.json
+/analysis/
+/codeanal/
+/.local/

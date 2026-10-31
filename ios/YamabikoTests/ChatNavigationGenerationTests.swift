@@ -5,6 +5,46 @@ import XCTest
 
 @MainActor
 final class ChatNavigationGenerationTests: XCTestCase {
+    func testFirstKeyboardSendPresentsUserBubbleWithoutAudioTeardown() async throws {
+        let (stream, continuation) = AsyncThrowingStream<ProviderStreamEvent, Error>.makeStream()
+        defer { continuation.finish() }
+        let connected = expectation(description: "Provider connected after local presentation")
+        let fixture = try makeFixture { _, _, _ in
+            connected.fulfill()
+            return stream
+        }
+        let id = try fixture.repository.createConversation()
+        let model = ChatViewModel(conversationID: id)
+        await bind(model, repository: fixture.repository)
+        var recordingChanges: [Bool] = []
+        let observation = model.speechService.$isRecording.dropFirst()
+            .sink { recordingChanges.append($0) }
+        defer { observation.cancel() }
+
+        model.inputText = "First keyboard message"
+        model.sendMessage()
+
+        let row = try XCTUnwrap(model.timelineStore.row(id: "m--1"))
+        guard case .message(let submitted) = row.item else {
+            return XCTFail("Expected a local user bubble before awaiting the provider")
+        }
+        XCTAssertEqual(submitted.message.role, "user")
+        XCTAssertEqual(submitted.message.text, "First keyboard message")
+        XCTAssertEqual(model.inputText, "")
+        XCTAssertTrue(model.isSending)
+        XCTAssertTrue(recordingChanges.isEmpty)
+
+        await fulfillment(of: [connected], timeout: 10)
+        let finished = expectation(description: "Send finished")
+        let completion = model.$isSending.filter { !$0 }.prefix(1).sink { _ in finished.fulfill() }
+        defer { completion.cancel() }
+        continuation.yield(.completed(ProviderResponse(text: "Reply")))
+        continuation.finish()
+        await fulfillment(of: [finished], timeout: 10)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(try fixture.conversations.fetchMessages(conversationId: id).map(\.role), ["user", "model"])
+    }
+
     func testSwitchingChatsKeepsRunAliveAndReusesItsState() async throws {
         try await checkNavigationDuringGeneration(regenerating: false)
     }

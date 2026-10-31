@@ -4,9 +4,11 @@ import Foundation
 enum ShortcutIntentSupport {
     static func perform(
         prompt: String,
-        provider: ShortcutProviderAppEnum,
+        provider: ShortcutProviderEntity,
         model: String,
         systemPrompt: String?,
+        reasoningEffort: String?,
+        allowedTools: Set<ShortcutTool>?,
         saveToNewConversation: Bool
     ) async throws -> some IntentResult & ReturnsValue<String> {
         let trimmedSystemPrompt = systemPrompt?
@@ -16,9 +18,11 @@ enum ShortcutIntentSupport {
         do {
             let result = try await AppServices.resolve().chatRepository.runShortcut(
                 prompt: prompt,
-                provider: provider.providerKey,
+                provider: provider.id,
                 model: model,
                 systemPromptOverride: resolvedSystemPrompt,
+                reasoningEffort: reasoningEffort,
+                allowedTools: allowedTools,
                 saveToNewConversation: saveToNewConversation
             )
             return .result(
@@ -30,8 +34,10 @@ enum ShortcutIntentSupport {
                 saveToNewConversation ? "Shortcut save intent failed" : "Shortcut intent failed",
                 category: .chat,
                 metadata: [
-                    "provider": provider.providerKey,
-                    "model": model
+                    "provider": provider.id,
+                    "model": model,
+                    "reasoningEffort": reasoningEffort ?? "default",
+                    "allowedTools": allowedTools.map { $0.map(\.rawValue).sorted().joined(separator: ",") } ?? "default"
                 ],
                 error: error
             )

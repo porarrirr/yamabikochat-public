@@ -2,10 +2,62 @@ import Foundation
 import WebKit
 
 enum YamabikoWebKitSupport {
-    static func makeConfiguration(userContentController: WKUserContentController? = nil) -> WKWebViewConfiguration {
+    enum NetworkAccess {
+        /// WebKit itself blocks every network load, independent of page HTML or CSP.
+        case blocked
+        /// Only the isolated YouTube player, which receives a validated video ID and nothing else.
+        case youTubeEmbed
+    }
+
+    enum NetworkPolicyError: LocalizedError {
+        case ruleListUnavailable
+
+        var errorDescription: String? { "WebKit network policy could not be compiled" }
+    }
+
+    private static let networkRules = """
+    [{"trigger":{"url-filter":"^https?://"},"action":{"type":"block"}},
+     {"trigger":{"url-filter":"^wss?://"},"action":{"type":"block"}},
+     {"trigger":{"url-filter":"^ftp://"},"action":{"type":"block"}}]
+    """
+    private static let ruleListLock = NSLock()
+    nonisolated(unsafe) private static var blockedNetworkRuleList: WKContentRuleList?
+
+    /// App startup and headless loaders await this before any web view exists.
+    static func prepareNetworkPolicy() async throws {
+        if ruleListLock.withLock({ blockedNetworkRuleList }) != nil { return }
+        let ruleList = try await loadNetworkPolicy(from: .default())
+        ruleListLock.withLock { blockedNetworkRuleList = ruleList }
+    }
+
+    static func loadNetworkPolicy(from store: WKContentRuleListStore) async throws -> WKContentRuleList {
+        // Bump this identifier whenever the rules change so a previous policy is never reused.
+        let identifier = "YamabikoWebNoNetworkV1"
+        if let cached = try? await store.contentRuleList(forIdentifier: identifier) {
+            return cached
+        }
+        guard let compiled = try await store.compileContentRuleList(
+            forIdentifier: identifier, encodedContentRuleList: networkRules
+        ) else { throw NetworkPolicyError.ruleListUnavailable }
+        return compiled
+    }
+
+    /// The only constructor for app web views. A blocked view without the compiled
+    /// rule list is a startup-order bug, so it stops instead of loading unrestricted.
+    static func makeConfiguration(
+        userContentController: WKUserContentController? = nil,
+        network: NetworkAccess = .blocked
+    ) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
         if let userContentController {
             configuration.userContentController = userContentController
+        }
+        configuration.websiteDataStore = .nonPersistent()
+        if network == .blocked {
+            guard let ruleList = ruleListLock.withLock({ blockedNetworkRuleList }) else {
+                preconditionFailure("prepareNetworkPolicy() must finish before creating a web view")
+            }
+            configuration.userContentController.add(ruleList)
         }
         return configuration
     }

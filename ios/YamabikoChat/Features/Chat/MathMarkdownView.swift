@@ -12,14 +12,7 @@ enum MathMarkdownNormalizer {
     static func normalizeEscapedMathIfNeeded(_ markdown: String) -> String {
         guard containsMathDelimitersOutsideCode(markdown) else { return markdown }
 
-        let unescaped = normalizeEscapedSequencesOutsideCode(markdown)
-        return normalizeEscapedDollarDelimiters(unescaped)
-    }
-
-    static func normalizeEscapedDollarDelimiters(_ markdown: String) -> String {
-        transformOutsideCode(markdown) { segment in
-            normalizeEscapedDollarPairs(in: segment)
-        }
+        return normalizeEscapedSequencesOutsideCode(markdown)
     }
 
     private static func containsMathDelimitersOutsideCode(_ markdown: String) -> Bool {
@@ -83,90 +76,40 @@ enum MathMarkdownNormalizer {
             .replacingOccurrences(of: #"\\$"#, with: #"\$"#)
     }
 
-    static func transformOutsideCode(_ markdown: String, transform: (String) -> String) -> String {
-        guard !markdown.isEmpty else { return markdown }
+    private static let codeOpeningRegex = try! NSRegularExpression(
+        pattern: #"(?m)^[ \t>]*(?:(?:[-+*]|[0-9]+[.)])[ \t]+)?(`{3,}|~{3,})[^\n]*(?:\n|$)|(?<![\\`])(`+)(?!`)"#
+    )
 
+    static func transformOutsideCode(_ markdown: String, transform: (String) -> String) -> String {
         var output = ""
         var cursor = markdown.startIndex
-
-        while cursor < markdown.endIndex {
-            if markdown[cursor...].hasPrefix("```") {
-                let fenceStart = cursor
-                let searchStart = markdown.index(cursor, offsetBy: 3)
-                if let closingRange = markdown[searchStart...].range(of: "```") {
-                    output.append(contentsOf: markdown[fenceStart..<closingRange.upperBound])
-                    cursor = closingRange.upperBound
-                } else {
-                    output.append(contentsOf: markdown[fenceStart...])
-                    break
-                }
+        var searchStart = cursor
+        while searchStart < markdown.endIndex,
+              let match = codeOpeningRegex.firstMatch(in: markdown, range: NSRange(searchStart..., in: markdown)),
+              let opening = Range(match.range, in: markdown) {
+            let isFence = match.range(at: 1).location != NSNotFound
+            let delimiterRange = Range(match.range(at: isFence ? 1 : 2), in: markdown)!
+            let delimiter = String(markdown[delimiterRange])
+            let closingPattern = isFence
+                ? "(?m)^[ \\t>]*" + String(delimiter.first!) + "{\(delimiter.count),}[ \\t]*(?=\\n|$)"
+                : "(?<!`)" + delimiter + "(?!`)"
+            let closingRegex = try! NSRegularExpression(pattern: closingPattern)
+            let closing = closingRegex.firstMatch(in: markdown, range: NSRange(opening.upperBound..., in: markdown))
+                .flatMap { Range($0.range, in: markdown) }
+            guard isFence || closing != nil else {
+                searchStart = opening.upperBound
                 continue
             }
-
-            if markdown[cursor] == "`" {
-                let inlineStart = cursor
-                let searchStart = markdown.index(after: cursor)
-                if let closingTick = markdown[searchStart...].firstIndex(of: "`") {
-                    let inlineEnd = markdown.index(after: closingTick)
-                    output.append(contentsOf: markdown[inlineStart..<inlineEnd])
-                    cursor = inlineEnd
-                } else {
-                    output.append(contentsOf: markdown[inlineStart...])
-                    break
-                }
-                continue
-            }
-
-            let segmentStart = cursor
-            while cursor < markdown.endIndex {
-                if markdown[cursor...].hasPrefix("```") || markdown[cursor] == "`" {
-                    break
-                }
-                cursor = markdown.index(after: cursor)
-            }
-
-            let segment = String(markdown[segmentStart..<cursor])
-            output.append(transform(segment))
+            let end = closing?.upperBound ?? markdown.endIndex
+            output += transform(String(markdown[cursor..<opening.lowerBound]))
+            output += markdown[opening.lowerBound..<end]
+            cursor = end
+            searchStart = end
         }
-
+        output += transform(String(markdown[cursor...]))
         return output
     }
 
-    private static func normalizeEscapedDollarPairs(in text: String) -> String {
-        var normalized = replaceEscapedMathPairs(
-            in: text,
-            pattern: #"(?<!\\)\\\$([^$\n]+?)\\\$(?![A-Za-z0-9])"#
-        )
-
-        normalized = replaceEscapedMathPairs(
-            in: normalized,
-            pattern: #"(?<!\\)\\\$([^$\n]+?)\$(?![A-Za-z0-9])"#
-        )
-
-        return normalized
-    }
-
-    private static func replaceEscapedMathPairs(in text: String, pattern: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else {
-            return text
-        }
-
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let matches = regex.matches(in: text, range: range)
-        guard !matches.isEmpty else { return text }
-
-        var result = text
-        for match in matches.reversed() {
-            guard let fullRange = Range(match.range(at: 0), in: result),
-                  let contentRange = Range(match.range(at: 1), in: result) else {
-                continue
-            }
-            let content = result[contentRange]
-            result.replaceSubrange(fullRange, with: "$\(content)$")
-        }
-
-        return result
-    }
 }
 
 enum MathMarkdownHTMLBuilder {
@@ -242,7 +185,11 @@ enum MathMarkdownHTMLBuilder {
               },
               startup: { typeset: false },
               svg: { fontCache: 'global' },
-              options: { enableMenu: false }
+              options: {
+                enableMenu: false,
+                ignoreHtmlClass: 'yamabiko-markdown',
+                processHtmlClass: 'yamabiko-math'
+              }
             };
             window.__yamabikoMathJaxOnError = function() {
               window.__yamabikoMathJaxLoadFailed = true;
@@ -308,8 +255,16 @@ enum MathMarkdownHTMLBuilder {
               overflow-y: hidden;
             }
             mjx-container svg {
+              max-width: none;
+            }
+            .yamabiko-math {
+              display: inline-block;
               max-width: 100%;
-              height: auto;
+              overflow-x: auto;
+              vertical-align: middle;
+            }
+            .yamabiko-math-display {
+              display: block;
             }
             h1, h2, h3, h4, h5, h6 {
               margin: 1.05em 0 0.45em 0;
@@ -492,7 +447,7 @@ enum MathMarkdownHTMLBuilder {
                 });
               });
               function enableHorizontalScrollContainers() {
-                var selector = '.yamabiko-table-wrap, pre, mjx-container[display="true"]';
+                var selector = '.yamabiko-table-wrap, pre, .yamabiko-math, mjx-container[display="true"]';
                 var containers = document.querySelectorAll(selector);
                 containers.forEach(function(element) {
                   if (element.__yamabikoHorizontalScrollBound) return;

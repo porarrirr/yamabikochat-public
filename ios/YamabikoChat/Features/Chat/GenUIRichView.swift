@@ -41,6 +41,7 @@ struct GenUIRichView: View {
     @State private var imagePresentation: GenUIImagePresentation?
     @State private var sharePresentation: GenUISharePresentation?
     @State private var videoPresentation: GenUIVideoPresentation?
+    @State private var externalAccess: GenUIExternalAccessRequest?
     @Environment(\.onGenUIRoute) private var presentRoute
 
     var body: some View {
@@ -62,6 +63,22 @@ struct GenUIRichView: View {
         .sheet(item: $imagePresentation) { GenUIImagePresentationView(presentation: $0) }
         .sheet(item: $sharePresentation) { GenUISharePresentationView(items: $0.items) }
         .sheet(item: $videoPresentation) { GenUIVideoPresentationView(presentation: $0) }
+        .alert(L10n.text("外部サイトに接続しますか？"), isPresented: Binding(
+            get: { externalAccess != nil }, set: { if !$0 { externalAccess = nil } }
+        ), presenting: externalAccess) { request in
+            Button(L10n.text("接続")) { request.approve() }
+            Button(L10n.text("キャンセル"), role: .cancel) {}
+        } message: { request in
+            Text(request.hosts.joined(separator: "\n") + "\n\n" + L10n.text("生成された表示から外部へ接続します。接続先のURLには会話の内容が含まれている可能性があります。"))
+        }
+    }
+
+    /// Every network contact a GenUI document can cause passes through this native
+    /// dialog. Generated code can forge taps inside the canvas, but not this alert.
+    private func requestExternalAccess(to urls: [URL], approve: @escaping () -> Void) {
+        let hosts = Array(Set(urls.compactMap(\.host))).sorted()
+        guard !hosts.isEmpty else { return }
+        externalAccess = GenUIExternalAccessRequest(hosts: hosts, approve: approve)
     }
 
     private func handle(_ object: [String: Any]) {
@@ -76,7 +93,7 @@ struct GenUIRichView: View {
                 status = L10n.text("このリンクは開けません")
                 return
             }
-            openURL(url)
+            requestExternalAccess(to: [url]) { openURL(url) }
         case "prefillComposer":
             guard let text = object["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 16_384 else { return }
             prefillComposer(text)
@@ -103,7 +120,22 @@ struct GenUIRichView: View {
                 return .init(url: url, title: item["alt_text"] as? String ?? item["title"] as? String ?? "")
             }
             guard !images.isEmpty else { status = L10n.text("表示できる画像がありません"); return }
-            imagePresentation = .init(images: images, selected: min(max(args["selected_index"] as? Int ?? 0, 0), images.count - 1))
+            let presentation = GenUIImagePresentation(images: images, selected: min(max(args["selected_index"] as? Int ?? 0, 0), images.count - 1))
+            requestExternalAccess(to: images.map(\.url)) { imagePresentation = presentation }
+        case "loadExternalImages":
+            let urls = (object["urls"] as? [String] ?? []).compactMap(GenUIHostPolicy.externalURL)
+                .prefix(GenUIExternalImageLoader.maximumImageCount)
+            guard !urls.isEmpty else { return }
+            requestExternalAccess(to: Array(urls)) { [state] in
+                Task { @MainActor in
+                    let images = await GenUIExternalImageLoader.load(Array(urls))
+                    if let renderer = state.richRenderer {
+                        renderer.deliverExternalImages(images)
+                    } else {
+                        state.externalImages.merge(images) { $1 }
+                    }
+                }
+            }
         case "openVideoLightbox":
             let args = object["args"] as? [String: Any] ?? [:]
             guard let id = args["video_id"] as? String, id.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil else {
@@ -118,7 +150,13 @@ struct GenUIRichView: View {
             if let text = payload["text"] as? String ?? payload["message"] as? String ?? payload["title"] as? String { items.append(text) }
             if let url = (payload["url"] as? String).flatMap(GenUIHostPolicy.externalURL) { items.append(url) }
             guard !items.isEmpty else { status = L10n.text("共有データには参考元サーバーが必要です"); return }
-            sharePresentation = .init(items: items)
+            // The share sheet fetches link previews for URL items.
+            let urls = items.compactMap { $0 as? URL }
+            if urls.isEmpty {
+                sharePresentation = .init(items: items)
+            } else {
+                requestExternalAccess(to: urls) { sharePresentation = .init(items: items) }
+            }
         case "openMap":
             guard let props = object["props"] as? [String: Any],
                   let data = try? JSONSerialization.data(withJSONObject: props),
@@ -131,6 +169,44 @@ struct GenUIRichView: View {
             DiagnosticsLogger.log("GenUI map presentation requested", category: .app)
         default:
             status = L10n.text("この操作は利用できません")
+        }
+    }
+}
+
+struct GenUIExternalAccessRequest {
+    let hosts: [String]
+    let approve: () -> Void
+}
+
+/// Fetches consented GenUI images natively so the canvas itself keeps no network access.
+enum GenUIExternalImageLoader {
+    static let maximumImageCount = 24
+    static let maximumImageBytes = 5 * 1024 * 1024
+    private static let allowedTypes: Set<String> = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/heic", "image/avif"]
+
+    static func load(_ urls: [URL], session: URLSession = URLSession(configuration: .ephemeral)) async -> [String: String?] {
+        await withTaskGroup(of: (String, String?).self) { group in
+            for url in urls {
+                group.addTask { (url.absoluteString, await dataURL(for: url, session: session)) }
+            }
+            return await group.reduce(into: [:]) { $0[$1.0] = .some($1.1) }
+        }
+    }
+
+    private static func dataURL(for url: URL, session: URLSession) async -> String? {
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let type = http.mimeType?.lowercased(), allowedTypes.contains(type),
+                  data.count <= maximumImageBytes, UIImage(data: data) != nil else {
+                DiagnosticsLogger.log("GenUI external image rejected", category: .network,
+                                      metadata: ["host": url.host ?? "", "status": String((response as? HTTPURLResponse)?.statusCode ?? 0)])
+                return nil
+            }
+            return "data:\(type);base64,\(data.base64EncodedString())"
+        } catch {
+            DiagnosticsLogger.log("GenUI external image failed", category: .network, metadata: ["host": url.host ?? ""], error: error)
+            return nil
         }
     }
 }
@@ -488,7 +564,6 @@ struct GenUIRichWebView: UIViewRepresentable {
         func makeWebView() -> WKWebView {
             if let webView { return webView }
             let configuration = YamabikoWebKitSupport.makeConfiguration()
-            configuration.websiteDataStore = .nonPersistent()
             let handler = MessageHandler(target: self)
             configuration.userContentController.add(handler, name: "genui")
             let gestureWorld = WKContentWorld.world(name: "GenUIHostGestures")
@@ -621,6 +696,13 @@ struct GenUIRichWebView: UIViewRepresentable {
             for id in Array(videoHosts.keys) where !retained.contains(id) { videoHosts.removeValue(forKey: id)?.remove() }
         }
 
+        func deliverExternalImages(_ images: [String: String?]) {
+            state?.externalImages.merge(images) { $1 }
+            let arguments = images.mapValues { $0.map { $0 as Any } ?? NSNull() }
+            webView?.callAsyncJavaScript("window.GenUIRuntime?.setExternalImages(images);", arguments: ["images": arguments],
+                                         in: nil, in: .page, completionHandler: nil)
+        }
+
         func load(in webView: WKWebView) {
             guard let parent else { return }
             attachMapControllers(in: webView)
@@ -634,9 +716,8 @@ struct GenUIRichWebView: UIViewRepresentable {
             }
             if let loadedDocument, loadedDocument.isRich, parent.document.isRich {
                 guard ready else { return }
-                let encoder = JSONEncoder()
-                if let previous = try? encoder.encode(loadedDocument), let next = try? encoder.encode(parent.document),
-                   Self.mediaOrigins(previous) == Self.mediaOrigins(next) {
+                // The canvas policy is fixed, so a rich document can always update in place.
+                if let next = try? JSONEncoder().encode(parent.document) {
                     self.loadedDocument = parent.document
                     webView.callAsyncJavaScript("const value=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded),c=>c.charCodeAt(0)))); window.GenUIRuntime.updateDocument(value);window.__GENUI_SET_THEME__(theme);", arguments: ["encoded": next.base64EncodedString(), "theme": parent.dark ? "dark" : "light"], in: nil, in: .page, completionHandler: { result in
                         if case .failure(let error) = result { DiagnosticsLogger.log("GenUI document update failed", category: .app, error: error) }
@@ -647,7 +728,8 @@ struct GenUIRichWebView: UIViewRepresentable {
             ready = false
             isRestoring = true
             restorePreviewIfNeeded()
-            guard let html = Self.html(document: parent.document, snapshot: parent.state.richSnapshot, dark: parent.dark) else {
+            guard let html = Self.html(document: parent.document, snapshot: parent.state.richSnapshot, dark: parent.dark,
+                                       externalImages: parent.state.externalImages) else {
                 DispatchQueue.main.async { [weak self] in self?.parent?.onStatus(L10n.text("GenUIの表示リソースを読み込めません")) }
                 return
             }
@@ -731,10 +813,7 @@ struct GenUIRichWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             let url = navigationAction.request.url
-            if navigationAction.targetFrame?.isMainFrame == false,
-               url?.scheme == "https", url?.host == "www.youtube-nocookie.com" {
-                decisionHandler(.allow)
-            } else if navigationAction.navigationType == .other, url?.scheme == "about" || url?.isFileURL == true {
+            if navigationAction.navigationType == .other, url?.scheme == "about" || url?.isFileURL == true {
                 decisionHandler(.allow)
             } else {
                 decisionHandler(.cancel)
@@ -755,7 +834,7 @@ struct GenUIRichWebView: UIViewRepresentable {
             DiagnosticsLogger.log("GenUI WebKit process terminated", category: .app)
         }
 
-        static func html(document: GenUIDocument, snapshot: [String: JSONValue]?, dark: Bool) -> String? {
+        static func html(document: GenUIDocument, snapshot: [String: JSONValue]?, dark: Bool, externalImages: [String: String?] = [:]) -> String? {
             func asset(_ name: String, extension ext: String) -> String? {
                 let url = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "genui")
                     ?? Bundle.main.url(forResource: name, withExtension: ext)
@@ -770,8 +849,10 @@ struct GenUIRichWebView: UIViewRepresentable {
                   let lottie = asset("lottie-light", extension: "js"),
                   let markdown = asset("markdown-it", extension: "js") else { return nil }
             let snapshot64 = (try? JSONEncoder().encode(snapshot ?? [:]).base64EncodedString()) ?? "e30="
-            let origins = mediaOrigins(encoded)
-            let policy = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' file:; style-src 'unsafe-inline'; img-src data: \(origins); media-src \(origins.isEmpty ? "'none'" : origins); font-src file: data:; connect-src \(origins.isEmpty ? "'none'" : origins); frame-src https://www.youtube-nocookie.com; base-uri 'none'; form-action 'none'"
+            // Generated content never reaches the network. External images arrive as
+            // data URLs only after native consent; see GenUIExternalAccess.
+            let images64 = (try? JSONEncoder().encode(externalImages).base64EncodedString()) ?? "e30="
+            let policy = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' file:; style-src 'unsafe-inline'; img-src data:; media-src 'none'; font-src file: data:; connect-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
             let math = MathMarkdownResourceResolver.mathJaxScriptURL(in: .main).map {
                 "<script>window.MathJax={startup:{typeset:false},tex:{inlineMath:[['$','$'],['\\\\(','\\\\)']]}};</script><script src=\"\($0.lastPathComponent)\"></script>"
             } ?? ""
@@ -780,6 +861,7 @@ struct GenUIRichWebView: UIViewRepresentable {
             const decode=b=>JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b),c=>c.charCodeAt(0))));
             window.__GENUI_DOCUMENT__=decode('\(encoded.base64EncodedString())');
             window.__GENUI_SAVED_STATE__=decode('\(snapshot64)');
+            window.__GENUI_EXTERNAL_IMAGES__=decode('\(images64)');
             window.__GENUI_IS_MOBILE__=true;
             window.__GENUI_THEME__='\(dark ? "dark" : "light")';
             window.__GENUI_LOCALE__='\(Locale.current.language.languageCode?.identifier ?? "en")';
@@ -792,22 +874,6 @@ struct GenUIRichWebView: UIViewRepresentable {
             \(runtime)
             </script></body></html>
             """
-        }
-
-        private static func mediaOrigins(_ data: Data) -> String {
-            var origins = Set<String>()
-            func scan(_ object: Any) {
-                if let dictionary = object as? [String: Any] {
-                    // Client code must declare media URLs in resources or node props.
-                    for (key, value) in dictionary where key != "code" { scan(value) }
-                } else if let array = object as? [Any] {
-                    array.forEach(scan)
-                } else if let raw = object as? String, let url = GenUIHostPolicy.externalURL(raw), let host = url.host {
-                    origins.insert("https://\(host)\(url.port.map { ":\($0)" } ?? "")")
-                }
-            }
-            if let object = try? JSONSerialization.jsonObject(with: data) { scan(object) }
-            return origins.sorted().joined(separator: " ")
         }
     }
 }

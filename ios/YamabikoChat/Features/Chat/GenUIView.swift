@@ -10,6 +10,8 @@ final class GenUIState: ObservableObject {
     // WebKit owns interactive rendering. Keep its restoration snapshot without
     // invalidating the SwiftUI host on every slider input event.
     var richSnapshot: [String: JSONValue]?
+    // Consented remote images as data URLs; nil marks an image that failed to load.
+    var externalImages: [String: String?] = [:]
     let renderCacheID = UUID()
     // Visible hosts own their renderer. Only a bounded shared cache keeps offscreen ones.
     weak var richRenderer: GenUIRichWebView.Coordinator?

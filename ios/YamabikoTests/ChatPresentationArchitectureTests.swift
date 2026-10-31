@@ -2484,6 +2484,28 @@ final class ChatPresentationArchitectureTests: XCTestCase {
     }
 
     @MainActor
+    func testTextOnlyUserBubbleRemeasuresAfterEditing() async throws {
+        let store = ChatTimelineStore()
+        store.update(messages: [timelineMessage(id: 1, role: "user", text: "Short message")])
+        let controller = configuredTimelineController(store: store)
+        await settleTimeline(controller)
+        let collection = try XCTUnwrap(findCollectionView(in: controller.view))
+        let indexPath = IndexPath(item: 0, section: 0)
+        let initialHeight = try XCTUnwrap(collection.layoutAttributesForItem(at: indexPath)).size.height
+        XCTAssertGreaterThan(initialHeight, 0)
+
+        store.update(messages: [timelineMessage(id: 1, role: "user", text: String(repeating: "長いメッセージの編集。\n", count: 15))])
+        await settleTimeline(controller)
+        let editedHeight = try XCTUnwrap(collection.layoutAttributesForItem(at: indexPath)).size.height
+        XCTAssertGreaterThan(editedHeight, initialHeight * 3)
+
+        store.update(messages: [timelineMessage(id: 1, role: "user", text: "Short message")])
+        await settleTimeline(controller)
+        XCTAssertEqual(try XCTUnwrap(collection.layoutAttributesForItem(at: indexPath)).size.height,
+                       initialHeight, accuracy: 1)
+    }
+
+    @MainActor
     private func configuredTimelineController(
         store: ChatTimelineStore,
         scrollRequest: Int = 0

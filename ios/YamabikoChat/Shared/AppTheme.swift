@@ -33,24 +33,28 @@ enum AppThemeColor: String, CaseIterable {
         case .orange:
             return Color(uiColor: .systemOrange)
         case .white:
-            return Color(uiColor: .white)
+            // The accent also draws links and selection marks on unfilled surfaces.
+            return Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark ? .white : UIColor(white: 0.35, alpha: 1)
+            })
         case .black:
-            return Color(uiColor: .black)
-        }
-    }
-
-    /// Light accents need a dark glyph when used as a filled surface.
-    var usesDarkOnAccentColor: Bool {
-        switch self {
-        case .yellow, .white:
-            return true
-        case .bluePurple, .blue, .green, .pink, .orange, .black:
-            return false
+            return Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark ? UIColor(white: 0.75, alpha: 1) : .black
+            })
         }
     }
 
     var onAccentColor: Color {
-        usesDarkOnAccentColor ? Color(uiColor: .black) : Color(uiColor: .white)
+        switch self {
+        case .white, .black:
+            return Color(uiColor: UIColor { traits in
+                traits.userInterfaceStyle == .dark ? .black : .white
+            })
+        case .yellow:
+            return Color(uiColor: .black)
+        case .bluePurple, .blue, .green, .pink, .orange:
+            return Color(uiColor: .white)
+        }
     }
 }
 

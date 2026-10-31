@@ -474,6 +474,14 @@
 "Shortcuts: プロンプトを入力してください。" = "Saisissez un prompt.";
 "Shortcuts: モデル ID を入力してください。" = "Saisissez un ID de modèle.";
 "Shortcuts: 不明なプロバイダです。" = "Fournisseur inconnu.";
+"Shortcuts: 推論エフォート" = "Effort de raisonnement";
+"Shortcuts: 許可するツール" = "Outils autorisés";
+"Shortcuts: 許可するツール説明" = "Outils de l'app disponibles pour cette exécution. S'il n'est pas défini, les réglages de l'app sont utilisés ; s'il est vide, aucun outil de l'app n'est utilisé. Les outils du fournisseur suivent ses réglages.";
+"Shortcuts: ツール" = "Outil";
+"Shortcuts: Web 検索" = "Recherche web";
+"Shortcuts: Python 実行" = "Exécution Python";
+"Shortcuts: ファイル編集" = "Édition de fichiers";
+"Shortcuts: GenUI" = "GenUI";
 "Shortcuts: モデルに聞く説明" = "Envoie un prompt à un modèle et renvoie le texte généré sans ouvrir l’app.";
 "Shortcuts: モデルに聞いて保存説明" = "Envoie un prompt à un modèle, renvoie le texte et l’enregistre dans un nouveau chat.";
 "Shortcuts: モデルに聞く要約" = "Interroger \(\.$prompt) avec \(\.$provider) / \(\.$model)";
@@ -717,3 +725,10 @@
 "履歴を残す" = "Enregistrer l’historique";
 
 "履歴を残さない" = "Ne pas enregistrer l’historique";
+
+"会話" = "Conversations";
+"該当する会話がありません" = "Aucune conversation correspondante";
+"検索を消去" = "Effacer la recherche";
+"外部サイトに接続しますか？" = "Se connecter à un site externe ?";
+"接続" = "Se connecter";
+"生成された表示から外部へ接続します。接続先のURLには会話の内容が含まれている可能性があります。" = "Cette vue générée va se connecter à un site externe. L’URL de destination peut contenir des parties de votre conversation.";

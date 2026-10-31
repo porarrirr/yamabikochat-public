@@ -333,7 +333,6 @@ private struct MermaidWebView: UIViewRepresentable {
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: Coordinator.messageName)
         let configuration = YamabikoWebKitSupport.makeConfiguration(userContentController: controller)
-        configuration.websiteDataStore = .nonPersistent()
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator

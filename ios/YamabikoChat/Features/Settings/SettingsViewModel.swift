@@ -470,12 +470,18 @@ final class SettingsViewModel: ObservableObject {
         if enabled, settings.apiProvider.caseInsensitiveCompare("GEMINI") == .orderedSame {
             settings.disableGeminiTools()
         }
+        if enabled, settings.apiProvider.caseInsensitiveCompare("PLAMO") == .orderedSame {
+            settings.plamoWebSearchEnabled = false
+        }
     }
 
     func setPythonToolEnabled(_ enabled: Bool) {
         settings.pythonToolEnabled = enabled
         if enabled, settings.apiProvider.caseInsensitiveCompare("GEMINI") == .orderedSame {
             settings.disableGeminiTools()
+        }
+        if enabled, settings.apiProvider.caseInsensitiveCompare("PLAMO") == .orderedSame {
+            settings.plamoWebSearchEnabled = false
         }
     }
 
@@ -484,6 +490,14 @@ final class SettingsViewModel: ObservableObject {
         if enabled, settings.apiProvider.caseInsensitiveCompare("GEMINI") == .orderedSame {
             settings.disableGeminiTools()
         }
+        if enabled, settings.apiProvider.caseInsensitiveCompare("PLAMO") == .orderedSame {
+            settings.plamoWebSearchEnabled = false
+        }
+    }
+
+    func setPlamoWebSearchEnabled(_ enabled: Bool) {
+        settings.plamoWebSearchEnabled = enabled
+        if enabled { settings.disableClientTools() }
     }
 
     func setGeminiGoogleSearchEnabled(_ enabled: Bool) {

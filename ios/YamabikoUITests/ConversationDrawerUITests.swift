@@ -62,6 +62,39 @@ final class ConversationDrawerUITests: XCTestCase {
         }
     }
 
+    func testHistoryButtonTogglesSplitViewSidebarOnIPad() throws {
+        try XCTSkipUnless(UIDevice.current.userInterfaceIdiom == .pad, "iPad split-view layout only")
+
+        let app = launchConversation()
+        let searchToggle = app.buttons["conversation-search-toggle"]
+        XCTAssertTrue(searchToggle.waitForExistence(timeout: 5))
+
+        app.buttons["chat-history-button"].tap()
+        XCTAssertTrue(searchToggle.waitForNonExistence(timeout: 5))
+
+        app.buttons["chat-history-button"].tap()
+        XCTAssertTrue(searchToggle.waitForExistence(timeout: 5))
+    }
+
+    func testSidebarSearchCanBeOpenedFilteredAndDismissed() {
+        let app = launchConversation()
+        app.buttons["chat-history-button"].tap()
+        let toggle = app.buttons["conversation-search-toggle"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 5))
+        toggle.tap()
+        let search = app.textFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText("no-matching-conversation-92841")
+        XCTAssertTrue(app.staticTexts["該当する会話がありません"].waitForExistence(timeout: 5))
+        toggle.tap()
+        XCTAssertFalse(search.exists)
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Text Selection Fixture")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["sidebar-new-chat"].isHittable)
+        XCTAssertTrue(app.buttons["open-settings"].isHittable)
+    }
+
     func testNewChatAutomaticallyShowsKeyboard() {
         let app = launchConversation()
         app.buttons["chat-primary-action-button"].tap()

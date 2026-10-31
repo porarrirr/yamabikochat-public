@@ -1,9 +1,9 @@
 import Foundation
 
 enum AppConstants {
-    static let appGroupIdentifier = "group.com.porarri.yamabikochat"
+    static let appGroupIdentifier = "group.org.example.yamabikochat"
     static let sharePayloadDidChangeNotification = Notification.Name("YamabikoSharePayloadDidChange")
-    static let sharePayloadDarwinNotification = "com.porarri.yamabikochat.share_payload.changed"
+    static let sharePayloadDarwinNotification = "org.example.yamabikochat.share_payload.changed"
     static let importShareURL = URL(string: "yamabikochat://import-share")!
     static let alibabaMCPAuthorizationTokenKey = "alibaba_mcp_authorization_token"
     static let alibabaMCPDefaultServerName = "firecrawl"
@@ -17,9 +17,9 @@ enum AppConstants {
     static let defaultZAICodingPlanBaseURL = URL(string: "https://api.z.ai/api/coding/paas/v4/")!
     static let defaultSuperGrokBaseURL = URL(string: "https://cli-chat-proxy.grok.com/v1/")!
 
-    /// GitHub Pages (`docs/`). Enable Pages on the repo before App Store submission.
-    static let marketingURL = URL(string: "https://porarrirr.github.io/yamabikochat/")!
-    static let privacyPolicyURL = URL(string: "https://porarrirr.github.io/yamabikochat/privacy.html")!
-    static let supportURL = URL(string: "https://porarrirr.github.io/yamabikochat/support.html")!
-    static let termsOfUseURL = URL(string: "https://porarrirr.github.io/yamabikochat/terms.html")!
+    /// Public app information hosted in the shared Pages repository.
+    static let marketingURL = URL(string: "https://github.com/porarrirr/yamabikochat-public")!
+    static let privacyPolicyURL = URL(string: "https://github.com/porarrirr/yamabikochat-public/blob/main/ios/PRIVACY.md")!
+    static let supportURL = URL(string: "https://github.com/porarrirr/yamabikochat-public/issues")!
+    static let termsOfUseURL = URL(string: "https://github.com/porarrirr/yamabikochat-public/blob/main/ios/TERMS.md")!
 }

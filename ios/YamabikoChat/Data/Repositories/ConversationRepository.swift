@@ -453,23 +453,58 @@ final class ConversationRepository: @unchecked Sendable {
         }
     }
 
-    // Siri queries never decrypt or expose secret conversations. Use bound values and
-    // literal substring matching so '%' and '_' are ordinary search characters.
-    func siriConversations(matching term: String? = nil, ids: [Int64]? = nil, limit: Int = 50) throws -> [Conversation] {
+    // The only repository surface for OS integrations. Secret conversations are excluded
+    // in SQL and search matches titles only, so no caller can expose message content.
+    // Bound values and instr() keep '%' and '_' ordinary search characters.
+    func externalConversationSummaries(matching term: String? = nil, ids: [Int64]? = nil, limit: Int = 50) throws -> [ExternalConversationSummary] {
         if let ids, ids.isEmpty { return [] }
         return try dbQueue.read { db in
-            var clauses = ["c.isSecret = 0"]
+            var clauses = ["isSecret = 0"]
             var arguments = StatementArguments()
             if let ids {
-                clauses.append("c.id IN (\(Array(repeating: "?", count: ids.count).joined(separator: ",")))")
+                clauses.append("id IN (\(Array(repeating: "?", count: ids.count).joined(separator: ",")))")
                 arguments += StatementArguments(ids)
             }
             if let term = term?.trimmingCharacters(in: .whitespacesAndNewlines), !term.isEmpty {
-                clauses.append("(instr(lower(c.title), lower(?)) > 0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.conversationId = c.id AND instr(lower(m.text), lower(?)) > 0))")
-                arguments += [term, term]
+                clauses.append("instr(lower(title), lower(?)) > 0")
+                arguments += [term]
             }
             arguments += [max(1, min(limit, 500))]
-            return try Conversation.fetchAll(db, sql: "SELECT c.* FROM conversations c WHERE \(clauses.joined(separator: " AND ")) ORDER BY c.updatedAtMs DESC, c.id DESC LIMIT ?", arguments: arguments)
+            return try Self.externalSummaries(db, where: clauses.joined(separator: " AND "), arguments: arguments)
+        }
+    }
+
+    func observeExternalConversationSummaries() -> AnyPublisher<[ExternalConversationSummary], Never> {
+        ValueObservation.tracking { db in
+            // LIMIT -1 is unbounded in SQLite.
+            try Self.externalSummaries(db, where: "isSecret = 0", arguments: [-1])
+        }
+        .publisher(in: dbQueue)
+        .replaceError(with: [])
+        .removeDuplicates()
+        .eraseToAnyPublisher()
+    }
+
+    private static func externalSummaries(_ db: Database, where clause: String, arguments: StatementArguments) throws -> [ExternalConversationSummary] {
+        try Row.fetchAll(db, sql: """
+            SELECT id, title, updatedAtMs FROM conversations WHERE \(clause)
+            ORDER BY updatedAtMs DESC, id DESC LIMIT ?
+            """, arguments: arguments)
+            .map { ExternalConversationSummary(id: $0["id"], title: $0["title"], updatedAtMs: $0["updatedAtMs"]) }
+    }
+
+    /// Foreground in-app search, which also matches message bodies. Never hand its
+    /// results to an OS integration; use externalConversationSummaries instead.
+    func searchConversations(matching term: String, limit: Int = 50) throws -> [Conversation] {
+        let term = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return [] }
+        return try dbQueue.read { db in
+            try Conversation.fetchAll(db, sql: """
+                SELECT c.* FROM conversations c
+                WHERE c.isSecret = 0 AND (instr(lower(c.title), lower(?)) > 0 OR EXISTS (
+                    SELECT 1 FROM chat_messages m WHERE m.conversationId = c.id AND instr(lower(m.text), lower(?)) > 0))
+                ORDER BY c.updatedAtMs DESC, c.id DESC LIMIT ?
+                """, arguments: [term, term, max(1, min(limit, 500))])
         }
     }
 

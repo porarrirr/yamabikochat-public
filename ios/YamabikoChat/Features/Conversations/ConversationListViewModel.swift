@@ -345,7 +345,7 @@ final class ConversationListViewModel: ObservableObject {
         let filtered: [ConversationListEntry]
         if let siriSearchTerm, siriSearchTerm == query, let siriConversationRepository {
             do {
-                let ids = Set(try siriConversationRepository.siriConversations(matching: query).compactMap(\.id))
+                let ids = Set(try siriConversationRepository.searchConversations(matching: query).compactMap(\.id))
                 filtered = base.filter { ids.contains($0.id) }
             } catch {
                 filtered = []

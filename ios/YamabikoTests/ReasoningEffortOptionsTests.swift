@@ -2,6 +2,14 @@ import XCTest
 @testable import YamabikoChat
 
 final class ReasoningEffortOptionsTests: XCTestCase {
+    func testPlamoOnlyOffersOfficialReasoningEffortsForSupportedChatModels() {
+        for model in ["plamo-3.0-prime", "plamo-3.1-prime"] {
+            XCTAssertEqual(ReasoningEffortOptions.options(provider: "PLAMO", model: model), ["none", "medium"])
+        }
+        XCTAssertEqual(ReasoningEffortOptions.options(provider: "PLAMO", model: "unknown"), [])
+        XCTAssertEqual(ReasoningEffortOptions.options(provider: "PLAMO", model: "plamo-3.1-prime-deep-research"), [])
+    }
+
     func testModelsDevProviderUsesCatalogEfforts() {
         let model = CatalogModel(
             id: "glm-5.3",

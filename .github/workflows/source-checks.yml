@@ -1,0 +1,29 @@
+name: Source checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check public content
+        run: python3 scripts/check-public-content.py
+      - name: Pi runtime
+        run: |
+          npm ci --prefix ios/PiRuntime
+          npm test --prefix ios/PiRuntime
+      - name: GenUI
+        run: |
+          npm ci --prefix ios/GenUIRuntimeTests --ignore-scripts
+          npm test --prefix ios/GenUIRuntimeTests
+      - name: Python
+        run: python3 -m unittest ios/PythonTests/test_yamabiko_runtime.py

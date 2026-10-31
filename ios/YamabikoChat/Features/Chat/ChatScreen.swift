@@ -640,7 +640,10 @@ struct ChatScreen: View {
                 .padding(.top, 8)
             }
 
+            // Keep the composer aligned with the assistant message column on wide iPad windows.
             composerBar
+                .frame(maxWidth: 760)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 14)
                 .padding(.top, 4)
                 .padding(.bottom, 8)
@@ -996,7 +999,7 @@ struct ChatScreen: View {
                 }
                 .padding(.horizontal, 8)
                 .padding(.bottom, 7)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .transition(.opacity)
             }
         }
         .background(Color(uiColor: .amoledSecondarySystemBackground))
@@ -1005,7 +1008,7 @@ struct ChatScreen: View {
             RoundedRectangle(cornerRadius: isComposerExpanded ? 22 : 26, style: .continuous)
                 .stroke(Color(uiColor: .separator).opacity(0.16), lineWidth: 1)
         }
-        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isComposerExpanded)
+        .animation(.easeOut(duration: 0.18), value: isComposerExpanded)
     }
 
     private var speechRecordingBar: some View {

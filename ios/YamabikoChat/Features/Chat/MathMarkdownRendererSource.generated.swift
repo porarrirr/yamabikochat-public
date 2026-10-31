@@ -93,77 +93,104 @@ enum MathMarkdownRendererSource {
         return -1;
       }
     
-      function protectMathSegments(text) {
-        var source = String(text || "");
-        var tokens = [];
+      function protectCodeSegments(source, context) {
+        var opening = /^[ \t>]*(?:(?:[-+*]|[0-9]+[.)])[ \t]+)?(`{3,}|~{3,})[^\n]*(?:\n|$)|(?<![\\`])(`+)(?!`)/gm;
+        var output = "";
+        var cursor = 0;
+        var match;
+        while ((match = opening.exec(source))) {
+          var fence = !!match[1];
+          var delimiter = match[1] || match[2];
+          var closing = new RegExp(fence
+            ? "^[ \\t>]*" + delimiter.charAt(0) + "{" + delimiter.length + ",}[ \\t]*(?=\\n|$)"
+            : "(?<!`)" + delimiter + "(?!`)", "gm");
+          closing.lastIndex = opening.lastIndex;
+          var end = closing.exec(source);
+          if (!fence && !end) continue;
+          var upper = end ? closing.lastIndex : source.length;
+          var content = source.slice(opening.lastIndex, end ? end.index : upper);
+          var html;
+          var prefix = "";
+          if (fence) {
+            prefix = match[0].slice(0, match[0].indexOf(delimiter));
+            var language = match[0].slice(prefix.length + delimiter.length).trim();
+            var indent = prefix.match(/^[ \t]*/)[0].length;
+            var quoteDepth = prefix.split(">").length - 1;
+            if (quoteDepth) content = content.replace(new RegExp("^[ \\t]*(?:>[ \\t]?){" + quoteDepth + "}", "gm"), "");
+            content = content.replace(new RegExp("^[ \\t]{0," + indent + "}", "gm"), "");
+            html = '<div class="yamabiko-code-block"><button type="button" class="yamabiko-copy-button">' +
+              copyButtonLabel + '</button><pre><code' + (language ? ' class="language-' + escapeAttr(language) + '"' : '') +
+              '>' + escapeHtml(content) + '</code></pre></div>';
+          } else {
+            content = content.replace(/\n/g, " ");
+            if (/^ .* $/.test(content) && /[^ ]/.test(content)) content = content.slice(1, -1);
+            html = '<code>' + escapeHtml(content) + '</code>';
+          }
+          var key = "@@YBPROTECTED" + context.tokens.length + "@@";
+          context.tokens.push({ html: html, block: fence });
+          output += source.slice(cursor, match.index) + prefix + key;
+          cursor = upper;
+          opening.lastIndex = upper;
+        }
+        return output + source.slice(cursor);
+      }
+    
+      function protectMathSegments(source, context) {
         var output = "";
         var i = 0;
-    
-        function pushToken(segment) {
-          var key = "@@YBMATH" + tokens.length + "@@";
-          tokens.push(segment);
-          output += key;
-        }
-    
         while (i < source.length) {
-          if (source.slice(i, i + 2) === "$$" && !isEscaped(source, i)) {
-            var blockClose = findClosingDelimiter(source, i, "$$", "$$");
-            if (blockClose > i + 1) {
-              pushToken(source.slice(i, blockClose + 2));
-              i = blockClose + 2;
-              continue;
-            }
+          var url = source.slice(i).match(/^https?:\/\/[^\s<>"']+/i);
+          if (url) {
+            output += url[0];
+            i += url[0].length;
+            continue;
           }
-    
-          if (source.slice(i, i + 2) === "\\[" && !isEscaped(source, i)) {
-            var bracketClose = findClosingDelimiter(source, i, "\\[", "\\]");
-            if (bracketClose !== -1) {
-              pushToken(source.slice(i, bracketClose + 2));
-              i = bracketClose + 2;
-              continue;
-            }
-          }
-    
-          if (source.slice(i, i + 2) === "\\(" && !isEscaped(source, i)) {
-            var parenClose = findClosingDelimiter(source, i, "\\(", "\\)");
-            if (parenClose !== -1) {
-              pushToken(source.slice(i, parenClose + 2));
-              i = parenClose + 2;
-              continue;
-            }
-          }
-    
-          if (source.charAt(i) === "$" && !isEscaped(source, i) && source.charAt(i + 1) !== "$") {
-            var inlineClose = i + 1;
-            while (inlineClose < source.length) {
-              if (
-                source.charAt(inlineClose) === "$" &&
-                !isEscaped(source, inlineClose) &&
-                source.charAt(inlineClose - 1) !== "$" &&
-                source.charAt(inlineClose + 1) !== "$"
-              ) {
+          var opening = source.slice(i, i + 2);
+          var closing = opening === "\\[" ? "\\]" : opening === "\\(" ? "\\)" : "$$";
+          var display = opening === "$$" || opening === "\\[";
+          var length = 2;
+          var end = -1;
+          if ((display || opening === "\\(") && !isEscaped(source, i)) {
+            end = findClosingDelimiter(source, i, opening, closing);
+          } else if (source.charAt(i) === "$" && !isEscaped(source, i) &&
+                     source.charAt(i - 1) !== "$" && source.charAt(i + 1) !== "$" &&
+                     !/\s/.test(source.charAt(i + 1))) {
+            length = 1;
+            var candidate = i + 1;
+            while (candidate < source.length && source.charAt(candidate) !== "\n") {
+              if (source.charAt(candidate) === "$" && !isEscaped(source, candidate)) {
+                if (candidate > i + 1 && !/\s/.test(source.charAt(candidate - 1)) &&
+                    !/[A-Za-z0-9$]/.test(source.charAt(candidate + 1)) && source.charAt(candidate - 1) !== "$") {
+                  end = candidate;
+                }
                 break;
               }
-              inlineClose += 1;
+              candidate += 1;
             }
-    
-            if (inlineClose < source.length && inlineClose > i + 1) {
-              pushToken(source.slice(i, inlineClose + 1));
-              i = inlineClose + 1;
+          }
+          if (end !== -1) {
+            var equation = source.slice(i, end + length);
+            // Quote prefixes belong to Markdown. Let the recursive quote parser
+            // remove them before protecting the complete equation.
+            var linePrefix = source.slice(source.lastIndexOf("\n", i - 1) + 1, i);
+            var quoted = /^[ \t]*>/.test(linePrefix) && /\n[ \t]*>/.test(equation);
+            if (!quoted && !/@@YBPROTECTED\d+@@/.test(equation)) {
+              var key = "@@YBPROTECTED" + context.tokens.length + "@@";
+              var classes = "yamabiko-math" + (display ? " yamabiko-math-display" : "");
+              context.tokens.push({ html: '<span class="' + classes + '">' + escapeHtml(equation) + '</span>', block: false });
+              output += key;
+              i = end + length;
               continue;
             }
           }
-    
           output += source.charAt(i);
           i += 1;
         }
-    
-        return { text: output, tokens: tokens };
+        return output;
       }
     
       function applyInlineMarkdown(text) {
-        var mathProtected = protectMathSegments(text);
-        var input = mathProtected.text;
+        var input = text;
         if (!input) return "";
     
         var inlineBreakTokens = [];
@@ -173,10 +200,10 @@ enum MathMarkdownRendererSource {
           return key;
         });
     
-        var inlineCodeTokens = [];
-        input = input.replace(/`([^`]+?)`/g, function(_, code) {
-          var key = "@@YBCODE" + inlineCodeTokens.length + "@@";
-          inlineCodeTokens.push("<code>" + escapeHtml(code) + "</code>");
+        var escapedTokens = [];
+        input = input.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\]\^_`{|}~\\])/g, function(_, character) {
+          var key = "@@YBESCAPED" + escapedTokens.length + "@@";
+          escapedTokens.push(escapeHtml(character));
           return key;
         });
     
@@ -219,19 +246,12 @@ enum MathMarkdownRendererSource {
           return bareLinkTokens[Number(index)] || "";
         });
     
-        output = output.replace(/@@YBCODE(\d+)@@/g, function(_, index) {
-          return inlineCodeTokens[Number(index)] || "";
+        output = output.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+        output = output.replace(/@@YBESCAPED(\d+)@@/g, function(_, index) {
+          return escapedTokens[Number(index)] || "";
         });
-    
         output = output.replace(/@@YBBR(\d+)@@/g, function(_, index) {
           return inlineBreakTokens[Number(index)] || "";
-        });
-    
-        output = output.replace(/@@YBMATH(\d+)@@/g, function(_, index) {
-          // MathJax reads TeX from text nodes. Returning the raw token here would
-          // re-enter the HTML parser when the caller assigns this string to
-          // innerHTML, allowing markup hidden inside math delimiters to execute.
-          return escapeHtml(mathProtected.tokens[Number(index)] || "");
         });
     
         return output;
@@ -326,14 +346,6 @@ enum MathMarkdownRendererSource {
         if (text.charAt(0) === "|") text = text.slice(1);
         if (text.charAt(text.length - 1) === "|") text = text.slice(0, -1);
     
-        var codeTokens = [];
-        text = text.replace(/(`+)([\s\S]*?)\1(?!`)/g, function(code) {
-          var key = "@@YBTABLECODE" + codeTokens.length + "@@";
-          codeTokens.push(code);
-          return key;
-        });
-        var math = protectMathSegments(text);
-        text = math.text;
         var cells = [];
         var segmentStart = 0;
         for (var i = 0; i < text.length; i += 1) {
@@ -345,9 +357,7 @@ enum MathMarkdownRendererSource {
         cells.push(text.slice(segmentStart));
     
         return cells.map(function(cell) {
-          return cell.replace(/\\\|/g, "|").trim()
-            .replace(/@@YBMATH(\d+)@@/g, function(_, index) { return math.tokens[Number(index)] || ""; })
-            .replace(/@@YBTABLECODE(\d+)@@/g, function(_, index) { return codeTokens[Number(index)] || ""; });
+          return cell.replace(/\\\|/g, "|").trim();
         });
       }
     
@@ -425,30 +435,8 @@ enum MathMarkdownRendererSource {
     
       function renderBlocks(input, context) {
         var source = String(input || "").replace(/\r\n?/g, "\n");
-        context = context || { codeBlocks: [], displayMath: [] };
-        var codeBlocks = context.codeBlocks;
-    
-        source = source.replace(/```([^\n`]*)\n([\s\S]*?)```/g, function(_, language, code) {
-          var key = "@@CODE_BLOCK_" + codeBlocks.length + "@@";
-          var langClass = String(language || "").trim();
-          var classAttr = langClass ? ' class="language-' + escapeAttr(langClass) + '"' : "";
-          codeBlocks.push(
-            "<div class=\"yamabiko-code-block\">" +
-              "<button type=\"button\" class=\"yamabiko-copy-button\">" + copyButtonLabel + "</button>" +
-              "<pre><code" + classAttr + ">" + escapeHtml(code) + "</code></pre>" +
-            "</div>"
-          );
-          return key;
-        });
-    
-        // Keep display TeX in one text node even when it contains blank lines.
-        // Fenced code has already been extracted, so it remains literal.
-        var displayMath = context.displayMath;
-        source = source.replace(/(^|\n)([ \t]*)(\\\[[\s\S]*?\\\]|\$\$[\s\S]*?\$\$)[ \t]*(?=\n|$)/g, function(_, prefix, indent, math) {
-          var key = "@@DISPLAY_MATH_" + displayMath.length + "@@";
-          displayMath.push("<p>" + escapeHtml(math) + "</p>");
-          return prefix + indent + key;
-        });
+        source = protectCodeSegments(source, context);
+        source = protectMathSegments(source, context);
     
         var lines = source.split("\n");
         var htmlParts = [];
@@ -472,17 +460,10 @@ enum MathMarkdownRendererSource {
             continue;
           }
     
-          if (/^@@DISPLAY_MATH_\d+@@$/.test(trimmed)) {
+          var protectedBlock = trimmed.match(/^@@YBPROTECTED(\d+)@@$/);
+          if (protectedBlock && context.tokens[Number(protectedBlock[1])] && context.tokens[Number(protectedBlock[1])].block) {
             flushParagraph();
-            htmlParts.push(displayMath[Number(trimmed.replace(/\D/g, ""))] || "");
-            i += 1;
-            continue;
-          }
-    
-          if (/^@@CODE_BLOCK_\d+@@$/.test(trimmed)) {
-            flushParagraph();
-            var codeIndex = Number(trimmed.replace(/\D/g, ""));
-            htmlParts.push(codeBlocks[codeIndex] || "");
+            htmlParts.push(trimmed);
             i += 1;
             continue;
           }
@@ -545,7 +526,12 @@ enum MathMarkdownRendererSource {
       }
     
       global.yamabikoRenderMarkdown = function(markdown) {
-        return renderBlocks(markdown);
+        var context = { tokens: [] };
+        var html = renderBlocks(markdown, context);
+        return html.replace(/@@YBPROTECTED(\d+)@@/g, function(match, index) {
+          var token = context.tokens[Number(index)];
+          return token ? token.html : match;
+        });
       };
     })(window);
     

@@ -440,6 +440,14 @@
 "Shortcuts: プロンプトを入力してください。" = "Enter a prompt.";
 "Shortcuts: モデル ID を入力してください。" = "Enter a model ID.";
 "Shortcuts: 不明なプロバイダです。" = "Unknown provider.";
+"Shortcuts: 推論エフォート" = "Reasoning Effort";
+"Shortcuts: 許可するツール" = "Allowed Tools";
+"Shortcuts: 許可するツール説明" = "App tools available for this run. If unset, the app settings are used; if empty, no app tools are used. Provider-side tools follow the provider settings.";
+"Shortcuts: ツール" = "Tool";
+"Shortcuts: Web 検索" = "Web Search";
+"Shortcuts: Python 実行" = "Python Execution";
+"Shortcuts: ファイル編集" = "File Editing";
+"Shortcuts: GenUI" = "GenUI";
 "Shortcuts: モデルに聞く説明" = "Send a prompt to a model and return the generated text without opening the app.";
 "Shortcuts: モデルに聞いて保存説明" = "Send a prompt to a model, return the text, and save it to a new chat.";
 "Shortcuts: モデルに聞く要約" = "Ask \(\.$prompt) with \(\.$provider) / \(\.$model)";
@@ -768,3 +776,10 @@
 "履歴を残す" = "Save history";
 
 "履歴を残さない" = "Do not save history";
+
+"会話" = "Conversations";
+"該当する会話がありません" = "No matching conversations";
+"検索を消去" = "Clear search";
+"外部サイトに接続しますか？" = "Connect to an external site?";
+"接続" = "Connect";
+"生成された表示から外部へ接続します。接続先のURLには会話の内容が含まれている可能性があります。" = "This generated view will connect to an external site. The destination URL may contain parts of your conversation.";

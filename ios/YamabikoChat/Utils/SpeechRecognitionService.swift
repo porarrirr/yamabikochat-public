@@ -62,18 +62,14 @@ final class SpeechRecognitionService: ObservableObject {
 
     var onTranscription: ((String) -> Void)?
 
-    private let audioEngine = AVAudioEngine()
+    private lazy var audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
-    private var speechRecognizer: SFSpeechRecognizer?
+    private lazy var speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
     private var pendingStartTask: Task<Void, Never>?
     private var hasInstalledInputTap = false
     private var sessionState = SpeechRecognitionSessionState()
     private var audioLevelHistory = SpeechAudioLevelHistory()
-
-    init() {
-        speechRecognizer = SFSpeechRecognizer(locale: Locale.current)
-    }
 
     func toggleRecording() {
         if isRecording || pendingStartTask != nil {
@@ -142,6 +138,11 @@ final class SpeechRecognitionService: ObservableObject {
             pendingStartTask?.cancel()
             pendingStartTask = nil
         }
+
+        // Keyboard sends also call stopRecording. Do not initialize audio hardware
+        // or synchronously deactivate an audio session we never started.
+        // Pending permission requests must still be cancelled above this guard.
+        guard sessionState.activeID != nil else { return }
 
         // Invalidate the session before cancelling. SFSpeechRecognizer can report
         // cancellation as "No speech detected" even after partial text was delivered.

@@ -213,6 +213,21 @@ final class PiAgentGatewayTests: XCTestCase {
         }
     }
 
+    func testPlamoUsesPiWithDedicatedCredentialAndExactModelIDs() async throws {
+        let database = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(database)
+        let credentials = PiGatewayCredentialStore()
+        try credentials.setCredential("plamo-key", for: .plamo)
+        let pi = PiStreamSpy()
+        let gateway = ProviderGateway(settingsRepository: SettingsRepository(dbQueue: database), credentialStore: credentials, piStream: pi.stream)
+        for id in ["plamo-3.0-prime", "plamo-3.1-prime"] {
+            _ = try await gateway.generate(request: ProviderRequest(model: id, messages: []), provider: .plamo)
+            XCTAssertEqual(pi.calls.last?.configuration.provider, "plamo")
+            XCTAssertEqual(pi.calls.last?.configuration.model, id)
+            XCTAssertEqual(pi.calls.last?.configuration.apiKey, "plamo-key")
+        }
+    }
+
     func testSarashinaUsesPiWithDedicatedCredential() async throws {
         let database = try DatabaseQueue()
         try AppDatabase.migrator.migrate(database)
@@ -220,7 +235,7 @@ final class PiAgentGatewayTests: XCTestCase {
         try credentials.setCredential("sarashina-key", for: .sarashina)
         let pi = PiStreamSpy()
         let gateway = ProviderGateway(settingsRepository: SettingsRepository(dbQueue: database), credentialStore: credentials, piStream: pi.stream)
-        for id in ["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"] {
+        for id in ["sarashina3.2-mini-thinking", "sarashina3-mini", "sarashina3-nano", "sarashina3-guard"] {
             _ = try await gateway.generate(request: ProviderRequest(model: id, messages: []), provider: .sarashina)
             XCTAssertEqual(pi.calls.last?.configuration.provider, "sarashina")
             XCTAssertEqual(pi.calls.last?.configuration.model, id)
@@ -617,7 +632,7 @@ final class PiAgentGatewayTests: XCTestCase {
         let headers = try XCTUnwrap(pi.calls.first?.configuration.headers)
         XCTAssertEqual(
             headers["HTTP-Referer"],
-            "https://porarrirr.github.io/yamabikochat/"
+            "https://github.com/porarrirr/yamabikochat-public"
         )
         XCTAssertEqual(headers["X-OpenRouter-Title"], "yamabikochat")
         XCTAssertEqual(headers["X-Title"], "yamabikochat")
@@ -779,7 +794,7 @@ final class PiAgentGatewayTests: XCTestCase {
                 providerID == "openrouter" ? ProviderGateway.openRouterAttributionHeaders : [:]
             )
             if providerID == "openrouter" {
-                XCTAssertEqual(configuration.headers["HTTP-Referer"], "https://porarrirr.github.io/yamabikochat/")
+                XCTAssertEqual(configuration.headers["HTTP-Referer"], "https://github.com/porarrirr/yamabikochat-public")
                 XCTAssertEqual(configuration.headers["X-OpenRouter-Title"], "yamabikochat")
                 XCTAssertEqual(configuration.headers["X-Title"], "yamabikochat")
             }

@@ -40,7 +40,8 @@ enum ProviderCatalog {
         ProviderDisplay(key: "SUPERGROK", title: "xAI"),
         ProviderDisplay(key: "APPLE_INTELLIGENCE", title: "Apple Intelligence"),
         ProviderDisplay(key: "OPENAI_COMPAT", title: "Custom Endpoint"),
-        ProviderDisplay(key: "SARASHINA", title: "Sarashina")
+        ProviderDisplay(key: "SARASHINA", title: "Sarashina"),
+        ProviderDisplay(key: "PLAMO", title: "PLaMo")
     ]
 
     /// All built-in providers can be configured in dual mode and auto conversation.
@@ -68,6 +69,7 @@ enum ProviderCatalog {
         case "ZAI": ZAICodingPlanModelCatalog.defaultModel
         case "MINIMAX": "MiniMax-M2.1"
         case "SARASHINA": "sarashina3-mini"
+        case "PLAMO": "plamo-3.1-prime"
         case "OPENAI": "gpt-4.1-mini"
         case "CODEX_AUTH": CodexModelCatalog.defaultModel()
         case "APPLE_INTELLIGENCE": AppleIntelligenceModelCatalog.displayModel
@@ -77,7 +79,8 @@ enum ProviderCatalog {
 
     static func constrainedModelIDs(for provider: String) -> [String]? {
         switch provider.uppercased() {
-        case "SARASHINA": ["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"]
+        case "SARASHINA": ["sarashina3.2-mini-thinking", "sarashina3-mini", "sarashina3-nano", "sarashina3-guard"]
+        case "PLAMO": ["plamo-3.0-prime", "plamo-3.1-prime"]
         case "OPENCODE_GO": OpenCodeGoModelCatalog.supportedModels.map(\.id)
         case "CLINEPASS": ClinePassModelCatalog.supportedModels.map(\.id)
         case "ALIBABA_CODING_PLAN": AlibabaCodingPlanModelCatalog.supportedModels

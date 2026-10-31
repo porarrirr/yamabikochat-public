@@ -116,7 +116,7 @@ const CHATGPT_CALLBACK_HTML = `<!doctype html>
 </html>`;
 
 function chatGPTCallbackHTML(userAgent = "") {
-  // iPad Safari can identify as Macintosh. Android has no registered app scheme.
+  // iPad Safari can identify as Macintosh.
   const supportsAppReturn = /iPhone|iPad|iPod|Macintosh/.test(userAgent);
   // This fixed link only foregrounds iOS; credentials still resolve through Pi.
   return CHATGPT_CALLBACK_HTML.replace("<!-- APP_RETURN_LINK -->", supportsAppReturn

@@ -347,25 +347,33 @@ enum NativeMarkdownParser {
     }
 
     private static func containsMath(_ value: String) -> Bool {
-        var mathSource = ""
-        _ = MathMarkdownNormalizer.transformOutsideCode(value) { segment in
-            mathSource += segment
+        let normalized = MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(value)
+        var containsMath = false
+        _ = MathMarkdownNormalizer.transformOutsideCode(normalized) { segment in
+            if segment.utf8.contains(0x24) || segment.utf8.contains(0x5C) {
+                containsMath = containsMath
+                    || inlineMathRegex.firstMatch(in: segment, range: NSRange(segment.startIndex..., in: segment)) != nil
+                    || hasOrderedPair(opening: "$$", closing: "$$", in: segment)
+                    || hasOrderedPair(opening: #"\["#, closing: #"\]"#, in: segment)
+                    || hasOrderedPair(opening: #"\("#, closing: #"\)"#, in: segment)
+            }
             return segment
         }
-        return containsMathOutsideCode(mathSource)
-    }
-
-    private static func containsMathOutsideCode(_ value: String) -> Bool {
-        guard value.utf8.contains(0x24) || value.utf8.contains(0x5C) else { return false }
-        return hasOrderedPair(opening: "$$", closing: "$$", in: value)
-            || inlineMathRegex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-            || hasOrderedPair(opening: "\\[", closing: "\\]", in: value)
-            || hasOrderedPair(opening: "\\(", closing: "\\)", in: value)
+        return containsMath
     }
 
     private static func hasOrderedPair(opening: String, closing: String, in value: String) -> Bool {
-        guard let openingRange = value.range(of: opening) else { return false }
-        return value[openingRange.upperBound...].range(of: closing) != nil
+        func nextUnescapedRange(of delimiter: String, from start: String.Index) -> Range<String.Index>? {
+            var cursor = start
+            while let range = value.range(of: delimiter, range: cursor..<value.endIndex) {
+                let slashes = value[..<range.lowerBound].reversed().prefix { $0 == "\\" }.count
+                if slashes.isMultiple(of: 2) { return range }
+                cursor = range.upperBound
+            }
+            return nil
+        }
+        guard let openingRange = nextUnescapedRange(of: opening, from: value.startIndex) else { return false }
+        return nextUnescapedRange(of: closing, from: openingRange.upperBound) != nil
     }
 
     private static func flattenInlineText(_ markup: Markup) -> AttributedString {
@@ -1161,7 +1169,7 @@ enum ChatTextSelectionPolicy {
 }
 
 private extension NSAttributedString.Key {
-    static let yamabikoQuoteDepth = NSAttributedString.Key("com.porarri.yamabikochat.quote-depth")
+    static let yamabikoQuoteDepth = NSAttributedString.Key("org.example.yamabikochat.quote-depth")
 }
 
 final class SelectableChatTextView: UITextView {

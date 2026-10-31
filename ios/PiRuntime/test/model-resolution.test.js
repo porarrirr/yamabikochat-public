@@ -505,15 +505,15 @@ test("bundled runtime resolves every explicit custom protocol and both Sarashina
   const custom = { name: "Local", modelId: "custom-model", baseUrl: "https://custom.example/v1", contextWindow: 128000, maxTokens: 4096, reasoning: true, reasoningEffort: "high", toolCall: true, vision: true, maxTokensField: "max_tokens", supportsStore: false, supportsDeveloperRole: false, supportsUsageInStreaming: false };
   const protocols = ["anthropic-messages", "openai-completions", "openai-responses", "google-generative-ai", "mistral-conversations"];
   const configs = protocols.map(protocol => ({ contractVersion: 2, provider: "yamabiko-custom", model: custom.modelId, customEndpoint: { ...custom, protocol } }));
-  for (const model of ["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"]) {
+  for (const model of ["sarashina3.2-mini-thinking", "sarashina3-mini", "sarashina3-nano", "sarashina3-guard"]) {
     configs.push({ contractVersion: 2, provider: "sarashina", model });
     configs.push({ contractVersion: 2, provider: "sarashina", model, catalogContract: { npm: "@ai-sdk/openai-compatible", api: "https://api.sarashina.ai/v1", shape: "chat-completions", provenance: "model", toolCall: model !== "sarashina3-guard" } });
   }
   configs.push({ contractVersion: 2, provider: "yamabiko-custom", model: custom.modelId, customEndpoint: { ...custom, protocol: "" } });
   const result = await resolveModels(baseURL, token, configs);
   protocols.forEach((protocol, index) => { assert.equal(result.models[index].supported, true); assert.equal(result.models[index].api, protocol); assert.equal(result.models[index].source, "user_configured"); });
-  for (const resolution of result.models.slice(protocols.length, protocols.length + 6)) { assert.equal(resolution.supported, true); assert.equal(resolution.api, "openai-completions"); assert.equal(resolution.source, "verified_official_contract"); assert.equal(resolution.maxTokens, 8000); }
-  assert.equal(result.models[protocols.length + 6].reason, "custom_protocol_required");
+  for (const resolution of result.models.slice(protocols.length, protocols.length + 8)) { assert.equal(resolution.supported, true); assert.equal(resolution.api, "openai-completions"); assert.equal(resolution.source, "verified_official_contract"); assert.equal(resolution.maxTokens, 8000); }
+  assert.equal(result.models[protocols.length + 8].reason, "custom_protocol_required");
 });
 
 
@@ -560,4 +560,32 @@ test("bundled runtime resolves verified provider routes and preserves built-ins 
     const restored = await resolveModels(baseURL, token, models.map(m => ({ contractVersion: 2, provider: provider.id, model: m.id })));
     assert.deepEqual(restored.models.map(m => [m.supported, m.api]), models.map(m => [true, m.api]), provider.id);
   }
+});
+
+
+test("bundled runtime resolves all official PLaMo models and rejects background-only research", async context => {
+  const port = await availablePort(), token = "plamo-resolution-test";
+  const child = spawn(process.execPath, [new URL("../bundle/main.js", import.meta.url).pathname, String(port), token]);
+  context.after(() => child.kill());
+  const baseURL = `http://127.0.0.1:${port}`;
+  await waitUntilReady(baseURL, token);
+  const configs = ["plamo-3.0-prime", "plamo-3.1-prime"].flatMap(model => [
+    { contractVersion: 2, provider: "plamo", model },
+    { contractVersion: 2, provider: "plamo", model, catalogContract: {
+      npm: "@ai-sdk/openai-compatible", api: "https://api.platform.preferredai.jp/v1", shape: "chat-completions",
+      provenance: "model", reasoning: true, input: ["text"], contextWindow: 262144, maxTokens: 20480, toolCall: true
+    } }
+  ]);
+  configs.push({ contractVersion: 2, provider: "plamo", model: "plamo-3.1-prime-deep-research" });
+  const result = await resolveModels(baseURL, token, configs);
+  result.models.slice(0, 4).forEach((resolution, index) => {
+    assert.equal(resolution.supported, true, JSON.stringify(resolution));
+    assert.equal(resolution.model, configs[index].model);
+    assert.equal(resolution.provider, "plamo");
+    assert.equal(resolution.api, "openai-completions");
+    assert.equal(resolution.source, "verified_official_contract");
+    assert.deepEqual(resolution.supportedThinkingLevels, ["off", "medium"]);
+  });
+  assert.equal(result.models[4].supported, false);
+  assert.equal(result.models[4].reason, "plamo_background_jobs_unsupported");
 });

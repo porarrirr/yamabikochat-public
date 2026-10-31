@@ -8,6 +8,10 @@ cache_tool="$ios_dir/scripts/build-cache.py"
 release="$ios_dir/node-mobile-release.json"
 license="$ios_dir/../third_party/nodejs-mobile/LICENSE"
 stamp="$vendor_dir/node-mobile-cache.json"
+if [[ ! -f "$release" ]]; then
+  echo "error: missing ios/node-mobile-release.json; see README.md for the verified runtime manifest requirements" >&2
+  exit 1
+fi
 read -r node_version archive_url archive_sha256 < <(python3 - "$release" <<'PY'
 import json, re, sys
 with open(sys.argv[1]) as source:

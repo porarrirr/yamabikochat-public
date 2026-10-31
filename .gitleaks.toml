@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+# Session cache keys are fixed fixture identifiers, not authentication keys.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''(^|/)ios/YamabikoTests/PCCSessionStoreTests\.swift$''']
+regexTarget = "secret"
+regexes = ['''^conversation-[12]$''']

@@ -1,7 +1,6 @@
 import Foundation
 
 enum GeminiModelCatalog {
-    // Keep this list aligned with Android ModelUtils reference models.
     static let suggestedModels: [String] = [
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",

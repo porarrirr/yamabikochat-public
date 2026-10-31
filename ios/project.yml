@@ -1,5 +1,4 @@
 name: YamabikoChat
-author: porarri
 options:
   minimumXcodeGenVersion: 2.40.0
   deploymentTarget:
@@ -75,7 +74,7 @@ targets:
         excludes:
           - Info.plist
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.porarri.yamabikochat.ios
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.yamabikochat.ios
       INFOPLIST_FILE: $(BUILD_DIR)/YamabikoBuildMetadata/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/App-Info.plist
       DEVELOPMENT_LANGUAGE: en
       CODE_SIGN_ENTITLEMENTS: YamabikoChat/App/Resources/YamabikoChat.entitlements
@@ -151,7 +150,7 @@ targets:
       - path: YamabikoShareExtension/fr.lproj
       - path: YamabikoShareExtension/zh-Hans.lproj
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.porarri.yamabikochat.ios.share
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.yamabikochat.ios.share
       INFOPLIST_FILE: $(BUILD_DIR)/YamabikoBuildMetadata/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)/ShareExtension-Info.plist
       CODE_SIGN_ENTITLEMENTS: YamabikoShareExtension/YamabikoShareExtension.entitlements
       CODE_SIGN_STYLE: Automatic
@@ -167,8 +166,9 @@ targets:
       - path: PiRuntime/src/pcc-subagent-schema.json
         buildPhase: resources
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.porarri.yamabikochat.ios.tests
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.yamabikochat.ios.tests
       GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_NSPrincipalClass: YamabikoTestObserver
       CODE_SIGN_STYLE: Automatic
     dependencies:
       - target: YamabikoChat
@@ -179,7 +179,7 @@ targets:
     sources:
       - path: YamabikoUITests
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.porarri.yamabikochat.ios.uitests
+      PRODUCT_BUNDLE_IDENTIFIER: org.example.yamabikochat.ios.uitests
       GENERATE_INFOPLIST_FILE: YES
     dependencies:
       - target: YamabikoChat

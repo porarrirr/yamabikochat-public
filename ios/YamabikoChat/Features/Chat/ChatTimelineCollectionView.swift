@@ -142,33 +142,46 @@ final class ChatTimelineViewController: UIViewController, UICollectionViewDelega
             cell.onMeasuredContentHeightChange = { [weak self] height in
                 self?.applyMeasuredCellHeight(height, rowID: id)
             }
-            cell.contentConfiguration = UIHostingConfiguration {
-                ChatTimelineRowView(
-                    store: row,
-                    regeneratableMessageID: self.regeneratableMessageID,
-                    dualSplitLayout: self.dualSplitLayout,
-                    dualSplitRatio: self.dualSplitRatio,
-                    onRoute: self.onRoute,
-                    onPreviousVariant: self.onPreviousVariant,
-                    onNextVariant: self.onNextVariant,
-                    onBranch: self.onBranch,
-                    onRegenerate: self.onRegenerate,
-                    onAskChatWithSelection: self.onAskChatWithSelection,
-                    onGenUINewTurn: self.onGenUINewTurn,
-                    onEditUserMessage: self.onEditUserMessage,
-                    onSelectUserMessageText: self.onSelectUserMessageText,
-                    onSelectDualSide: { [weak self] side in self?.onSelectDualSide(side) },
-                    onIntrinsicHeightChange: { [weak self] height in
-                        self?.applyIntrinsicHeight(height, rowID: id)
-                    },
-                    onContentLayoutChange: { [weak self] in
-                        self?.remeasureRow(rowID: id)
-                    }
-                )
-                .id(row.id)
-                .environment(\.markdownPresentationCache, row.markdownPresentationCache)
+            if case let .message(message) = row.item,
+               message.message.role == "user", message.displayAttachmentsJSON == "[]" {
+                // Text-only user messages need neither assistant rendering nor
+                // asynchronous attachment layout and preview infrastructure.
+                cell.contentConfiguration = UIHostingConfiguration {
+                    ChatTimelineUserTextRow(store: row,
+                                            onEditUserMessage: self.onEditUserMessage,
+                                            onSelectUserMessageText: self.onSelectUserMessageText)
+                        .id(row.id)
+                }
+                .margins(.all, 0)
+            } else {
+                cell.contentConfiguration = UIHostingConfiguration {
+                    ChatTimelineRowView(
+                        store: row,
+                        regeneratableMessageID: self.regeneratableMessageID,
+                        dualSplitLayout: self.dualSplitLayout,
+                        dualSplitRatio: self.dualSplitRatio,
+                        onRoute: self.onRoute,
+                        onPreviousVariant: self.onPreviousVariant,
+                        onNextVariant: self.onNextVariant,
+                        onBranch: self.onBranch,
+                        onRegenerate: self.onRegenerate,
+                        onAskChatWithSelection: self.onAskChatWithSelection,
+                        onGenUINewTurn: self.onGenUINewTurn,
+                        onEditUserMessage: self.onEditUserMessage,
+                        onSelectUserMessageText: self.onSelectUserMessageText,
+                        onSelectDualSide: { [weak self] side in self?.onSelectDualSide(side) },
+                        onIntrinsicHeightChange: { [weak self] height in
+                            self?.applyIntrinsicHeight(height, rowID: id)
+                        },
+                        onContentLayoutChange: { [weak self] in
+                            self?.remeasureRow(rowID: id)
+                        }
+                    )
+                    .id(row.id)
+                    .environment(\.markdownPresentationCache, row.markdownPresentationCache)
+                }
+                .margins(.all, 0)
             }
-            .margins(.all, 0)
             cell.requestContentHeightMeasurement()
             return cell
         }
@@ -1265,6 +1278,74 @@ private struct ChatTimelineTopPinnedLayout: Layout {
     }
 }
 
+private struct ChatUserMessageContent: View {
+    let text: String
+    let attachments: [ChatAttachmentItem]
+    var isReadOnly = false
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+
+    var body: some View {
+        HStack(alignment: .top) {
+            Spacer(minLength: 48)
+            VStack(alignment: .trailing, spacing: 8) {
+                if !attachments.isEmpty {
+                    MessageAttachmentList(attachments: attachments, isOutgoing: true)
+                }
+                if !text.isEmpty {
+                    Text(text)
+                        .font(.body)
+                        .lineSpacing(2)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 11)
+                        .background(Color(uiColor: .amoledSecondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                        .contextMenu {
+                            Button {
+                                UIPasteboard.general.string = text
+                            } label: {
+                                Label(L10n.text("コピーする"), systemImage: "doc.on.doc")
+                            }
+                            if !isReadOnly {
+                                Button {
+                                    onEditUserMessage(text)
+                                } label: {
+                                    Label(L10n.text("編集する"), systemImage: "pencil")
+                                }
+                            }
+                            if !isReadOnly {
+                                Button {
+                                    onSelectUserMessageText(text)
+                                } label: {
+                                    Label(L10n.text("テキストを選択する"), systemImage: "selection.pin.in.out")
+                                }
+                            }
+                        }
+                }
+            }
+            .frame(maxWidth: 520, alignment: .trailing)
+        }
+    }
+}
+
+private struct ChatTimelineUserTextRow: View {
+    @ObservedObject var store: ChatTimelineRowStore
+    let onEditUserMessage: (String) -> Void
+    let onSelectUserMessageText: (String) -> Void
+
+    var body: some View {
+        if case let .message(message) = store.item {
+            ChatUserMessageContent(text: message.displayText, attachments: [],
+                                   onEditUserMessage: onEditUserMessage,
+                                   onSelectUserMessageText: onSelectUserMessageText)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .transaction { $0.animation = nil }
+        }
+    }
+}
+
 struct ChatMessageRow: View {
     let message: FullChatMessage
     let streamingSnapshot: ChatStreamingSnapshot?
@@ -1318,46 +1399,9 @@ struct ChatMessageRow: View {
     var body: some View {
         Group {
             if isUser {
-                HStack(alignment: .top) {
-                    Spacer(minLength: 48)
-                    VStack(alignment: .trailing, spacing: 8) {
-                        if !attachmentItems.isEmpty {
-                            MessageAttachmentList(attachments: attachmentItems, isOutgoing: true)
-                        }
-                        if !responseText.isEmpty {
-                            Text(responseText)
-                                .font(.body)
-                                .lineSpacing(2)
-                                .textSelection(.enabled)
-                                .padding(.horizontal, 15)
-                                .padding(.vertical, 11)
-                                .background(Color(uiColor: .amoledSecondarySystemBackground))
-                                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                                .contextMenu {
-                                    Button {
-                                        UIPasteboard.general.string = responseText
-                                    } label: {
-                                        Label(L10n.text("コピーする"), systemImage: "doc.on.doc")
-                                    }
-                                    if !isReadOnly {
-                                        Button {
-                                            onEditUserMessage(responseText)
-                                        } label: {
-                                            Label(L10n.text("編集する"), systemImage: "pencil")
-                                        }
-                                    }
-                                    if !isReadOnly {
-                                        Button {
-                                            onSelectUserMessageText(responseText)
-                                        } label: {
-                                            Label(L10n.text("テキストを選択する"), systemImage: "selection.pin.in.out")
-                                        }
-                                    }
-                                }
-                        }
-                    }
-                    .frame(maxWidth: 520, alignment: .trailing)
-                }
+                ChatUserMessageContent(text: responseText, attachments: attachmentItems,
+                                       isReadOnly: isReadOnly, onEditUserMessage: onEditUserMessage,
+                                       onSelectUserMessageText: onSelectUserMessageText)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(rotationNotices) { notice in

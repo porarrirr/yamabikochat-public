@@ -482,7 +482,13 @@ final class ChatViewModel: ObservableObject {
         let runID = UUID()
         activeSendID = runID
 
+        timelineStore.showPendingUserMessage(
+            conversationID: conversationID, text: text,
+            attachments: attachmentDrafts.map { $0.url.path }
+        )
         activeSendTask = Task { [self] in
+            // Let SwiftUI present the submitted bubble before provider preparation.
+            await Task.yield()
             defer {
                 if self.activeSendID == runID {
                     self.clearStreamingState()
@@ -599,6 +605,7 @@ final class ChatViewModel: ObservableObject {
             startedAtMs: startedAtMs
         )) ?? false
         if !committed {
+            timelineStore.clearPendingUserMessage()
             restoreDraft(text: text, attachmentDrafts: attachmentDrafts)
         }
     }

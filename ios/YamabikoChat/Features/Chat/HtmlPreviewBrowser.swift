@@ -46,7 +46,6 @@ struct HtmlPreviewWebView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = YamabikoWebKitSupport.makeConfiguration()
-        configuration.websiteDataStore = WKWebsiteDataStore.nonPersistent()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
 
         let webView = WKWebView(frame: .zero, configuration: configuration)

@@ -1,3 +1,4 @@
+import "./transport-policy.js";
 import { PCC_PROVIDER, pccResolution, withPCCBridge, withPCCSubagentBridge, receivePCCEvent, executePCCTool } from "./pcc-provider.js";
 import { providerUsage, aggregateUsage as sumUsage } from "./usage-contract.js";
 import { createGenuiPreviewPublisher } from "./genui-preview.js";
@@ -19,21 +20,18 @@ import { sanitizePayload as sanitizeGrokPayload } from "pi-grok/sanitize.ts";
 import { providerErrorDetails } from "./provider-error.js";
 import { prepareSkillContext } from "./skill-context.js";
 import { createChatGPTPlanPlugin, CHATGPT_PLAN_PROVIDER, chatGPTPlanPayload, chatGPTPlanCompleted } from "./chatgpt-plan-plugin.js";
-import { installSarashinaProvider, sarashinaResolution } from "./sarashina-provider.js";
+import { installPlamoProvider, plamoResolution, plamoPayload } from "./plamo-provider.js";
+import { installSarashinaProvider, sarashinaResolution, sarashinaResponseFailure } from "./sarashina-provider.js";
 import { CUSTOM_PROVIDER, customProviderResolution, customStreamOptions } from "./custom-provider.js";
 import { installAzureProvider, azureCatalogResolution, azureExecutionModel, azureStreamOptions } from "./azure-provider.js";
 import { installCatalogProviderAdapters, verifiedCatalogResolution, verifiedExecutionModel, verifiedStreamOptions, catalogProviderEnvironment, verifiedCatalogModelSource } from "./catalog-provider-contracts.js";
 import { compactContext } from "./compaction.js";
 import { contextBreakdown } from "./context-breakdown.js";
 import { createMobileSubagentsHost } from "./subagents.js";
-import { credentialFetch, diagnosticRedactor, withCredentialSecurity } from "./credential-security.js";
+import { diagnosticRedactor, withCredentialSecurity } from "./credential-security.js";
 import { enforceExecutionPolicy } from "./execution-policy.js";
 import { authFailure } from "./auth-security.js";
 import { OAuthOperations } from "./oauth-operations.js";
-
-// Applies to Pi's SDKs as well as OAuth. In particular, the Google SDK uses the
-// global transport rather than Pi's optional per-request fetch hook.
-globalThis.fetch = credentialFetch(globalThis.fetch.bind(globalThis));
 
 const port = Number(process.argv[2]);
 const token = process.argv[3];
@@ -204,6 +202,7 @@ installVerifiedOpenCodeGoContracts();
 installCatalogProviderAdapters(runtimeModels);
 installSuperGrokProvider();
 installSarashinaProvider(runtimeModels);
+installPlamoProvider(runtimeModels);
 
 const AUTH_PROVIDER_IDS = {
   codex: "openai-codex",
@@ -708,6 +707,7 @@ function resolutionFor(config) {
   if (verified) return verified;
   if (config.provider === CUSTOM_PROVIDER) return customProviderResolution(config, runtimeModels);
   if (config.provider === "sarashina") return sarashinaResolution(config, runtimeModels);
+  if (config.provider === "plamo") return plamoResolution(config, runtimeModels);
   if (config.provider === CHATGPT_PLAN_PROVIDER) {
     const reason = chatGPTPlan.modelStatus(config.model);
     if (reason) return { supported: false, reason, provider: config.provider, model: config.model };
@@ -1027,7 +1027,7 @@ function mutatePayload(payload, request, config) {
       value.tools = [...(value.tools || []), toolset];
     }
   }
-  return value;
+  return config.provider === "plamo" ? plamoPayload(value, request, config) : value;
 }
 
 function timeoutMs(request) {
@@ -1204,6 +1204,8 @@ function finalResponse(assistants, contextUsage, generatedMessages = [], provide
       argumentsJSON: JSON.stringify(part.arguments || {}),
       providerMetadata: null
     })));
+  const sarashinaFailure = sarashinaResponseFailure(last);
+  if (sarashinaFailure) throw sarashinaFailure;
   if (!text && !reasoning && !toolCalls.length) {
     throw new Error(`Pi provider completed without content (stopReason=${last.stopReason || "unknown"})`);
   }
@@ -1462,7 +1464,7 @@ async function runAgent(envelope, res) {
         stepId: activeStep,
         timeMs: Date.now(),
         succeeded: config.provider === CHATGPT_PLAN_PROVIDER ? chatGPTPlanCompleted(event.message)
-          : event.message.stopReason !== "error" && event.message.stopReason !== "aborted" && !event.message.errorMessage,
+          : event.message.stopReason !== "error" && event.message.stopReason !== "aborted" && !event.message.errorMessage && !sarashinaResponseFailure(event.message),
         usage: providerUsage(event.message.usage)
       });
       activeStep = null;
@@ -1540,6 +1542,7 @@ async function runAgent(envelope, res) {
         startedAtMs,
         failure: {
           name: error?.name || "Error",
+          code: error?.code,
           message: error?.message || String(error)
         }
       })

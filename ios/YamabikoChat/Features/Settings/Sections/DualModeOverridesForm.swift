@@ -47,6 +47,21 @@ struct DualModeOverridesForm: View {
             modelsDevReasoningControls(model: catalogModel)
         } else {
             switch provider {
+            case "SARASHINA":
+                if model == "sarashina3.2-mini-thinking" {
+                    Picker(L10n.text("Reasoning Effort"), selection: reasoningEffortBinding) {
+                        Text(L10n.text("inherit")).tag("")
+                        ForEach(["low", "medium", "high"], id: \.self) { Text($0).tag($0) }
+                    }
+                }
+            case "PLAMO":
+                Picker(L10n.text("Reasoning Effort"), selection: reasoningEffortBinding) {
+                    Text(L10n.text("inherit")).tag("")
+                    Text("none").tag("none")
+                    Text("medium").tag("medium")
+                }
+                Toggle("Web Search", isOn: googleSearchBinding)
+                    .disabled(model != "plamo-3.1-prime")
             case "GEMINI":
                 geminiControls
             case "OPENROUTER":
@@ -250,12 +265,12 @@ struct DualModeOverridesForm: View {
         switch side {
         case .a:
             Binding(
-                get: { viewModel.settings.dualGoogleSearchEnabledA ?? viewModel.settings.geminiGoogleSearchEnabled },
+                get: { viewModel.settings.dualGoogleSearchEnabledA ?? (provider == "PLAMO" ? viewModel.settings.plamoWebSearchEnabled : viewModel.settings.geminiGoogleSearchEnabled) },
                 set: { viewModel.settings.dualGoogleSearchEnabledA = $0 }
             )
         case .b:
             Binding(
-                get: { viewModel.settings.dualGoogleSearchEnabledB ?? viewModel.settings.geminiGoogleSearchEnabled },
+                get: { viewModel.settings.dualGoogleSearchEnabledB ?? (provider == "PLAMO" ? viewModel.settings.plamoWebSearchEnabled : viewModel.settings.geminiGoogleSearchEnabled) },
                 set: { viewModel.settings.dualGoogleSearchEnabledB = $0 }
             )
         }

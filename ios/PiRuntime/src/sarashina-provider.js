@@ -4,20 +4,22 @@
 import { createProvider, envApiKeyAuth } from "@earendil-works/pi-ai";
 import { stream, streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 export const sarashinaModels = [
-  { id: "sarashina3-mini", contextWindow: 128000, toolCall: true },
-  { id: "sarashina3-nano", contextWindow: 128000, toolCall: true },
-  { id: "sarashina3-guard", contextWindow: 64000, toolCall: false }
+  { id: "sarashina3.2-mini-thinking", contextWindow: 128000, toolCall: true, reasoning: true },
+  { id: "sarashina3-mini", contextWindow: 128000, toolCall: true, reasoning: false },
+  { id: "sarashina3-nano", contextWindow: 128000, toolCall: true, reasoning: false },
+  { id: "sarashina3-guard", contextWindow: 64000, toolCall: false, reasoning: false }
 ];
 export function installSarashinaProvider(models) {
   models.setProvider(createProvider({
     id: "sarashina", name: "Sarashina",
     auth: { apiKey: envApiKeyAuth("Sarashina API key", ["SARASHINA_API_KEY"]) },
-    models: sarashinaModels.map(({ id, contextWindow }) => ({
+    models: sarashinaModels.map(({ id, contextWindow, reasoning }) => ({
       id, name: id, provider: "sarashina", api: "openai-completions",
-      baseUrl: "https://api.sarashina.ai/v1", reasoning: false, input: ["text"],
+      baseUrl: "https://api.sarashina.ai/v1", reasoning, input: ["text"],
       contextWindow, maxTokens: 8000,
+      ...(reasoning ? { thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null } } : {}),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: false,
+      compat: { supportsStore: false, supportsDeveloperRole: false, supportsReasoningEffort: reasoning,
         supportsUsageInStreaming: false, supportsStrictMode: false, maxTokensField: "max_completion_tokens" }
     })),
     api: { "openai-completions": { stream, streamSimple } }
@@ -35,8 +37,16 @@ export function sarashinaResolution(config, models) {
       (contract.input != null && JSON.stringify(contract.input) !== JSON.stringify(model.input)) ||
       (contract.contextWindow != null && contract.contextWindow !== model.contextWindow) ||
       (contract.maxTokens != null && contract.maxTokens !== model.maxTokens))) return failure("catalog_contract_conflict");
-  if (config.thinkingLevel && config.thinkingLevel !== "off") return failure("sarashina_reasoning_unsupported");
+  if (config.thinkingLevel && !(model.reasoning ? ["low", "medium", "high"] : ["off"]).includes(config.thinkingLevel)) return failure("sarashina_reasoning_unsupported");
   return { supported: true, provider: model.provider, model: model.id, api: model.api, source: "verified_official_contract",
-    reasoning: false, input: model.input, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+    reasoning: model.reasoning, input: model.input, contextWindow: model.contextWindow, maxTokens: model.maxTokens,
     toolCall: sarashinaModels.find((entry) => entry.id === model.id).toolCall && (contract ? contract.toolCall === true : true) };
+}
+
+export function sarashinaResponseFailure(message) {
+  if (message.provider !== "sarashina" || message.model !== "sarashina3.2-mini-thinking" || message.stopReason !== "length") return null;
+  if (message.content.some(part => (part.type === "text" && part.text.trim()) || part.type === "toolCall")) return null;
+  return Object.assign(new Error("Sarashina API reached its 8,000-token output limit, including thinking, before returning an answer. Lower Reasoning Effort to low or medium and retry."), {
+    code: "sarashina_output_limit_before_answer"
+  });
 }

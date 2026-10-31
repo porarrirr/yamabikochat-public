@@ -335,6 +335,10 @@
     const document = global.document,
         config = global.__GENUI_DOCUMENT__ || {};
     const saved = global.__GENUI_SAVED_STATE__ || {};
+    // Generated documents never reach the network. Remote images render only after
+    // the host fetched them with native user consent and returned data URLs (null = failed).
+    const externalImages = { ...(global.__GENUI_EXTERNAL_IMAGES__ || {}) },
+        pendingExternalImages = new Set();
     let state = { ...clone(config.state), ...clone(saved.bindings) },
         trusted = false,
         scheduled = false,
@@ -925,6 +929,31 @@
         el.textContent = message;
         return el;
     }
+    const localized = (ja, en) => (global.__GENUI_LOCALE__ === 'ja' ? ja : en);
+    function externalMediaButton(label, url, onClick) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'genui-external-media';
+        button.textContent = `${label} · ${new URL(url).hostname}`;
+        listen(button, 'click', (event) => action(onClick, null, event));
+        return button;
+    }
+    // Returns the data URL, or a placeholder whose tap asks the host to load every
+    // remote image of this document at once.
+    function externalImage(url) {
+        const loaded = externalImages[url];
+        if (loaded) return { src: loaded };
+        if (loaded === null) return { element: missing(document.createElement('div'), 'Image unavailable') };
+        pendingExternalImages.add(url);
+        return {
+            element: externalMediaButton(localized('画像を表示', 'Show image'), url, () =>
+                guarded('loadExternalImages', { urls: [...pendingExternalImages] }),
+            ),
+        };
+    }
+    function externalMediaLink(url) {
+        return externalMediaButton(localized('メディアを開く', 'Open media'), url, () => GenUI.openUrl(url));
+    }
     const referenceTokens = global.__GENUI_WIDGET_TOKENS__ || {};
     const paletteKeys = new Set(Object.keys(referenceTokens.LIGHT_COLOR_PALETTE || {}));
     const tokenStyle = document.createElement('style');
@@ -1334,12 +1363,14 @@
                     }
                     if (token.type === 'image') {
                         const url = safeURL(token.attrGet('src'));
-                        if (!plain && url) {
+                        const remote = !plain && url ? externalImage(url) : null;
+                        if (remote?.src) {
                             const image = document.createElement('img');
-                            image.src = url;
+                            image.src = remote.src;
                             image.alt = token.content;
                             parent.append(image);
-                        } else parent.append(document.createTextNode(token.content));
+                        } else if (remote) parent.append(remote.element);
+                        else parent.append(document.createTextNode(token.content));
                         continue;
                     }
                     if (['fence', 'code_block'].includes(token.type)) {
@@ -1541,34 +1572,8 @@
             el.className = 'genui-audio-player';
             if (p.title) el.append(node(h('text', { strong: true }, p.title), path + '.title'));
             if (p.subtitle) el.append(node(h('caption', {}, p.subtitle), path + '.subtitle'));
-            const audio = document.createElement('audio');
-            audio.src = url;
-            audio.controls = true;
-            audio.loop = !!p.loop;
-            audio.muted = !!p.muted;
-            audio.preload = p.preload || 'metadata';
-            audio.playbackRate = p.defaultPlaybackRate || 1;
-            if (p.initialCurrentTimeSeconds)
-                listen(audio, 'loadedmetadata', () => {
-                    audio.currentTime = p.initialCurrentTimeSeconds;
-                });
-            if (p.autoPlay) listen(audio, 'canplay', () => audio.play?.().catch(() => {}));
-            el.append(audio);
-            if (p.playbackRates?.length)
-                el.append(
-                    node(
-                        h('select', {
-                            ariaLabel: 'Playback speed',
-                            value: p.defaultPlaybackRate || 1,
-                            options: p.playbackRates.map((value) => ({
-                                value,
-                                label: value + '×',
-                            })),
-                            onChange: (value) => (audio.playbackRate = Number(value)),
-                        }),
-                        path + '.speed',
-                    ),
-                );
+            // Remote audio opens outside the canvas only after native consent.
+            el.append(externalMediaLink(url));
             if (p.downloadUrl)
                 el.append(
                     node(
@@ -1842,10 +1847,11 @@
             return el;
         }
         if (type === 'lottie') {
-            if (!global.lottie) return missing(el, 'Animation player failed to load');
             const data = p.animationData || p.data,
                 url = safeURL(p.src || p.url);
             if (!data && !url) return missing(el, p.fallback || 'Animation data is missing');
+            if (!data) return missing(el, p.fallback || 'Remote animation files are not loaded; embed animationData');
+            if (!global.lottie) return missing(el, 'Animation player failed to load');
             el.className = 'genui-lottie';
             el.dataset.nodePath = path;
             el.__animationKey = JSON.stringify([data, url, p.loop, p.autoplay]);
@@ -1865,7 +1871,7 @@
                     autoplay:
                         p.autoplay !== false &&
                         !global.matchMedia?.('(prefers-reduced-motion: reduce)').matches,
-                    ...(data ? { animationData: clone(data) } : { path: url }),
+                    animationData: clone(data),
                 });
                 target.__animation = animation;
                 animation.addEventListener('data_failed', () =>
@@ -2181,6 +2187,11 @@
         if (type === 'favicon') {
             const r = resource(p.url);
             const src = safeURL(r?.src || r?.url);
+            // Favicons load with the document's other images instead of adding placeholders.
+            if (src && !externalImages[src]) {
+                if (!Object.hasOwn(externalImages, src)) pendingExternalImages.add(src);
+                return el;
+            }
             return src
                 ? node(
                       h('AsyncImage', {
@@ -2201,28 +2212,29 @@
                     el,
                     p.fallback || `Media unavailable${p.query ? ': ' + p.query : ''}`,
                 );
-            if (type === 'AsyncImage') {
-                el = document.createElement('img');
-                el.className = 'genui-AsyncImage';
-                style(el, p, type);
-                el.alt = p.alt || r?.title || '';
-                el.style.objectFit = p.fit || 'cover';
-                el.loading = 'lazy';
-                if (p.frame) {
-                    el.style.border = '1px solid var(--border)';
-                    el.style.padding = '4px';
-                }
-                if (p.group) el.dataset.group = String(p.group);
-                listen(el, 'error', () => {
-                    el.replaceWith(
-                        missing(document.createElement('div'), p.fallback || 'Image unavailable'),
-                    );
-                });
-            } else {
-                el.controls = true;
-                el.preload = 'metadata';
+            if (type === 'AsyncVideo') return externalMediaLink(url);
+            const remote = externalImage(url);
+            if (remote.element) {
+                style(remote.element, p, type);
+                return remote.element;
             }
-            el.src = url;
+            el = document.createElement('img');
+            el.className = 'genui-AsyncImage';
+            style(el, p, type);
+            el.alt = p.alt || r?.title || '';
+            el.style.objectFit = p.fit || 'cover';
+            el.loading = 'lazy';
+            if (p.frame) {
+                el.style.border = '1px solid var(--border)';
+                el.style.padding = '4px';
+            }
+            if (p.group) el.dataset.group = String(p.group);
+            listen(el, 'error', () => {
+                el.replaceWith(
+                    missing(document.createElement('div'), p.fallback || 'Image unavailable'),
+                );
+            });
+            el.src = remote.src;
             return el;
         }
         if (type === 'AsyncImageGroup') {
@@ -3364,6 +3376,7 @@
             focusID = active?.dataset?.focusPath;
         maps.length = 0;
         videos.length = 0;
+        pendingExternalImages.clear();
         usedHooks.clear();
         renderScope = state;
         renderTheme = global.__GENUI_THEME__ || 'light';
@@ -3531,6 +3544,10 @@
             hooks.forEach((list) => list.forEach((s) => s.cleanup?.()));
             hooks.clear();
             stateSlots.length = 0;
+            queueRender();
+        },
+        setExternalImages(images) {
+            Object.assign(externalImages, images);
             queueRender();
         },
         setTheme(theme) {

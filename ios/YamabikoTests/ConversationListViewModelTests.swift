@@ -1,5 +1,6 @@
 import XCTest
 import GRDB
+import SwiftUI
 @testable import YamabikoChat
 
 private final class ConversationListTestCredentialStore: SecureCredentialStore {
@@ -116,6 +117,21 @@ final class ConversationListViewModelTests: XCTestCase {
         )
         XCTAssertFalse(
             RootNavigationPresentationPolicy.usesCompactColumnNavigation(horizontalSizeClass: nil)
+        )
+    }
+
+    func testSidebarVisibilityToggleHidesVisibleSidebarAndRestoresIt() {
+        XCTAssertEqual(
+            RootNavigationPresentationPolicy.toggledSidebarVisibility(.all),
+            .detailOnly
+        )
+        XCTAssertEqual(
+            RootNavigationPresentationPolicy.toggledSidebarVisibility(.doubleColumn),
+            .detailOnly
+        )
+        XCTAssertEqual(
+            RootNavigationPresentationPolicy.toggledSidebarVisibility(.detailOnly),
+            .all
         )
     }
 

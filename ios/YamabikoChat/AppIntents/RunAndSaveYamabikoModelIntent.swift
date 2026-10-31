@@ -10,7 +10,7 @@ struct RunAndSaveYamabikoModelIntent: AppIntent {
     var prompt: String
 
     @Parameter(title: LocalizedStringResource("Shortcuts: プロバイダ"))
-    var provider: ShortcutProviderAppEnum
+    var provider: ShortcutProviderEntity
 
     @Parameter(
         title: LocalizedStringResource("Shortcuts: モデル ID"),
@@ -23,6 +23,19 @@ struct RunAndSaveYamabikoModelIntent: AppIntent {
         default: nil
     )
     var systemPrompt: String?
+
+    @Parameter(
+        title: LocalizedStringResource("Shortcuts: 推論エフォート"),
+        optionsProvider: SaveShortcutReasoningEffortOptionsProvider()
+    )
+    var reasoningEffort: String?
+
+    @Parameter(
+        title: LocalizedStringResource("Shortcuts: 許可するツール"),
+        description: LocalizedStringResource("Shortcuts: 許可するツール説明"),
+        default: nil
+    )
+    var allowedTools: [ShortcutTool]?
 
     static var parameterSummary: some ParameterSummary {
         Summary("Shortcuts: モデルに聞いて保存要約") {
@@ -38,6 +51,8 @@ struct RunAndSaveYamabikoModelIntent: AppIntent {
             provider: provider,
             model: model,
             systemPrompt: systemPrompt,
+            reasoningEffort: reasoningEffort,
+            allowedTools: allowedTools.map(Set.init),
             saveToNewConversation: true
         )
     }

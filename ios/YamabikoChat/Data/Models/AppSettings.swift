@@ -222,6 +222,9 @@ struct AppSettings: Codable, FetchableRecord, MutablePersistableRecord, Equatabl
     var geminiThinkingEnabled: Bool
     var geminiThinkingBudget: Int
     var geminiThinkingLevel: String
+    var plamoWebSearchEnabled: Bool
+    var sarashinaReasoningEffort: String
+    var plamoReasoningEffort: String
     var geminiGoogleSearchEnabled: Bool
     var geminiCodeExecutionEnabled: Bool
     var geminiURLContextEnabled: Bool
@@ -371,6 +374,9 @@ struct AppSettings: Codable, FetchableRecord, MutablePersistableRecord, Equatabl
         geminiThinkingEnabled = false
         geminiThinkingBudget = 0
         geminiThinkingLevel = ""
+        plamoWebSearchEnabled = false
+        sarashinaReasoningEffort = "medium"
+        plamoReasoningEffort = "none"
         geminiGoogleSearchEnabled = false
         geminiCodeExecutionEnabled = false
         geminiURLContextEnabled = false
@@ -551,6 +557,11 @@ struct AppSettings: Codable, FetchableRecord, MutablePersistableRecord, Equatabl
         normalized.setVisibleChatStatsFields(normalized.visibleChatStatsFields())
         if normalized.apiProvider.caseInsensitiveCompare("GEMINI") == .orderedSame,
            normalized.hasEnabledGeminiTool {
+            normalized.disableClientTools()
+        }
+        if normalized.apiProvider.caseInsensitiveCompare("PLAMO") == .orderedSame,
+           normalized.defaultModel == "plamo-3.1-prime",
+           normalized.plamoWebSearchEnabled {
             normalized.disableClientTools()
         }
         if normalized.isDualModeEnabled {

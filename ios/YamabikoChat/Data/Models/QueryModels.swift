@@ -10,6 +10,14 @@ struct ConversationListEntry: Identifiable, Equatable {
     var projectTitle: String?
 }
 
+/// The only conversation shape Siri, Shortcuts and Spotlight receive: no message
+/// content and never a secret conversation.
+struct ExternalConversationSummary: Equatable {
+    let id: Int64
+    let title: String
+    let updatedAtMs: Int64
+}
+
 struct ProjectListEntry: Identifiable, Equatable {
     var id: Int64
     var title: String

@@ -20,6 +20,7 @@ struct ProjectDetailScreen: View {
 
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.windowControlsLeadingInset) private var windowControlsLeadingInset
     @ObservedObject var viewModel: ConversationListViewModel
     let projectId: Int64
     var onBack: () -> Void
@@ -227,6 +228,7 @@ struct ProjectDetailScreen: View {
             }
         }
         .padding(.horizontal, 16)
+        .padding(.leading, windowControlsLeadingInset)
         .padding(.top, 8)
         .padding(.bottom, 10)
     }

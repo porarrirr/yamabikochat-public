@@ -21,10 +21,9 @@ struct ConversationEntity: AppEntity {
         self.updatedAt = updatedAt
     }
 
-    init?(_ conversation: Conversation) {
-        guard let id = conversation.id, !conversation.isSecret else { return nil }
-        self.init(id: id, title: conversation.title,
-                  updatedAt: Date(timeIntervalSince1970: Double(conversation.updatedAtMs) / 1000))
+    init(_ summary: ExternalConversationSummary) {
+        self.init(id: summary.id, title: summary.title,
+                  updatedAt: Date(timeIntervalSince1970: Double(summary.updatedAtMs) / 1000))
     }
 }
 
@@ -34,7 +33,7 @@ struct ConversationEntityQuery: EntityStringQuery {
         var found: [Int: ConversationEntity] = [:]
         for start in stride(from: 0, to: identifiers.count, by: 500) {
             let chunk = Array(identifiers[start..<min(start + 500, identifiers.count)])
-            for entity in try repository.siriConversations(ids: chunk.map(Int64.init), limit: 500).compactMap(ConversationEntity.init) {
+            for entity in try repository.externalConversationSummaries(ids: chunk.map(Int64.init), limit: 500).map(ConversationEntity.init) {
                 found[entity.id] = entity
             }
         }
@@ -42,13 +41,13 @@ struct ConversationEntityQuery: EntityStringQuery {
     }
 
     func entities(matching string: String) async throws -> [ConversationEntity] {
-        try AppServices.resolve().conversationRepository.siriConversations(matching: string)
-            .compactMap(ConversationEntity.init)
+        try AppServices.resolve().conversationRepository.externalConversationSummaries(matching: string)
+            .map(ConversationEntity.init)
     }
 
     func suggestedEntities() async throws -> [ConversationEntity] {
-        try AppServices.resolve().conversationRepository.siriConversations(limit: 10)
-            .compactMap(ConversationEntity.init)
+        try AppServices.resolve().conversationRepository.externalConversationSummaries(limit: 10)
+            .map(ConversationEntity.init)
     }
 }
 

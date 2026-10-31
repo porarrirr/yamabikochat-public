@@ -73,10 +73,16 @@ final class ShortcutModelOptionsTests: XCTestCase {
         XCTAssertEqual(options, AppleIntelligenceModelCatalog.supportedModels)
     }
 
-    func testProviderOptionsIncludeAppleIntelligence() {
-        let options = ShortcutModelOptionsBuilder.providerOptions()
-        XCTAssertTrue(options.contains(where: { $0.key == "APPLE_INTELLIGENCE" }))
-        XCTAssertEqual(options.count, ProviderCatalog.options.count)
+    func testProviderOptionsMirrorBuiltInsAndSelectableModelsDevProviders() {
+        let options = ShortcutModelOptionsBuilder.providerOptions(catalogProviders: [
+            Self.catalogProvider(id: "opencode-go", name: "OpenCode Go", modelIDs: ["beam-free"]),
+            Self.catalogProvider(id: "google", name: "Google", modelIDs: ["gemini-2.5-flash"])
+        ])
+
+        XCTAssertEqual(Array(options.prefix(ProviderCatalog.options.count)), ProviderCatalog.options)
+        XCTAssertTrue(options.contains(ProviderDisplay(key: "MODELS_DEV:opencode-go", title: "OpenCode Go")))
+        XCTAssertFalse(options.contains(where: { $0.key == "MODELS_DEV:google" }))
+        XCTAssertFalse(options.contains(where: { $0.key == "OPENCODE_GO" }))
     }
 
     func testCodexOptionsIncludeOnlySupportedAccountCatalogModels() {
@@ -107,15 +113,40 @@ final class ShortcutModelOptionsTests: XCTestCase {
         XCTAssertFalse(options.contains("gpt-6.1-sol"))
     }
 
-    func testOpenCodeGoOptionsIncludeCatalogModels() {
-        let settings = AppSettings()
+    func testModelsDevOptionsIncludeSavedModelAndCatalogModels() {
+        var settings = AppSettings()
+        settings.apiProvider = "MODELS_DEV:opencode-go"
+        settings.defaultModel = "beam-free"
         let options = ShortcutModelOptionsBuilder.modelOptions(
-            provider: "OPENCODE_GO",
+            provider: "MODELS_DEV:opencode-go",
             settings: settings,
-            openRouterModels: []
+            openRouterModels: [],
+            catalogProvider: Self.catalogProvider(id: "opencode-go", name: "OpenCode Go", modelIDs: ["glm-5.3", "beam-free"])
         )
 
-        XCTAssertTrue(options.contains(OpenCodeGoModelCatalog.defaultModel))
-        XCTAssertTrue(options.contains("deepseek-v4-flash"))
+        XCTAssertEqual(options, ["beam-free", "glm-5.3"])
+    }
+
+    static func catalogProvider(id: String, name: String, modelIDs: [String]) -> CatalogProvider {
+        CatalogProvider(
+            id: id,
+            name: name,
+            npm: "@ai-sdk/openai-compatible",
+            env: [],
+            models: modelIDs.map { modelID in
+                CatalogModel(
+                    id: modelID,
+                    name: modelID,
+                    reasoningOptions: [],
+                    inputModalities: ["text"],
+                    outputModalities: ["text"],
+                    limits: CatalogLimits(context: nil, input: nil, output: nil),
+                    cost: CatalogCost(
+                        inputPerMillion: nil, outputPerMillion: nil, reasoningPerMillion: nil,
+                        cacheReadPerMillion: nil, cacheWritePerMillion: nil
+                    )
+                )
+            }
+        )
     }
 }

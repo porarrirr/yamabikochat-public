@@ -30,6 +30,8 @@ enum ReasoningEffortOptions {
             let efforts = CodexModelCatalog.findPreset(normalizedModel, in: codexModels)?
                 .supportedReasoningEfforts.map(\.effort) ?? []
             return deduplicated(efforts)
+        case "PLAMO":
+            return ProviderCatalog.constrainedModelIDs(for: "PLAMO")?.contains(normalizedModel) == true ? ["none", "medium"] : []
         case "SUPERGROK":
             return superGrok
         default:

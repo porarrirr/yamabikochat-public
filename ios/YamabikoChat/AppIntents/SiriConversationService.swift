@@ -41,30 +41,9 @@ enum SiriConversationService {
     }
 
     static func resolve(id: Int64, repository: ConversationRepository) throws -> ConversationEntity {
-        guard let conversation = try repository.siriConversations(ids: [id]).first,
-              let entity = ConversationEntity(conversation) else {
+        guard let summary = try repository.externalConversationSummaries(ids: [id]).first else {
             throw SiriConversationError.unavailable
         }
-        return entity
-    }
-
-    static func ask(prompt: String, save: Bool) async throws -> ShortcutRunResult {
-        let services = try AppServices.resolve()
-        let settings = try services.settingsRepository.load()
-        return try await ask(prompt: prompt, save: save, settings: settings, repository: services.chatRepository)
-    }
-
-    static func ask(prompt: String, save: Bool, settings: AppSettings, repository: ChatRepository) async throws -> ShortcutRunResult {
-        do {
-            return try await repository.runShortcut(
-                prompt: prompt, provider: settings.apiProvider, model: settings.currentModel(),
-                saveToNewConversation: save
-            )
-        } catch {
-            DiagnosticsLogger.log("Siri question failed", category: .chat,
-                                  metadata: ["provider": settings.apiProvider, "model": settings.currentModel()],
-                                  error: error)
-            throw error
-        }
+        return ConversationEntity(summary)
     }
 }

@@ -171,6 +171,18 @@ final class ChatRepository {
         }
 
         switch normalizedProvider {
+        case "SARASHINA":
+            guard normalizedModel == "sarashina3.2-mini-thinking" else { return nil }
+            return makeReasoningEffortConfiguration(
+                providerID: normalizedProvider, modelID: normalizedModel, modelLabel: normalizedModel,
+                options: ["low", "medium", "high"], selectedValue: settings.sarashinaReasoningEffort
+            )
+        case "PLAMO":
+            guard ProviderCatalog.constrainedModelIDs(for: "PLAMO")?.contains(normalizedModel) == true else { return nil }
+            return makeReasoningEffortConfiguration(
+                providerID: normalizedProvider, modelID: normalizedModel, modelLabel: normalizedModel,
+                options: ["none", "medium"], selectedValue: settings.plamoReasoningEffort
+            )
         case "APPLE_INTELLIGENCE":
             guard normalizedModel == AppleIntelligenceModelCatalog.pccModel else { return nil }
             return makeReasoningEffortConfiguration(
@@ -252,12 +264,48 @@ final class ChatRepository {
 
     func setReasoningEffort(_ effort: String, provider: String, model: String) throws {
         let currentSettings = try loadSettings()
-        guard let configuration = reasoningEffortConfiguration(
+        let selection = try reasoningEffortSelection(
+            effort,
             settings: currentSettings,
             provider: provider,
             model: model
+        )
+
+        if let providerID = ProviderReference(persistedID: selection.configuration.providerID).modelsDevID {
+            try credentialStore.saveSecret(
+                selection.value,
+                key: ModelsDevReasoningPreference.storageKey(
+                    providerID: providerID,
+                    modelID: selection.configuration.modelID
+                )
+            )
+        } else {
+            try saveSettings(try settings(currentSettings, applying: selection))
+        }
+
+        DiagnosticsLogger.log(
+            "Chat reasoning effort changed",
+            category: .settings,
+            metadata: [
+                "provider": selection.configuration.providerID,
+                "model": selection.configuration.modelID,
+                "effort": selection.value
+            ]
+        )
+    }
+
+    private func reasoningEffortSelection(
+        _ effort: String,
+        settings: AppSettings,
+        provider: String,
+        model: String
+    ) throws -> (configuration: ChatReasoningEffortConfiguration, value: String) {
+        guard let configuration = reasoningEffortConfiguration(
+            settings: settings,
+            provider: provider,
+            model: model
         ),
-        let selectedValue = ChatReasoningEffortPresentationPolicy.matchingOption(
+        let value = ChatReasoningEffortPresentationPolicy.matchingOption(
             effort,
             in: configuration.options
         ) else {
@@ -265,51 +313,42 @@ final class ChatRepository {
                 L10n.text("このモデルでは推論エフォートを変更できません。")
             )
         }
+        return (configuration, value)
+    }
 
-        let reference = ProviderReference(persistedID: configuration.providerID)
-        if let providerID = reference.modelsDevID {
-            try credentialStore.saveSecret(
-                selectedValue,
-                key: ModelsDevReasoningPreference.storageKey(
-                    providerID: providerID,
-                    modelID: configuration.modelID
-                )
+    /// Applies a validated effort to a built-in provider's settings. models.dev efforts live in
+    /// the credential store and are passed to the resolver separately.
+    private func settings(
+        _ settings: AppSettings,
+        applying selection: (configuration: ChatReasoningEffortConfiguration, value: String)
+    ) throws -> AppSettings {
+        var updated = settings
+        switch selection.configuration.providerID {
+        case "SARASHINA":
+            updated.sarashinaReasoningEffort = selection.value
+        case "PLAMO":
+            updated.plamoReasoningEffort = selection.value
+        case "APPLE_INTELLIGENCE":
+            updated.pccReasoningLevel = selection.value
+        case "CODEX_AUTH":
+            updated.codexReasoningEnabled = true
+            updated.codexReasoningEffort = selection.value
+        case "SUPERGROK":
+            updated.superGrokReasoningEnabled = true
+            updated.superGrokReasoningEffort = selection.value
+        case "GEMINI":
+            updated.geminiThinkingEnabled = true
+            updated.geminiThinkingLevel = selection.value
+        case "OPENROUTER":
+            updated.openRouterThinkingEnabled = true
+            updated.openRouterReasoningMode = "effort"
+            updated.openRouterReasoningEffort = selection.value
+        default:
+            throw ProviderClientError.parseFailure(
+                L10n.text("このプロバイダーでは推論エフォートを変更できません。")
             )
-        } else {
-            var updated = currentSettings
-            switch configuration.providerID {
-            case "APPLE_INTELLIGENCE":
-                updated.pccReasoningLevel = selectedValue
-            case "CODEX_AUTH":
-                updated.codexReasoningEnabled = true
-                updated.codexReasoningEffort = selectedValue
-            case "SUPERGROK":
-                updated.superGrokReasoningEnabled = true
-                updated.superGrokReasoningEffort = selectedValue
-            case "GEMINI":
-                updated.geminiThinkingEnabled = true
-                updated.geminiThinkingLevel = selectedValue
-            case "OPENROUTER":
-                updated.openRouterThinkingEnabled = true
-                updated.openRouterReasoningMode = "effort"
-                updated.openRouterReasoningEffort = selectedValue
-            default:
-                throw ProviderClientError.parseFailure(
-                    L10n.text("このプロバイダーでは推論エフォートを変更できません。")
-                )
-            }
-            try saveSettings(updated)
         }
-
-        DiagnosticsLogger.log(
-            "Chat reasoning effort changed",
-            category: .settings,
-            metadata: [
-                "provider": configuration.providerID,
-                "model": configuration.modelID,
-                "effort": selectedValue
-            ]
-        )
+        return updated
     }
 
     private func makeReasoningEffortConfiguration(
@@ -1413,7 +1452,7 @@ final class ChatRepository {
         )
         let modelRowId = try conversations.insertDualMessage(modelRow)
         modelRow.id = modelRowId
-        let dualActivityQueue = DispatchQueue(label: "com.porarri.yamabikochat.dual-tool-activity.\(modelRowId)")
+        let dualActivityQueue = DispatchQueue(label: "org.example.yamabikochat.dual-tool-activity.\(modelRowId)")
 
         var resultA: DualSideResult?
         var resultB: DualSideResult?
@@ -1574,6 +1613,8 @@ final class ChatRepository {
         provider: String,
         model: String,
         systemPromptOverride: String? = nil,
+        reasoningEffort: String? = nil,
+        allowedTools: Set<ShortcutTool>? = nil,
         saveToNewConversation: Bool
     ) async throws -> ShortcutRunResult {
         let bgGuard = BackgroundTaskGuard()
@@ -1597,7 +1638,17 @@ final class ChatRepository {
         let normalizedProvider = try validateShortcutProvider(provider)
         let resolvedProvider = normalizedProvider
 
-        let settings = try self.settings.load()
+        let savedSettings = try self.settings.load()
+        let effortOverride = try await shortcutReasoningEffortOverride(
+            reasoningEffort,
+            settings: savedSettings,
+            provider: normalizedProvider,
+            model: normalizedModel
+        )
+        var settings = effortOverride.settings
+        if let allowedTools {
+            settings = ShortcutTool.settings(settings, allowing: allowedTools)
+        }
         let trimmedOverride = systemPromptOverride?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedSystemPrompt: String?
@@ -1613,7 +1664,9 @@ final class ChatRepository {
             systemPrompt: resolvedSystemPrompt,
             provider: normalizedProvider,
             settings: settings,
-            stream: false
+            stream: false,
+            modelsDevReasoningEffort: effortOverride.modelsDevEffort,
+            allowedFunctionTools: allowedTools.map(ShortcutTool.functionNames(allowing:))
         )
 
         if saveToNewConversation {
@@ -1707,6 +1760,33 @@ final class ChatRepository {
                     "provider": normalizedProvider,
                     "model": normalizedModel
                 ],
+                error: error
+            )
+            throw error
+        }
+    }
+
+    /// Validates a Shortcut effort against the same per-model options the chat effort picker
+    /// offers, and applies it to this run only without changing the saved preference.
+    private func shortcutReasoningEffortOverride(
+        _ effort: String?,
+        settings: AppSettings,
+        provider: String,
+        model: String
+    ) async throws -> (settings: AppSettings, modelsDevEffort: String?) {
+        guard let effort = effort?.trimmedNonEmpty else { return (settings, nil) }
+        await refreshReasoningEffortCatalog(for: provider)
+        do {
+            let selection = try reasoningEffortSelection(effort, settings: settings, provider: provider, model: model)
+            if ProviderReference(persistedID: selection.configuration.providerID).isModelsDev {
+                return (settings, selection.value)
+            }
+            return (try self.settings(settings, applying: selection), nil)
+        } catch {
+            DiagnosticsLogger.log(
+                "Shortcut rejected reasoning effort",
+                category: .chat,
+                metadata: ["provider": provider, "model": model, "effort": effort],
                 error: error
             )
             throw error
@@ -2413,14 +2493,20 @@ final class ChatRepository {
         promptCacheKey: String? = nil,
         clientToolsAllowed: Bool = true,
         workspaceSessionID: String? = nil,
-        projectWorkspaceSourceID: Int64? = nil
+        projectWorkspaceSourceID: Int64? = nil,
+        modelsDevReasoningEffort: String? = nil,
+        allowedFunctionTools: Set<String>? = nil
     ) async throws -> ProviderRequest {
-        let resolvedSettings = try await requestSettingsResolver.resolve(
+        var resolvedSettings = try await requestSettingsResolver.resolve(
             settings: settings,
             provider: provider,
             model: model,
-            context: context
+            context: context,
+            modelsDevReasoningEffort: modelsDevReasoningEffort
         )
+        if let allowedFunctionTools {
+            resolvedSettings.tools.removeAll { $0.type == "function" && !allowedFunctionTools.contains($0.payload["name"] ?? "") }
+        }
         var metadata = resolvedSettings.metadata
         metadata["provider"] = provider
         if let promptCacheKey = promptCacheKey?.trimmingCharacters(in: .whitespacesAndNewlines), !promptCacheKey.isEmpty {

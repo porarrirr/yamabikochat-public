@@ -7,7 +7,7 @@ enum GenUIDemoFixture {
     @MainActor
     static func seed(chatRepository: ChatRepository, conversations: ConversationRepository, timestamp: Int64) throws {
         let messageID: Int64
-        if let id = try conversations.siriConversations(matching: title).first(where: { $0.title == title })?.id,
+        if let id = try conversations.searchConversations(matching: title).first(where: { $0.title == title })?.id,
            let existingID = try conversations.fetchLastAssistantMessage(conversationId: id)?.id {
             messageID = existingID
         } else {

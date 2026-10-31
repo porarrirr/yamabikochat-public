@@ -622,8 +622,48 @@ test('intrinsics bind scoped objects, repeat keyed items and switch conditional 
 test('widget aliases resolve through element aliases including pie and image aliases', () => {
     const app=mount({ui:api.h('Col',{},api.h('PieChart',{data:[{name:'A',value:2},{name:'B',value:3}]}),api.h('SearchImage',{src:'https://example.com/image.png'}))});
     assert.equal(app.root.querySelectorAll('svg').length,1);
-    assert.equal(app.root.querySelectorAll('img')[0].src,'https://example.com/image.png');
+    assert.equal(app.root.querySelectorAll('img').length,0);
+    assert.equal(app.root.querySelector('.genui-external-media').textContent,'Show image · example.com');
     assert.equal(app.messages.some(message=>message.type==='warning'),false);
+});
+
+test('remote media never loads in the canvas and images arrive only as host data URLs', () => {
+    const ui=api.h('col',{},
+        api.h('AsyncImage',{src:'https://images.example/a.png?leak=secret'}),
+        api.h('markdown',{},'![chart](https://other.example/b.png)'),
+        api.h('favicon',{url:'icon'}),
+        api.h('AsyncVideo',{src:'https://video.example/v.mp4'}),
+        api.h('audio-player',{src:'https://audio.example/a.mp3'}),
+        api.h('lottie',{src:'https://anim.example/a.json'}));
+    const app=mount({ui,resources:{icon:{src:'https://site.example/favicon.ico'}}});
+    assert.equal(app.root.querySelectorAll('img,video,audio').length,0);
+    assert.match(app.root.textContent,/Remote animation files are not loaded/);
+    const [image,markdownImage]=app.root.querySelectorAll('.genui-external-media');
+    image.fire('click');
+    assert.equal(app.messages.some(message=>message.type==='loadExternalImages'),false);
+    markdownImage.fire('click', true);
+    assert.deepEqual([...app.messages.find(message=>message.type==='loadExternalImages').urls].sort(),
+        ['https://images.example/a.png?leak=secret','https://other.example/b.png','https://site.example/favicon.ico']);
+    const media=[...app.root.querySelectorAll('.genui-external-media')].filter(button=>/Open media/.test(button.textContent));
+    assert.deepEqual(media.map(button=>button.textContent),['Open media · video.example','Open media · audio.example']);
+    media[0].fire('click', true);
+    assert.equal(app.messages.find(message=>message.type==='openUrl').url,'https://video.example/v.mp4');
+
+    app.context.GenUIRuntime.setExternalImages({
+        'https://images.example/a.png?leak=secret':'data:image/png;base64,AAAA',
+        'https://other.example/b.png':null,
+        'https://site.example/favicon.ico':'data:image/png;base64,BBBB'});
+    app.flush();
+    assert.deepEqual([...app.root.querySelectorAll('img')].map(img=>img.src),['data:image/png;base64,AAAA','data:image/png;base64,BBBB']);
+    assert.match(app.root.textContent,/Image unavailable/);
+});
+
+test('consented images survive a document reload through the host snapshot', () => {
+    const app=mount({ui:api.h('AsyncImage',{src:'https://images.example/a.png'})},320,{},context=>{
+        context.__GENUI_EXTERNAL_IMAGES__={'https://images.example/a.png':'data:image/png;base64,AAAA'};
+    });
+    assert.equal(app.root.querySelector('img').src,'data:image/png;base64,AAAA');
+    assert.equal(app.root.querySelector('.genui-external-media'),null);
 });
 
 test('flashcard retains both faces and changes accessibility and saved flip state', () => {

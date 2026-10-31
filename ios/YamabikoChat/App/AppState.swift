@@ -12,6 +12,7 @@ final class AppState: ObservableObject {
     @Published private var shareImportDrafts: [Int64: String] = [:]
     @Published var isConversationHistoryPresented = false
     @Published private(set) var conversationSidebarRevealGeneration = 0
+    @Published private(set) var conversationSidebarToggleGeneration = 0
     @Published private(set) var composerFocusGeneration = 0
     private var hasInitializedConversationSelection = false
 
@@ -36,6 +37,10 @@ final class AppState: ObservableObject {
 
     func requestConversationSidebarReveal() {
         conversationSidebarRevealGeneration += 1
+    }
+
+    func requestConversationSidebarToggle() {
+        conversationSidebarToggleGeneration += 1
     }
 
     func requestComposerFocus() {

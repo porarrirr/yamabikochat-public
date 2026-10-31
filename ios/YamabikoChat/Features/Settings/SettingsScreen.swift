@@ -78,6 +78,12 @@ struct SettingsScreen: View {
         }
     }
 
+    init(viewModel: SettingsViewModel, initialTab: SettingsTab? = nil) {
+        self.viewModel = viewModel
+        self.initialTab = initialTab
+        _navigationPath = State(initialValue: initialTab.map { [$0.category] } ?? [])
+    }
+
     var body: some View {
         NavigationStack(path: $navigationPath) {
             settingsIndex
@@ -116,11 +122,6 @@ struct SettingsScreen: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { viewModel.flushPendingSettingsSave() }
-        }
-        .onAppear {
-            if let initialTab {
-                navigationPath = [initialTab.category]
-            }
         }
     }
 
@@ -420,6 +421,7 @@ struct SettingsDetailScreen: View {
             }
             codexProviderSettingsSection
             geminiProviderSettingsSection
+            plamoProviderSettingsSection
             if currentProviderKey == "CODEX_AUTH" {
                 codexAuthSection
             }
@@ -1055,6 +1057,32 @@ struct SettingsDetailScreen: View {
         }
     }
 
+    private var plamoProviderSettingsSection: some View {
+        Group {
+            if currentProviderKey == "PLAMO" {
+                Section("PLaMo Settings") {
+                    Picker("Reasoning Effort", selection: Binding(
+                        get: { viewModel.settings.plamoReasoningEffort },
+                        set: { viewModel.settings.plamoReasoningEffort = $0 }
+                    )) {
+                        Text("none").tag("none")
+                        Text("medium").tag("medium")
+                    }
+                }
+                Section("PLaMo Tools") {
+                    Toggle("Web Search", isOn: Binding(
+                        get: { viewModel.settings.plamoWebSearchEnabled },
+                        set: { viewModel.setPlamoWebSearchEnabled($0) }
+                    ))
+                    .disabled(viewModel.settings.defaultModel != "plamo-3.1-prime")
+                    Text("PLaMoのWeb検索は3.1 Primeで利用できます。アプリのツール（Web検索・Python・GenUIなど）とは同時に使えません。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
     private var superGrokProviderSettingsSection: some View {
         Group {
             if currentProviderKey == "SUPERGROK" {
@@ -1323,11 +1351,27 @@ struct SettingsDetailScreen: View {
                     }
                     ForEach(viewModel.selectedCustomEndpointModels) { Text($0.modelId).tag($0.modelId) }
                 }
+            } else if currentProviderKey == "PLAMO" {
+                Picker("Model", selection: Binding(get: { viewModel.settings.defaultModel }, set: { viewModel.setDefaultModel($0) })) {
+                    ForEach(ProviderCatalog.constrainedModelIDs(for: "PLAMO") ?? [], id: \.self) { Text($0).tag($0) }
+                    if !(ProviderCatalog.constrainedModelIDs(for: "PLAMO") ?? []).contains(viewModel.settings.defaultModel) {
+                        Text(viewModel.settings.defaultModel).tag(viewModel.settings.defaultModel).disabled(true)
+                    }
+                }
+                Link("PLaMo API ドキュメント", destination: URL(string: "https://docs.plamo.preferredai.jp/ja/api")!)
             } else if currentProviderKey == "SARASHINA" {
                 Picker("Model", selection: Binding(get: { viewModel.settings.defaultModel }, set: { viewModel.setDefaultModel($0) })) {
-                    ForEach(["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"], id: \.self) { Text($0).tag($0) }
-                    if !["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"].contains(viewModel.settings.defaultModel) {
+                    ForEach(ProviderCatalog.constrainedModelIDs(for: "SARASHINA") ?? [], id: \.self) { Text($0).tag($0) }
+                    if !(ProviderCatalog.constrainedModelIDs(for: "SARASHINA") ?? []).contains(viewModel.settings.defaultModel) {
                         Text(viewModel.settings.defaultModel).tag(viewModel.settings.defaultModel).disabled(true)
+                    }
+                }
+                if viewModel.settings.defaultModel == "sarashina3.2-mini-thinking" {
+                    Picker("Reasoning Effort", selection: Binding(
+                        get: { viewModel.settings.sarashinaReasoningEffort },
+                        set: { viewModel.settings.sarashinaReasoningEffort = $0 }
+                    )) {
+                        ForEach(["low", "medium", "high"], id: \.self) { Text($0).tag($0) }
                     }
                 }
                 Link("Sarashina API ドキュメント", destination: URL(string: "https://docs.sarashina.ai/")!)

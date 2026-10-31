@@ -9,6 +9,7 @@ enum LLMProvider: String, Codable, CaseIterable, Sendable {
     case openAI = "OPENAI"
     case openAICompat = "OPENAI_COMPAT"
     case sarashina = "SARASHINA"
+    case plamo = "PLAMO"
     case miniMax = "MINIMAX"
     case codexAuth = "CODEX_AUTH"
     case superGrok = "SUPERGROK"

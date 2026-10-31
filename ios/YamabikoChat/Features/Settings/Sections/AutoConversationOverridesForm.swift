@@ -33,7 +33,7 @@ struct AutoConversationOverridesForm: View {
             providerSpecificControls
 
             if modelsDevProviderID == nil,
-               ["GEMINI", "OPENROUTER", "CODEX_AUTH", "SUPERGROK"].contains(provider) {
+               ["GEMINI", "OPENROUTER", "CODEX_AUTH", "SUPERGROK", "PLAMO", "SARASHINA"].contains(provider) {
                 Text(L10n.text("個別に指定しない項目は、プリセットの選択に関係なくプロバイダー設定を使用します。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -52,6 +52,21 @@ struct AutoConversationOverridesForm: View {
             modelsDevReasoningControls(model: catalogModel)
         } else {
             switch provider {
+            case "SARASHINA":
+                if model == "sarashina3.2-mini-thinking" {
+                    Picker(L10n.text("Reasoning Effort"), selection: reasoningEffortBinding) {
+                        Text(L10n.text("inherit")).tag("")
+                        ForEach(["low", "medium", "high"], id: \.self) { Text($0).tag($0) }
+                    }
+                }
+            case "PLAMO":
+                Picker(L10n.text("Reasoning Effort"), selection: reasoningEffortBinding) {
+                    Text(L10n.text("inherit")).tag("")
+                    Text("none").tag("none")
+                    Text("medium").tag("medium")
+                }
+                Toggle("Web Search", isOn: googleSearchBinding)
+                    .disabled(model != "plamo-3.1-prime")
             case "GEMINI":
                 geminiControls
             case "OPENROUTER":
@@ -256,7 +271,7 @@ struct AutoConversationOverridesForm: View {
 
     private var googleSearchBinding: Binding<Bool> {
         Binding(
-            get: { settings[keyPath: keyPaths.googleSearch] ?? settings.geminiGoogleSearchEnabled },
+            get: { settings[keyPath: keyPaths.googleSearch] ?? (provider == "PLAMO" ? settings.plamoWebSearchEnabled : settings.geminiGoogleSearchEnabled) },
             set: { viewModel.settings[keyPath: keyPaths.googleSearch] = $0 }
         )
     }

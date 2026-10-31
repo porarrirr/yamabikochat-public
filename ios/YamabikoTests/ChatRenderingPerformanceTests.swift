@@ -110,7 +110,7 @@ final class ChatRenderingPerformanceTests: XCTestCase {
         guard ProcessInfo.processInfo.environment["YAMABIKO_RENDER_BENCHMARK"] == "1" else {
             throw XCTSkip("Explicit rendering benchmark only")
         }
-        let log = OSLog(subsystem: "com.porarri.yamabikochat.performance", category: .pointsOfInterest)
+        let log = OSLog(subsystem: "org.example.yamabikochat.performance", category: .pointsOfInterest)
         let prose = (1...24).map {
             "## 手順\($0)\n\n日本語の **説明** と [出典](https://example.com/\($0))。計算結果を確認してから次に進みます。\n\n"
         }.joined() + "```swift\nlet values = [12, 18, 30]\nprint(values.reduce(0, +))\n```\n\n最終回答は **60** です。"

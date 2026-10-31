@@ -10,6 +10,7 @@ enum CredentialProvider: String, CaseIterable {
     case openAI = "OPENAI"
     case openAICompat = "OPENAI_COMPAT"
     case sarashina = "SARASHINA"
+    case plamo = "PLAMO"
     case miniMax = "MINIMAX"
     case codexAuth = "CODEX_AUTH"
     case superGrok = "SUPERGROK"
@@ -39,7 +40,7 @@ enum KeychainStoreError: LocalizedError {
 final class KeychainStore: SecureCredentialStore {
     private let service: String
 
-    init(service: String = "com.porarri.yamabikochat.ios") {
+    init(service: String = "org.example.yamabikochat.ios") {
         self.service = service
     }
 

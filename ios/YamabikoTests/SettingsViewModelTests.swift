@@ -420,6 +420,26 @@ final class SettingsViewModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPlamoSearchAndClientToolSettingsAreMutuallyExclusive() {
+        let viewModel = SettingsViewModel()
+        viewModel.settings.apiProvider = "PLAMO"
+        viewModel.settings.clientWebSearchToolEnabled = true
+        viewModel.setPlamoWebSearchEnabled(true)
+        XCTAssertTrue(viewModel.settings.plamoWebSearchEnabled)
+        XCTAssertFalse(viewModel.settings.clientWebSearchToolEnabled)
+        XCTAssertFalse(viewModel.settings.pythonToolEnabled)
+        XCTAssertFalse(viewModel.settings.genUIToolEnabled)
+        viewModel.setClientWebSearchToolEnabled(true)
+        XCTAssertFalse(viewModel.settings.plamoWebSearchEnabled)
+        viewModel.setPlamoWebSearchEnabled(true)
+        viewModel.setPythonToolEnabled(true)
+        XCTAssertFalse(viewModel.settings.plamoWebSearchEnabled)
+        viewModel.setPlamoWebSearchEnabled(true)
+        viewModel.setGenUIToolEnabled(true)
+        XCTAssertFalse(viewModel.settings.plamoWebSearchEnabled)
+    }
+
+    @MainActor
     func testEnablingGenUIForGeminiDisablesNativeTools() {
         let viewModel = SettingsViewModel()
         viewModel.settings.apiProvider = "GEMINI"

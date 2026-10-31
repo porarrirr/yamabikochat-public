@@ -786,6 +786,20 @@ input[type='radio'] {
     font-size: inherit;
     min-height: 0;
 }
+.genui-external-media {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 44px;
+    padding: 12px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    background: var(--surface-soft);
+    color: var(--info);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
 .genui-CodeBlock,
 pre {
     margin: 0;

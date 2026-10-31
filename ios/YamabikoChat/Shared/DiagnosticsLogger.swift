@@ -74,7 +74,7 @@ enum DiagnosticsLogger {
     private static let maxBytes = 2 * 1024 * 1024
     private static let lock = NSLock()
     private static let systemLogger = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "com.porarri.yamabikochat.ios",
+        subsystem: Bundle.main.bundleIdentifier ?? "org.example.yamabikochat.ios",
         category: "Diagnostics"
     )
 

@@ -301,6 +301,8 @@ struct CatalogModelListView: View {
 
     private func unsupportedReason(_ reason: String?) -> String {
         switch reason {
+        case "plamo_background_jobs_unsupported": "PLaMo Deep Researchの非同期ジョブには未対応です"
+        case "plamo_reasoning_effort_unsupported": "PLaMoの推論Effortはnoneまたはmediumを指定してください"
         case "pi_provider_missing": "Piにプロバイダー定義がありません"
         case "pi_provider_ambiguous": "models.devとPiのプロバイダー対応を一意に特定できません"
         case "model_operation_unsupported": "埋め込み専用モデルのため会話には使用できません"

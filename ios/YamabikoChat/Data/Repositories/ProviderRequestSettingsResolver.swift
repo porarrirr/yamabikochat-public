@@ -103,7 +103,8 @@ final class ProviderRequestSettingsResolver {
         model: String,
         context: AppSettings.ReasoningContext = .default,
         toolScope: ProviderRequestToolScope = .all,
-        enablesUserQuestions: Bool = false
+        enablesUserQuestions: Bool = false,
+        modelsDevReasoningEffort: String? = nil
     ) async throws -> ProviderRequestResolvedSettings {
         var metadata = metadataForProvider(
             settings: settings,
@@ -111,26 +112,25 @@ final class ProviderRequestSettingsResolver {
             model: model,
             context: context
         )
-        let supportsClientTools = supportsClientTools(provider: provider, model: model)
+        let tools = try toolsForProvider(
+            settings: settings, provider: provider, model: model, context: context,
+            toolScope: toolScope, enablesUserQuestions: enablesUserQuestions
+        )
+        let supportsClientTools = !tools.contains { $0.type == "plamo_web_search" }
+            && supportsClientTools(provider: provider, model: model)
         metadata["supportsClientTools"] = supportsClientTools ? "true" : "false"
         metadata["subagentsEnabled"] = toolScope == .all && settings.subagents.enabled && supportsClientTools ? "true" : "false"
         if let contextWindow = modelService.resolveContextLength(modelID: model, providerID: provider) {
             metadata["contextWindow"] = String(contextWindow)
         }
         return ProviderRequestResolvedSettings(
-            tools: try toolsForProvider(
-                settings: settings,
-                provider: provider,
-                model: model,
-                context: context,
-                toolScope: toolScope,
-                enablesUserQuestions: enablesUserQuestions
-            ),
+            tools: tools,
             thinking: try thinkingConfigForProvider(
                 settings: settings,
                 provider: provider,
                 model: model,
-                context: context
+                context: context,
+                modelsDevReasoningEffort: modelsDevReasoningEffort
             ),
             routing: try await providerPreferencesForProvider(
                 settings: settings,
@@ -154,6 +154,11 @@ final class ProviderRequestSettingsResolver {
         let overrides = settings.toolOverride(for: context)
         var tools: [ProviderTool]
         switch provider.uppercased() {
+        case "PLAMO":
+            if model == "plamo-3.1-prime", overrides.googleSearch ?? settings.plamoWebSearchEnabled {
+                return [ProviderTool(type: "plamo_web_search", payload: [:])]
+            }
+            tools = []
         case "GEMINI":
             tools = []
             if toolScope.allowsNativeWebSearch,
@@ -339,14 +344,26 @@ final class ProviderRequestSettingsResolver {
         settings: AppSettings,
         provider: String,
         model: String,
-        context: AppSettings.ReasoningContext
+        context: AppSettings.ReasoningContext,
+        modelsDevReasoningEffort: String?
     ) throws -> ProviderThinkingConfig? {
         let reference = ProviderReference(persistedID: provider)
         if let providerID = reference.modelsDevID {
-            return modelsDevThinkingConfig(providerID: providerID, model: model)
+            return modelsDevThinkingConfig(providerID: providerID, model: model, effortOverride: modelsDevReasoningEffort)
         }
         let overrides = settings.thinkingOverride(for: context)
         switch provider.uppercased() {
+        case "SARASHINA":
+            guard model == "sarashina3.2-mini-thinking" else { return nil }
+            return ProviderThinkingConfig(
+                enabled: nil, budget: nil, effort: overrides.codexEffort ?? settings.sarashinaReasoningEffort,
+                includeThoughts: false, exclude: nil
+            )
+        case "PLAMO":
+            return ProviderThinkingConfig(
+                enabled: nil, budget: nil, effort: overrides.codexEffort ?? settings.plamoReasoningEffort,
+                includeThoughts: true, exclude: nil
+            )
         case "OPENROUTER":
             return try buildOpenRouterThinkingConfig(settings: settings, model: model, context: context)
         case "CODEX_AUTH":
@@ -413,19 +430,19 @@ final class ProviderRequestSettingsResolver {
         }
     }
 
-    private func modelsDevThinkingConfig(providerID: String, model: String) -> ProviderThinkingConfig? {
+    private func modelsDevThinkingConfig(providerID: String, model: String, effortOverride: String?) -> ProviderThinkingConfig? {
         let catalogModel = modelsDevCatalogRepository?
             .provider(for: .modelsDev(providerID))?
             .models.first(where: { $0.id == model })
         let supported = catalogModel?.supportedReasoningEfforts ?? []
-        let saved = (modelsDevReasoningEffort(providerID, model) ?? "")
+        let effort = (effortOverride ?? modelsDevReasoningEffort(providerID, model) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        guard !saved.isEmpty, supported.contains(saved) else { return nil }
+        guard !effort.isEmpty, supported.contains(effort) else { return nil }
         return ProviderThinkingConfig(
             enabled: nil,
             budget: nil,
-            effort: saved,
+            effort: effort,
             includeThoughts: true,
             exclude: nil
         )

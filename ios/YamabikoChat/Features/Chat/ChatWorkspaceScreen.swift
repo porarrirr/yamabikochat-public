@@ -20,6 +20,7 @@ struct ChatWorkspaceScreen: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.windowControlsLeadingInset) private var windowControlsLeadingInset
 
     let conversationID: Int64
     @ObservedObject var viewModel: ChatViewModel
@@ -190,7 +191,7 @@ struct ChatWorkspaceScreen: View {
     private var topBar: some View {
         HStack(spacing: 8) {
             Button {
-                openConversationHistory()
+                toggleConversationHistory()
             } label: {
                 Image(systemName: "line.3.horizontal")
                     .font(.system(size: 20, weight: .medium))
@@ -221,6 +222,7 @@ struct ChatWorkspaceScreen: View {
             .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 12)
+        .padding(.leading, windowControlsLeadingInset)
         .padding(.top, 8)
         .padding(.bottom, 7)
         .overlay(alignment: .bottom) {
@@ -449,8 +451,8 @@ struct ChatWorkspaceScreen: View {
         }
     }
 
-    private func openConversationHistory() {
-        appState.requestConversationSidebarReveal()
+    private func toggleConversationHistory() {
+        appState.requestConversationSidebarToggle()
     }
 }
 

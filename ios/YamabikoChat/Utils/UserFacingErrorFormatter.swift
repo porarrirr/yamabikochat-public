@@ -79,6 +79,13 @@ enum UserFacingErrorFormatter {
         }
 
         let stripped = stripWrappers(stripChatErrorPrefix(original))
+        if original.lowercased().contains("sarashina_output_limit_before_answer") {
+            return UserFacingError(
+                title: L10n.text("Sarashina APIの出力上限に達しました"),
+                summary: L10n.text("API側の上限は思考と回答を合わせて8,000トークンです。今回は思考中に上限に達し、回答が返されませんでした。思考レベルをlowまたはmediumに下げて、再度お試しください。"),
+                detail: original
+            )
+        }
         if original.lowercased().contains("subscription_sharing_usage_limit_exceeded") {
             return UserFacingError(title: "ChatGPTの利用上限に達しました", summary: "ChatGPTの設定で、このアプリの利用上限と利用状況を確認してください。", detail: original)
         }

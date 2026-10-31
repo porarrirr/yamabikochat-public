@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { createModels } from "@earendil-works/pi-ai";
+import { createModels, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { customProviderResolution, customStreamOptions, CUSTOM_PROVIDER } from "../src/custom-provider.js";
-import { installSarashinaProvider, sarashinaResolution, sarashinaModels } from "../src/sarashina-provider.js";
+import { installSarashinaProvider, sarashinaResolution, sarashinaModels, sarashinaResponseFailure } from "../src/sarashina-provider.js";
 const endpoint = (protocol = "openai-completions") => ({ name: "Test", protocol, modelId: "custom-model", baseUrl: "https://custom.example/v1", contextWindow: 128000, maxTokens: 4096, reasoning: true, toolCall: true, vision: false, reasoningEffort: "high", maxTokensField: "max_tokens", supportsStore: false, supportsDeveloperRole: false, supportsUsageInStreaming: false, temperature: 0.3 });
 const configFor = (customEndpoint) => ({ provider: CUSTOM_PROVIDER, model: customEndpoint.modelId, customEndpoint, thinkingLevel: customEndpoint.reasoningEffort });
 const sse = (data) => new Response(data, { headers: { "content-type": "text/event-stream" } });
@@ -54,11 +54,11 @@ test("changing endpoint cannot replace an active custom model; extended efforts 
   assert.notEqual(first.provider, second.provider); assert.equal(models.getModel(first.provider, first.model).baseUrl, "https://custom.example/v1");
   for (const effort of ["xhigh", "max"]) { const result = customProviderResolution(configFor({ ...endpoint(), reasoningEffort: effort }), models); assert.equal(models.getModel(result.provider, result.model).thinkingLevelMap[effort], effort); }
 });
-for (const { id, contextWindow, toolCall } of sarashinaModels) test(`official Sarashina contract and payload: ${id}`, async () => {
+for (const { id, contextWindow, toolCall, reasoning } of sarashinaModels) test(`official Sarashina contract and payload: ${id}`, async () => {
   const models = createModels(); installSarashinaProvider(models);
   for (const catalogContract of [undefined, { npm: "@ai-sdk/openai-compatible", api: "https://api.sarashina.ai/v1", shape: "chat-completions", toolCall }]) {
     const resolution = sarashinaResolution({ provider: "sarashina", model: id, catalogContract }, models);
-    assert.equal(resolution.supported, true); assert.equal(resolution.contextWindow, contextWindow); assert.equal(resolution.maxTokens, 8000); assert.equal(resolution.toolCall, toolCall); assert.equal(resolution.reasoning, false);
+    assert.equal(resolution.supported, true); assert.equal(resolution.contextWindow, contextWindow); assert.equal(resolution.maxTokens, 8000); assert.equal(resolution.toolCall, toolCall); assert.equal(resolution.reasoning, reasoning);
   }
   let payload;
   const result = await models.streamSimple(models.getModel("sarashina", id), { systemPrompt: "System", messages: [{ role: "user", content: "Hi", timestamp: 1 }] }, { apiKey: "test", fetch: async (url, options) => { assert.equal(String(url), "https://api.sarashina.ai/v1/chat/completions"); payload = JSON.parse(options.body); return sse(chatSSE); } }).result();
@@ -120,4 +120,95 @@ test("custom Mistral stream failure does not retry another protocol or endpoint"
   assert.equal(result.stopReason, "error");
   assert.match(result.errorMessage, /401/);
   assert.equal(requests, 1);
+});
+
+for (const effort of ["low", "medium", "high"]) test(`Sarashina encrypted thinking replay: ${effort}`, async () => {
+  const models = createModels(); installSarashinaProvider(models);
+  const id = "sarashina3.2-mini-thinking", model = models.getModel("sarashina", id);
+  assert.deepEqual(getSupportedThinkingLevels(model), ["low", "medium", "high"]);
+  assert.equal(sarashinaResolution({ provider: "sarashina", model: id, thinkingLevel: effort }, models).supported, true);
+  const encrypted = 'data: {"choices":[{"index":0,"delta":{"reasoning":"Y2lw"},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,"delta":{"reasoning":"aGVy"},"finish_reason":null}]}\n\n';
+  let payload;
+  const options = { apiKey: "test", reasoning: effort, fetch: async (url, options) => {
+    payload = JSON.parse(options.body); return sse(encrypted + chatSSE);
+  }};
+  const messages = [{ role: "user", content: "Hi", timestamp: 1 }];
+  const stream = models.streamSimple(model, { messages }, options);
+  const events = [];
+  for await (const event of stream) events.push(event);
+  const result = await stream.result();
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  assert.equal(payload.reasoning_effort, effort);
+  assert.equal(payload.max_completion_tokens, 8000);
+  assert.equal(result.content.find(part => part.type === "thinking").thinkingSignature, "Y2lwaGVy");
+  assert.ok(!events.some(event => event.type === "thinking_delta"));
+  assert.equal(result.content.find(part => part.type === "thinking").thinking, "");
+  await models.streamSimple(model, { messages: [...messages, JSON.parse(JSON.stringify(result)), { role: "user", content: "Continue", timestamp: 2 }] }, options).result();
+  assert.equal(payload.messages.find(message => message.role === "assistant").reasoning, "Y2lwaGVy");
+  assert.equal(payload.messages.find(message => message.role === "assistant").content, "hello");
+  const other = { ...result, provider: "other" };
+  await models.streamSimple(model, { messages: [...messages, other] }, options).result();
+  assert.equal(payload.messages.find(message => message.role === "assistant").reasoning, undefined);
+});
+test("Sarashina rejects unsupported efforts without clamping or fallback", () => {
+  const models = createModels(); installSarashinaProvider(models);
+  for (const { id, reasoning } of sarashinaModels) {
+    for (const thinkingLevel of reasoning ? ["off", "minimal", "xhigh", "max"] : ["low", "medium", "high"]) {
+      assert.equal(sarashinaResolution({ provider: "sarashina", model: id, thinkingLevel }, models).reason, "sarashina_reasoning_unsupported");
+    }
+  }
+});
+
+for (const { id, toolCall } of sarashinaModels.filter(model => model.toolCall)) test(`Sarashina tool stream uses Pi parser: ${id}`, async () => {
+  const models = createModels(); installSarashinaProvider(models);
+  let payload;
+  const result = await models.streamSimple(models.getModel("sarashina", id), {
+    messages: [{ role: "user", content: "weather", timestamp: 1 }],
+    tools: [{ name: "weather", description: "Weather", parameters: { type: "object", properties: {} } }]
+  }, { apiKey: "test", toolChoice: "auto", fetch: async (url, options) => {
+    payload = JSON.parse(options.body);
+    return sse('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+  }}).result();
+  assert.equal(result.stopReason, "toolUse", result.errorMessage);
+  assert.equal(result.content.find(part => part.type === "toolCall").name, "weather");
+  assert.equal(payload.tool_choice, "auto");
+  assert.equal(payload.tools[0].function.name, "weather");
+});
+
+for (const { id, reasoning } of sarashinaModels) test(`Sarashina serializes iOS text blocks as strings: ${id}`, async () => {
+  const models = createModels(); installSarashinaProvider(models);
+  let payload;
+  const result = await models.streamSimple(models.getModel("sarashina", id), {
+    systemPrompt: "System",
+    messages: [{ role: "user", content: [{ type: "text", text: "今日の天気を調べて" }, { type: "text", text: "東京" }], timestamp: 1 }],
+    ...(id !== "sarashina3-guard" ? { tools: [{ name: "weather", description: "Weather", parameters: { type: "object", properties: {} } }] } : {})
+  }, { apiKey: "test", ...(reasoning ? { reasoning: "high" } : {}), toolChoice: "auto", fetch: async (url, options) => {
+    payload = JSON.parse(options.body);
+    assert.ok(payload.messages.every(message => typeof message.content === "string"));
+    return sse(chatSSE);
+  }}).result();
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  assert.equal(payload.messages.find(message => message.role === "user").content, "今日の天気を調べて\n東京");
+  if (reasoning) assert.equal(payload.reasoning_effort, "high");
+});
+
+test("Sarashina reports the provider output limit when thinking exhausts the budget before an answer", async () => {
+  const models = createModels(); installSarashinaProvider(models);
+  const result = await models.streamSimple(models.getModel("sarashina", "sarashina3.2-mini-thinking"), {
+    messages: [{ role: "user", content: "Question", timestamp: 1 }]
+  }, { apiKey: "test", reasoning: "high", fetch: async (url, options) => {
+    assert.equal(JSON.parse(options.body).max_completion_tokens, 8000);
+    return sse('data: {"choices":[{"index":0,"delta":{"reasoning":"Y2lwaGVy"},"finish_reason":"length"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":1834,"completion_tokens":8000,"total_tokens":9834}}\n\ndata: [DONE]\n\n');
+  }}).result();
+  assert.equal(result.stopReason, "length");
+  assert.equal(result.usage.output, 8000);
+  const failure = sarashinaResponseFailure(result);
+  assert.equal(failure.code, "sarashina_output_limit_before_answer");
+  assert.match(failure.message, /Sarashina API.*8,000-token/);
+  assert.match(failure.message, /low or medium/);
+  assert.equal(result.content.find(part => part.type === "thinking").thinkingSignature, "Y2lwaGVy");
+  assert.equal(sarashinaResponseFailure({ ...result, stopReason: "stop" }), null);
+  assert.equal(sarashinaResponseFailure({ ...result, provider: "other" }), null);
+  assert.equal(sarashinaResponseFailure({ ...result, content: [{ type: "text", text: "Partial answer" }] }), null);
+  assert.equal(sarashinaResponseFailure({ ...result, content: [{ type: "toolCall", id: "call", name: "test", arguments: {} }] }), null);
 });

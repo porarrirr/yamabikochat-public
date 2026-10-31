@@ -50,6 +50,9 @@ struct OnboardingScreen: View {
                     connectionChoices
                 }
             }
+            // Keep the setup form readable when an iPad-sized window is available.
+            .frame(maxWidth: 700)
+            .frame(maxWidth: .infinity)
             .toolbar {
                 if viewModel.progress.step == .provider || connectionStep != nil {
                     ToolbarItem(placement: .topBarLeading) {

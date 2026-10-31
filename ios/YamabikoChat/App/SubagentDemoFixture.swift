@@ -9,7 +9,7 @@ enum SubagentDemoFixture {
     static func seed(chatRepository: ChatRepository, conversations: ConversationRepository, timestamp: Int64) throws {
         let conversation: Int64
         let message: Int64
-        if let existing = try conversations.siriConversations(matching: title).first(where: { $0.title == title })?.id,
+        if let existing = try conversations.searchConversations(matching: title).first(where: { $0.title == title })?.id,
            let existingMessage = try conversations.fetchLastAssistantMessage(conversationId: existing)?.id {
             conversation = existing
             message = existingMessage

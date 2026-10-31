@@ -62,3 +62,26 @@ for (const name of ['captureWatchdogDiffBaseline', 'startWatchdogDiffBaselineCap
     `export function ${name}(cwd) {
     if (process.env.YAMABIKO_PI_MOBILE === "1") return ${name.startsWith('start') ? 'Promise.resolve(undefined)' : 'undefined'};`);
 }
+
+// Sarashina reasoning is opaque ciphertext, not a displayable thinking delta.
+// Preserve it in Pi's replay signature while leaving transport and parsing in Pi.
+patch('pi-ai/dist/api/openai-completions.js',
+    'const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];',
+    `if (model.provider === "sarashina" && typeof choice.delta.reasoning === "string" && choice.delta.reasoning.length > 0) {
+                        const block = ensureThinkingBlock("");
+                        block.thinkingSignature += choice.delta.reasoning;
+                    }
+                    const reasoningFields = model.provider === "sarashina" ? [] : ["reasoning_content", "reasoning", "reasoning_text"];`);
+patch('pi-ai/dist/api/openai-completions.js',
+    'const thinkingBlocks = msg.content.filter(isThinkingContentBlock);',
+    `const thinkingBlocks = msg.content.filter(isThinkingContentBlock);
+            if (model.provider === "sarashina" && msg.provider === model.provider && msg.model === model.id) {
+                const encryptedReasoning = thinkingBlocks.map(block => block.thinkingSignature ?? "").join("");
+                if (encryptedReasoning) assistantMsg.reasoning = encryptedReasoning;
+            }`);
+
+// Sarashina accepts string content only, including text-only Pi block arrays.
+patch('pi-ai/dist/api/openai-completions.js',
+    '                    role: "user",\n                    content,',
+    `                    role: "user",
+                    content: model.provider === "sarashina" ? content.filter(part => part.type === "text").map(part => part.text).join("\\n") : content,`);

@@ -479,8 +479,8 @@ final class MathMarkdownViewTests: XCTestCase {
         let html = try renderMarkdownWithJavaScript(source)
         XCTAssertTrue(html.hasPrefix("<ol start=\"7\"><li>"), html)
         XCTAssertEqual(html.components(separatedBy: "<ol").count - 1, 1, html)
-        XCTAssertTrue(html.contains("<ul><li><p>内側 $r$</p></li></ul>"), html)
-        XCTAssertTrue(html.contains("</ul></li><li><p>次の項目 $x$</p></li></ol>"), html)
+        XCTAssertTrue(html.contains(#"<ul><li><p>内側 <span class="yamabiko-math">$r$</span></p></li></ul>"#), html)
+        XCTAssertTrue(html.contains(#"</ul></li><li><p>次の項目 <span class="yamabiko-math">$x$</span></p></li></ol>"#), html)
         XCTAssertTrue(html.contains(#"\frac{r}{\sqrt{r^2-x^2}}"#), html)
         XCTAssertFalse(html.contains("@@"), html)
     }
@@ -649,7 +649,8 @@ final class MathMarkdownViewTests: XCTestCase {
         XCTAssertTrue(html.contains("tex-svg.js"))
         XCTAssertTrue(html.contains("typesetPromise([root])"))
         XCTAssertTrue(html.contains("packages: {'[-]': ['require']}"))
-        XCTAssertTrue(html.contains("options: { enableMenu: false }"))
+        XCTAssertTrue(html.contains("ignoreHtmlClass: 'yamabiko-markdown'"))
+        XCTAssertTrue(html.contains("processHtmlClass: 'yamabiko-math'"))
         XCTAssertTrue(html.contains("Content-Security-Policy"))
         XCTAssertTrue(html.contains("connect-src 'none'"))
     }
@@ -781,57 +782,16 @@ final class MathMarkdownViewTests: XCTestCase {
         XCTAssertEqual(script, rendererScript)
     }
 
-    func testNormalizeEscapedDollarDelimitersBothSides() {
-        let input = #"数式: \$sum_{k=1}^{n} k\$ を表示"#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedDollarDelimiters(input)
-
-        XCTAssertEqual(normalized, #"数式: $sum_{k=1}^{n} k$ を表示"#)
-    }
-
-    func testNormalizeEscapedDollarDelimitersEscapedOpeningOnly() {
-        let input = #"数式: \$sum_{k=1}^{n} k$ を表示"#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedDollarDelimiters(input)
-
-        XCTAssertEqual(normalized, #"数式: $sum_{k=1}^{n} k$ を表示"#)
-    }
-
-    func testNormalizeEscapedDollarDelimitersPreservesEscapedCurrency() {
-        let input = #"価格は \$5 です"#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedDollarDelimiters(input)
-
-        XCTAssertEqual(normalized, input)
-    }
-
-    func testNormalizeEscapedDollarDelimitersSkipsInlineCode() {
-        let input = #"`x = \$sum$` と本文 \$sum$"#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedDollarDelimiters(input)
-
-        XCTAssertEqual(normalized, #"`x = \$sum$` と本文 $sum$"#)
-    }
-
-    func testNormalizeEscapedDollarDelimitersSkipsFencedCodeBlock() {
-        let input = #"""
-```tex
-\$sum$
-```
-本文 \$sum$
-"""#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedDollarDelimiters(input)
-        let expected = #"""
-```tex
-\$sum$
-```
-本文 $sum$
-"""#
-
-        XCTAssertEqual(normalized, expected)
-    }
-
-    func testNormalizeEscapedMathIfNeededNormalizes() {
-        let input = #"本文 \$sum$"#
-        let normalized = MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(input)
-
-        XCTAssertEqual(normalized, #"本文 $sum$"#)
+    func testNormalizationPreservesEscapedDollarLiteralsAndCurrency() {
+        for input in [
+            #"数式の記法: \$x\$ と \(y\)"#,
+            #"本文 \$sum$"#,
+            #"価格は \$5 と \$10 です。式 $x$"#,
+            #"`x = \$sum$` と本文 \$sum$"#,
+            "~~~tex\n" + #"\$sum$"# + "\n~~~\n式 $x$"
+        ] {
+            XCTAssertEqual(MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(input), input)
+        }
     }
 
     func testNormalizeEscapedMathIfNeededNormalizesEscapedSequencesWhenMathPresent() {
@@ -840,7 +800,7 @@ final class MathMarkdownViewTests: XCTestCase {
 
         let expected = """
         1行目
-        \\(a+b\\) と $sum_{k=1}^{n}k$
+        \\(a+b\\) と \\$sum_{k=1}^{n}k\\$
         """
         XCTAssertEqual(normalized, expected)
     }
@@ -1122,7 +1082,7 @@ line1\\nline2
     func testDisplayMathWithBlankLinesStaysInOneTextNode() throws {
         for equation in [#"\["# + "\n\nx^2 < y\n\n" + #"\]"#, "$$\n\nx^2 < y\n\n$$"] {
             let html = try renderMarkdownWithJavaScript(equation)
-            XCTAssertEqual(html, "<p>" + equation.replacingOccurrences(of: "<", with: "&lt;") + "</p>")
+            XCTAssertEqual(html, #"<p><span class="yamabiko-math yamabiko-math-display">"# + equation.replacingOccurrences(of: "<", with: "&lt;") + "</span></p>")
         }
     }
 
@@ -1171,6 +1131,158 @@ line1\\nline2
         > \]
         """#
         try await assertMathRenders(source, expectedEquationCount: 4, usesNativeView: true)
+    }
+
+    func testRendererProtectsCodeSpansAndVariableLengthFencesBeforeMath() throws {
+        for source in [
+            #"式 $x$ と ``a`$not_math$`b``"#,
+            "- 式 $x$\n\n  ~~~tex\n  $not_math$\n  ~~~",
+            "式 $x$\n\n````tex\n```\n$not_math$\n````",
+            "式 $x$\n\n~~~tex\n$not_math$",
+            "> 式 $x$\n> ~~~tex\n> $not_math$\n> ~~~"
+        ] {
+            let html = try renderMarkdownWithJavaScript(source)
+            XCTAssertEqual(html.components(separatedBy: #"class="yamabiko-math""#).count - 1, 1, html)
+            XCTAssertTrue(html.contains("$not_math$"), html)
+            XCTAssertTrue(html.contains("<code"), html)
+            XCTAssertFalse(html.contains("@@"), html)
+        }
+        let html = try renderMarkdownWithJavaScript(#"式 $x$ と foo\_bar\_baz と ~~削除~~"#)
+        XCTAssertTrue(html.contains("foo_bar_baz"), html)
+        XCTAssertTrue(html.contains("<s>削除</s>"), html)
+        XCTAssertFalse(html.contains("<em>"), html)
+    }
+
+    func testDisplayMathPreservesBlankLinesBesideProse() throws {
+        for (opening, closing) in [(#"\["#, #"\]"#), ("$$", "$$")] {
+            let equation = opening + "\nx=1\n\ny=2\n" + closing
+            let html = try renderMarkdownWithJavaScript("前文 " + equation + " 後文")
+            XCTAssertEqual(html, #"<p>前文 <span class="yamabiko-math yamabiko-math-display">"# + equation + "</span> 後文</p>")
+        }
+    }
+
+    func testNativeAndWebMathDetectionAgreeOnMathAndCodeBoundaries() throws {
+        let fixtures: [(String, Bool)] = [
+            ("Price: $5 and $10", false),
+            ("価格は$100と$200です", false),
+            (#"\$x\$"#, false),
+            ("$ x $", false),
+            ("$x$y", false),
+            ("$x\n+y$", false),
+            ("$a`code`b$", false),
+            ("``a`$x$`b``", false),
+            ("~~~tex\n$x$\n~~~", false),
+            ("- ~~~tex\n  $x$\n  ~~~", false),
+            ("\\\\[x\\\\]", true),
+            ("Price: $5 and $10. 式 $x^2$", true),
+            (#"式 $x_i$ と \(y\)"#, true),
+            (#"\[x\]"#, true),
+            ("$$x$$", true),
+            ("\\[\nx\n>0\n\\]", true)
+        ]
+        for (source, expected) in fixtures {
+            let nativeHasMath = NativeMarkdownParser.parse(source).contains {
+                if case .math = $0 { return true }; return false
+            }
+            let html = try renderMarkdownWithJavaScript(MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(source))
+            XCTAssertEqual(nativeHasMath, expected, source)
+            XCTAssertEqual(html.contains(#"class="yamabiko-math"#), expected, source)
+        }
+    }
+
+    func testMathDoesNotInsertMarkupIntoURLsOrConsumeLiteralTokenNames() throws {
+        let html = try renderMarkdownWithJavaScript(#"式 $x$ と https://example.com/$path$ と [$y$](https://example.com/$path$) と @@YBPROTECTED999@@"#)
+        XCTAssertTrue(html.contains(#"href="https://example.com/$path$""#), html)
+        XCTAssertEqual(html.components(separatedBy: #"class="yamabiko-math""#).count - 1, 2, html)
+        XCTAssertTrue(html.contains("@@YBPROTECTED999@@"), html)
+    }
+
+    @MainActor
+    func testMathJaxProcessesOnlyRecognizedMathAndPreservesCodeAndCurrency() async throws {
+        let source = #"""
+        Price: $5 and $10. 式 $x^2$ と記法 \$z\$ と foo\_bar\_baz と ~~削除~~
+
+        ``a`$not_math$`b``
+
+        - 式 \(y\)
+
+          ~~~tex
+          $not_math$
+          ~~~
+
+        前文 \[
+        x=1
+
+        y=2
+        \] 後文
+        """#
+        let webView = try await renderedWebView(source)
+        let equations = try await webView.evaluateJavaScript("Array.from(MathJax.startup.document.math).map(m => m.math)") as? [String]
+        XCTAssertEqual(equations, ["x^2", "y", "\nx=1\n\ny=2\n"])
+        let text = try await webView.evaluateJavaScript("document.getElementById('yamabiko-markdown').textContent") as? String ?? ""
+        XCTAssertTrue(text.contains("Price: $5 and $10."), text)
+        XCTAssertTrue(text.contains("記法 $z$"), text)
+        XCTAssertTrue(text.contains("foo_bar_baz"), text)
+        let code = try await webView.evaluateJavaScript("Array.from(document.querySelectorAll('code')).map(c => c.textContent)") as? [String]
+        XCTAssertEqual(code, ["a`$not_math$`b", "$not_math$\n"])
+        let errors = try await webView.evaluateJavaScript("document.querySelectorAll('[data-mml-node=\"merror\"]').length") as? Int
+        XCTAssertEqual(errors, 0)
+        try await assertMathRenders(source, expectedEquationCount: 3, usesNativeView: true)
+    }
+
+    @MainActor
+    func testJapaneseMathAndLongEquationsKeepReadableSizeAndScroll() async throws {
+        let explanation = "これはとても長い日本語の説明であり数式の横幅を超えるかもしれない文字列です"
+        let source = #"$x = 日本語 + y$"# + "\n\n" +
+            #"\[\frac{\text{売上高} - \text{費用}}{\text{人数}} = \text{一人あたり利益}\]"# + "\n\n" +
+            #"\[f(x)=\begin{cases}x^2 & \text{正の場合}\\0 & \text{それ以外}\end{cases}\]"# + "\n\n" +
+            #"$x_{\text{最大値}}=2$"# + "\n\n" + #"\[x = \text{"# + explanation + #"} + y\]"# +
+            "\n\n" + #"\(x = \text{"# + explanation + #"} + y\)"#
+        let webView = try await renderedWebView(source)
+        let count = try await webView.evaluateJavaScript("document.querySelectorAll('mjx-container svg').length") as? Int
+        XCTAssertEqual(count, 6)
+        let errors = try await webView.evaluateJavaScript("document.querySelectorAll('[data-mml-node=\"merror\"]').length") as? Int
+        XCTAssertEqual(errors, 0)
+        let glyphs = try await webView.evaluateJavaScript("Array.from(document.querySelectorAll('svg text')).map(t => t.textContent).join('')") as? String ?? ""
+        XCTAssertTrue(glyphs.contains(explanation), glyphs)
+        let measuredSizes = try await webView.evaluateJavaScript("""
+            (() => {
+              return Array.from(document.querySelectorAll('.yamabiko-math')).slice(-2).map(wrapper => {
+                const container = wrapper.querySelector('mjx-container[display="true"]') || wrapper;
+                const svg = container.querySelector('svg');
+                container.scrollLeft = 80;
+                return [container.clientWidth, container.scrollWidth, svg.getBoundingClientRect().height, container.scrollLeft];
+              });
+            })()
+            """) as? [[Double]]
+        for sizes in try XCTUnwrap(measuredSizes) {
+            XCTAssertLessThanOrEqual(sizes[0], 390)
+            XCTAssertGreaterThan(sizes[1], sizes[0])
+            XCTAssertGreaterThanOrEqual(sizes[2], 16, "Long Japanese equations must not shrink to fit")
+            XCTAssertGreaterThan(sizes[3], 0, "The complete equation must remain reachable by scrolling")
+        }
+    }
+
+    @MainActor
+    private func renderedWebView(_ source: String) async throws -> WKWebView {
+        let normalized = MathMarkdownNormalizer.normalizeEscapedMathIfNeeded(source)
+        let payload = try XCTUnwrap(String(data: JSONEncoder().encode(normalized), encoding: .utf8))
+        let plan = MathJaxLoadPlanner.plan(localScriptURL: MathMarkdownResourceResolver.mathJaxScriptURL())
+        let html = MathMarkdownHTMLBuilder.buildHTML(
+            markdownPayload: payload, markdownRendererScript: try loadMarkdownRendererSource(),
+            bodyTextColor: "#000", codeBackgroundColor: "#eee", borderColor: "#ddd", linkColor: "#00f",
+            mathJaxScriptTag: plan.scriptTag
+        )
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 800))
+        webView.loadHTMLString(html, baseURL: plan.baseURL)
+        for _ in 0..<150 {
+            if (try? await webView.evaluateJavaScript("window.__yamabikoContentReady === true")) as? Bool == true {
+                return webView
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTFail("MathJax did not finish rendering")
+        return webView
     }
 
     private func loadMarkdownRendererSource() throws -> String {

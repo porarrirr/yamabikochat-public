@@ -264,6 +264,36 @@ final class AgentSkillRepositoryTests: XCTestCase {
         await worker.resetSession(sessionID: "skill-runtime")
     }
 
+    func testBundledInstallationPublishesOneCompleteCatalog() throws {
+        let bundle = temporaryRoot.appendingPathComponent("bundle", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        for name in ["first-skill", "second-skill", "third-skill"] {
+            try FileManager.default.moveItem(at: makeSkill(name: name), to: bundle.appendingPathComponent(name))
+        }
+        var catalogs: [[String]] = []
+        let subscription = repository.skillsPublisher.dropFirst().sink { catalogs.append($0.map(\.id)) }
+        defer { subscription.cancel() }
+
+        try repository.installBundledSkills(from: bundle)
+
+        XCTAssertEqual(catalogs, [["first-skill", "second-skill", "third-skill"]])
+        try repository.installBundledSkills(from: bundle)
+        XCTAssertEqual(catalogs.count, 1)
+    }
+
+    func testReloadStillRejectsModifiedResourceContents() throws {
+        let preview = try repository.inspect(sourceURL: makeSkill(name: "verified-skill",
+            extraFiles: ["references/source.md": "https://example.com/original"]))
+        XCTAssertEqual(preview.externalURLs, ["https://example.com/original"])
+        _ = try repository.install(preview, trusted: true, allowReplacement: false)
+        let root = try repository.rootForEnabledSkill(name: "verified-skill")
+        try Data("https://example.com/modified".utf8).write(to: root.appendingPathComponent("references/source.md"))
+
+        let reloaded = AgentSkillRepository(rootURL: temporaryRoot.appendingPathComponent("installed"))
+
+        XCTAssertTrue(reloaded.installedSkills.isEmpty)
+    }
+
     func testBundledSkillsSeedOnceAndPreserveUserChoices() throws {
         let bundle = try XCTUnwrap(Bundle.main.url(forResource: "BundledAgentSkills", withExtension: nil))
         try repository.installBundledSkills(from: bundle)
@@ -285,6 +315,29 @@ final class AgentSkillRepositoryTests: XCTestCase {
         let bundle = try XCTUnwrap(Bundle.main.url(forResource: "BundledAgentSkills", withExtension: nil))
         try repository.installBundledSkills(from: bundle)
         XCTAssertEqual(repository.installedSkills.first?.manifest.description, "User version")
+    }
+
+    func testSeededBundledSkillSkipsResourcesAndStillInstallsNewSkills() throws {
+        let bundle = temporaryRoot.appendingPathComponent("bundle", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        let seeded = bundle.appendingPathComponent("different-folder-name", isDirectory: true)
+        try FileManager.default.moveItem(at: makeSkill(name: "seeded-skill"), to: seeded)
+        try repository.installBundledSkills(from: bundle)
+        try repository.delete(name: "seeded-skill")
+        // Already-seeded resources must not be staged or inventoried on later launches.
+        try FileManager.default.createSymbolicLink(
+            at: seeded.appendingPathComponent("unused-resource"),
+            withDestinationURL: temporaryRoot.appendingPathComponent("missing")
+        )
+        try FileManager.default.moveItem(
+            at: makeSkill(name: "new-bundled-skill"),
+            to: bundle.appendingPathComponent("new", isDirectory: true)
+        )
+
+        let reloaded = AgentSkillRepository(rootURL: temporaryRoot.appendingPathComponent("installed"))
+        try reloaded.installBundledSkills(from: bundle)
+
+        XCTAssertEqual(reloaded.installedSkills.map(\.id), ["new-bundled-skill"])
     }
 
     private func makeSkill(

@@ -273,6 +273,42 @@ final class ChatViewModelBranchTests: XCTestCase {
         ))
     }
 
+    func testSarashinaReasoningEffortUsesOfficialLevelsAndPersistsSelection() throws {
+        let fixture = try makeFixture()
+        let settings = try fixture.repository.loadSettings()
+        let model = "sarashina3.2-mini-thinking"
+        let configuration = fixture.repository.reasoningEffortConfiguration(
+            settings: settings, provider: "SARASHINA", model: model
+        )
+        XCTAssertEqual(configuration?.options, ["low", "medium", "high"])
+        XCTAssertEqual(configuration?.selectedValue, "medium")
+        try fixture.repository.setReasoningEffort("high", provider: "SARASHINA", model: model)
+        XCTAssertEqual(try fixture.repository.loadSettings().sarashinaReasoningEffort, "high")
+        XCTAssertThrowsError(try fixture.repository.setReasoningEffort("off", provider: "SARASHINA", model: model))
+        for plain in ["sarashina3-mini", "sarashina3-nano", "sarashina3-guard"] {
+            XCTAssertNil(fixture.repository.reasoningEffortConfiguration(settings: settings, provider: "SARASHINA", model: plain))
+        }
+    }
+
+    func testPlamoReasoningEffortUsesOfficialLevelsAndPersistsSelection() throws {
+        let fixture = try makeFixture()
+        let settings = try fixture.repository.loadSettings()
+        for model in ["plamo-3.0-prime", "plamo-3.1-prime"] {
+            let configuration = fixture.repository.reasoningEffortConfiguration(
+                settings: settings, provider: "PLAMO", model: model
+            )
+            XCTAssertEqual(configuration?.options, ["none", "medium"])
+            XCTAssertEqual(configuration?.selectedValue, "none")
+        }
+        try fixture.repository.setReasoningEffort("medium", provider: "PLAMO", model: "plamo-3.1-prime")
+        XCTAssertEqual(try fixture.repository.loadSettings().plamoReasoningEffort, "medium")
+        XCTAssertThrowsError(try fixture.repository.setReasoningEffort("high", provider: "PLAMO", model: "plamo-3.1-prime"))
+        XCTAssertEqual(try fixture.repository.loadSettings().plamoReasoningEffort, "medium")
+        XCTAssertNil(fixture.repository.reasoningEffortConfiguration(
+            settings: settings, provider: "PLAMO", model: "plamo-3.1-prime-deep-research"
+        ))
+    }
+
     func testSuperGrokReasoningEffortUsesSupportedContractAndPersistsSelection() throws {
         let fixture = try makeFixture()
         var settings = try fixture.repository.loadSettings()

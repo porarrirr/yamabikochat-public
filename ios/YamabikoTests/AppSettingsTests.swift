@@ -3,6 +3,66 @@ import GRDB
 @testable import YamabikoChat
 
 final class AppSettingsTests: XCTestCase {
+    func testSarashinaThinkingMigratesAndPersistsWithoutReplacingSavedModel() throws {
+        let database = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(database, upTo: "v38_plamo_settings")
+        try database.write { db in
+            try db.execute(sql: "ALTER TABLE settings DROP COLUMN sarashinaReasoningEffort")
+            try db.execute(sql: "UPDATE settings SET apiProvider = 'SARASHINA', defaultModel = 'sarashina3-nano' WHERE id = 1")
+        }
+        try AppDatabase.migrator.migrate(database)
+        let repository = SettingsRepository(dbQueue: database)
+        var settings = try repository.load()
+        XCTAssertEqual(settings.sarashinaReasoningEffort, "medium")
+        XCTAssertEqual(settings.defaultModel, "sarashina3-nano")
+        settings.sarashinaReasoningEffort = "high"
+        try repository.save(settings)
+        XCTAssertEqual(try repository.load().sarashinaReasoningEffort, "high")
+        XCTAssertEqual(ProviderCatalog.constrainedModelIDs(for: "SARASHINA"), [
+            "sarashina3.2-mini-thinking", "sarashina3-mini", "sarashina3-nano", "sarashina3-guard"
+        ])
+        XCTAssertEqual(ProviderCatalog.defaultModel(for: "SARASHINA"), "sarashina3-mini")
+    }
+
+    func testPlamoSearchExcludesClientToolsWhenPersistingSupportedModel() {
+        var settings = AppSettings()
+        settings.apiProvider = "PLAMO"
+        settings.defaultModel = "plamo-3.1-prime"
+        settings.plamoWebSearchEnabled = true
+        settings.clientWebSearchToolEnabled = true
+        let normalized = settings.normalizedForPersistence()
+        XCTAssertTrue(normalized.plamoWebSearchEnabled)
+        XCTAssertFalse(normalized.clientWebSearchToolEnabled)
+        XCTAssertFalse(normalized.pythonToolEnabled)
+        XCTAssertFalse(normalized.genUIToolEnabled)
+        settings.defaultModel = "plamo-3.0-prime"
+        XCTAssertTrue(settings.normalizedForPersistence().pythonToolEnabled)
+        XCTAssertTrue(settings.normalizedForPersistence().clientWebSearchToolEnabled)
+    }
+
+    func testPlamoSettingsMigrateExistingDatabaseAndPersist() throws {
+        let database = try DatabaseQueue()
+        try AppDatabase.migrator.migrate(database, upTo: "v37_dual_side_execution_metrics")
+        try database.write { db in
+            try db.execute(sql: "ALTER TABLE settings DROP COLUMN plamoWebSearchEnabled")
+            try db.execute(sql: "ALTER TABLE settings DROP COLUMN plamoReasoningEffort")
+            try db.execute(sql: "UPDATE settings SET apiProvider = 'SARASHINA', defaultModel = 'sarashina3-nano' WHERE id = 1")
+        }
+        try AppDatabase.migrator.migrate(database)
+        let repository = SettingsRepository(dbQueue: database)
+        var settings = try repository.load()
+        XCTAssertEqual(settings.apiProvider, "SARASHINA")
+        XCTAssertEqual(settings.defaultModel, "sarashina3-nano")
+        XCTAssertFalse(settings.plamoWebSearchEnabled)
+        XCTAssertEqual(settings.plamoReasoningEffort, "none")
+        settings.plamoWebSearchEnabled = true
+        settings.plamoReasoningEffort = "medium"
+        try repository.save(settings)
+        let saved = try repository.load()
+        XCTAssertTrue(saved.plamoWebSearchEnabled)
+        XCTAssertEqual(saved.plamoReasoningEffort, "medium")
+    }
+
     func testRetiringFusionPreservesConversationAndIgnoresLegacySettings() throws {
         let database = try DatabaseQueue()
         try AppDatabase.migrator.migrate(database, upTo: "v32_context_compaction")

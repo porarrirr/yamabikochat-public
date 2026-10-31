@@ -28,25 +28,33 @@ private struct AppBootstrapView: View {
                     onRetry: initialize
                 )
             } else {
-                ProgressView(L10n.text("データベースを準備しています…"))
+                Color(uiColor: .systemBackground)
+                    .ignoresSafeArea()
             }
         }
         .task {
             if services == nil, initializationError == nil {
-                initialize()
+                await initializeAsync()
             }
         }
     }
 
     private func initialize() {
+        Task { await initializeAsync() }
+    }
+
+    private func initializeAsync() async {
         guard !isRetrying else { return }
         isRetrying = true
         initializationError = nil
         do {
-            services = try AppServices.resolve()
+            async let resolvedServices = AppServices.resolve()
+            // Every app web view requires the WebKit network block before it is created.
+            try await YamabikoWebKitSupport.prepareNetworkPolicy()
+            services = try await resolvedServices
         } catch {
             initializationError = error
-            DiagnosticsLogger.log("Database initialization failed", category: .app, error: error)
+            DiagnosticsLogger.log("App initialization failed", category: .app, error: error)
         }
         isRetrying = false
     }

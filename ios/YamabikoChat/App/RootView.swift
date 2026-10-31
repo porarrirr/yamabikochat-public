@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum ConversationListSelectionResolution: Equatable {
     case keepCurrentSelection
@@ -33,6 +34,14 @@ enum RootNavigationPresentationPolicy {
     static func usesCompactColumnNavigation(horizontalSizeClass: UserInterfaceSizeClass?) -> Bool {
         horizontalSizeClass == .compact
     }
+
+    static func toggledSidebarVisibility(
+        _ visibility: NavigationSplitViewVisibility
+    ) -> NavigationSplitViewVisibility {
+        // `.automatic` compares equal to `.detailOnly` on current SDKs, so
+        // treating anything but an explicit `.detailOnly` would never hide.
+        visibility == .detailOnly ? .all : .detailOnly
+    }
 }
 
 struct RootView: View {
@@ -46,11 +55,12 @@ struct RootView: View {
     @StateObject private var listViewModel = ConversationListViewModel()
     @StateObject private var settingsStore = SettingsViewModelStore()
     @StateObject private var chatViewModelStore = ChatViewModelStore()
-    @State private var isSettingsPresented = false
-    @State private var screenshotSettingsTab: SettingsScreen.SettingsTab?
+    @State private var settingsPresentation: SettingsPresentation?
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
     @State private var isCompactDrawerOpen = false
+    @State private var windowControlsLeadingInset: CGFloat = 0
+    @State private var isProjectNavigationActive = false
     @State private var themeColor = "BLUE_PURPLE"
     @State private var themeMode = "SYSTEM"
     @State private var keepSidebarAfterSecretDiscard = false
@@ -63,6 +73,11 @@ struct RootView: View {
 
     var body: some View {
         navigationContent
+        .background {
+            WindowControlsLayoutProbe(leadingInset: $windowControlsLeadingInset)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        }
         .task {
             listViewModel.bind(repository: container.chatRepository)
             if let settings = try? container.chatRepository.loadSettings() {
@@ -104,15 +119,10 @@ struct RootView: View {
             applyAppearance(settings)
         }
         .onChange(of: appState.conversationSidebarRevealGeneration) { _, _ in
-            let revealSidebar = {
-                columnVisibility = .all
-                setPreferredCompactColumn(.sidebar)
-            }
-            if reduceMotion {
-                revealSidebar()
-            } else {
-                withAnimation(.easeOut(duration: 0.25), revealSidebar)
-            }
+            setConversationSidebarVisible(true, animated: !reduceMotion)
+        }
+        .onChange(of: appState.conversationSidebarToggleGeneration) { _, _ in
+            toggleConversationSidebar()
         }
         .onChange(of: horizontalSizeClass) { _, _ in
             // Folding changes the navigation container, not the selected conversation.
@@ -161,10 +171,10 @@ struct RootView: View {
                 setPreferredCompactColumn(.detail)
             }
         }
-        .sheet(isPresented: $isSettingsPresented) {
-            SettingsScreen(viewModel: settingsViewModel, initialTab: screenshotSettingsTab)
+        .modifier(SettingsPresentationModifier(presentation: $settingsPresentation) { presentation in
+            SettingsScreen(viewModel: settingsViewModel, initialTab: presentation.initialTab)
                 .environmentObject(container)
-        }
+        })
         .sheet(isPresented: $appState.isConversationHistoryPresented) {
             ConversationHistorySheet(
                 viewModel: listViewModel,
@@ -211,12 +221,14 @@ struct RootView: View {
                     .environmentObject(appState)
                     .tint(resolvedAccent.color)
                     .environment(\.appAccent, resolvedAccent)
+                    .environment(\.windowControlsLeadingInset, windowControlsLeadingInset)
             } detail: {
                 conversationDetail
                     .environmentObject(container)
                     .environmentObject(appState)
                     .tint(resolvedAccent.color)
                     .environment(\.appAccent, resolvedAccent)
+                    .environment(\.windowControlsLeadingInset, chatPaneWindowControlsLeadingInset)
             }
             .ignoresSafeArea()
         } else {
@@ -225,11 +237,24 @@ struct RootView: View {
                 preferredCompactColumn: $preferredCompactColumn
             ) {
                 conversationSidebar
-                    .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 360)
+                    .navigationSplitViewColumnWidth(
+                        min: 280,
+                        ideal: isProjectNavigationActive ? 460 : 320,
+                        max: isProjectNavigationActive ? 560 : 360
+                    )
+                    .environment(\.windowControlsLeadingInset, windowControlsLeadingInset)
             } detail: {
                 conversationDetail
+                    .environment(\.windowControlsLeadingInset, chatPaneWindowControlsLeadingInset)
             }
         }
+    }
+
+    private var chatPaneWindowControlsLeadingInset: CGFloat {
+        if RootNavigationPresentationPolicy.usesCompactColumnNavigation(horizontalSizeClass: horizontalSizeClass) {
+            return isCompactDrawerOpen ? 0 : windowControlsLeadingInset
+        }
+        return columnVisibility == .detailOnly ? windowControlsLeadingInset : 0
     }
 
     private var conversationSidebar: some View {
@@ -237,8 +262,14 @@ struct RootView: View {
             viewModel: listViewModel,
             selection: $appState.selectedConversationID,
             onSelect: { id in selectConversation(id: id) },
-            onOpenSettings: { isSettingsPresented = true },
-            allowsRowSwipeActions: horizontalSizeClass != .compact || appState.selectedConversationID == nil
+            onOpenSettings: { settingsPresentation = SettingsPresentation() },
+            allowsRowSwipeActions: horizontalSizeClass != .compact || appState.selectedConversationID == nil,
+            onNavigationStateChange: { navigationState in
+                let isActive = navigationState != .conversations
+                if isProjectNavigationActive != isActive {
+                    isProjectNavigationActive = isActive
+                }
+            }
         )
     }
 
@@ -345,17 +376,13 @@ struct RootView: View {
                 selectConversation(id: conversationID)
             }
         case .settingsAPI:
-            screenshotSettingsTab = .api
-            isSettingsPresented = true
+            settingsPresentation = SettingsPresentation(initialTab: .api)
         case .settingsAppearance:
-            screenshotSettingsTab = .appearance
-            isSettingsPresented = true
+            settingsPresentation = SettingsPresentation(initialTab: .appearance)
         case .settingsDual:
-            screenshotSettingsTab = .dual
-            isSettingsPresented = true
+            settingsPresentation = SettingsPresentation(initialTab: .dual)
         case .settingsAuto:
-            screenshotSettingsTab = .auto
-            isSettingsPresented = true
+            settingsPresentation = SettingsPresentation(initialTab: .auto)
         case .project:
             if let projectID = launch.projectID {
                 listViewModel.selectProject(projectID)
@@ -461,10 +488,47 @@ struct RootView: View {
         }
     }
 
+    private func toggleConversationSidebar() {
+        let update = {
+            if RootNavigationPresentationPolicy.usesCompactColumnNavigation(
+                horizontalSizeClass: horizontalSizeClass
+            ) {
+                setPreferredCompactColumn(isCompactDrawerOpen ? .detail : .sidebar)
+            } else {
+                columnVisibility = RootNavigationPresentationPolicy.toggledSidebarVisibility(columnVisibility)
+            }
+        }
+        if reduceMotion {
+            update()
+        } else {
+            withAnimation(.easeOut(duration: 0.25), update)
+        }
+    }
+
+    private func setConversationSidebarVisible(_ isVisible: Bool, animated: Bool) {
+        let update = {
+            if RootNavigationPresentationPolicy.usesCompactColumnNavigation(horizontalSizeClass: horizontalSizeClass) {
+                setPreferredCompactColumn(isVisible ? .sidebar : .detail)
+            } else {
+                columnVisibility = isVisible ? .all : .detailOnly
+            }
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.25), update)
+        } else {
+            update()
+        }
+    }
+
     private func setPreferredCompactColumn(_ column: NavigationSplitViewColumn) {
         guard RootNavigationPresentationPolicy.usesCompactColumnNavigation(
             horizontalSizeClass: horizontalSizeClass
         ) else {
+            // The conversation list must stay reachable when an action that
+            // targets the sidebar arrives after it was collapsed on iPad.
+            if column == .sidebar {
+                columnVisibility = .all
+            }
             return
         }
         preferredCompactColumn = column
@@ -517,6 +581,24 @@ private struct ConversationDetailHost: View {
                     viewModel.discardSecretDataFromMemory()
                 }
             }
+    }
+}
+
+private struct SettingsPresentation: Identifiable {
+    let id = UUID()
+    var initialTab: SettingsScreen.SettingsTab? = nil
+}
+
+private struct SettingsPresentationModifier<SettingsContent: View>: ViewModifier {
+    @Binding var presentation: SettingsPresentation?
+    var settingsContent: (SettingsPresentation) -> SettingsContent
+
+    func body(content: Content) -> some View {
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            content.fullScreenCover(item: $presentation, content: settingsContent)
+        } else {
+            content.sheet(item: $presentation, content: settingsContent)
+        }
     }
 }
 

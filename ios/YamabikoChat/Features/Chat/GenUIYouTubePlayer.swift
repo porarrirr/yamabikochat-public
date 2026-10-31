@@ -7,8 +7,7 @@ final class GenUIYouTubePlayer: NSObject, WKScriptMessageHandler {
     var onEvent: ((String, Int?) -> Void)?
 
     init(videoID: String, title: String, poster: Bool = false) {
-        let configuration = YamabikoWebKitSupport.makeConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
+        let configuration = YamabikoWebKitSupport.makeConfiguration(network: .youTubeEmbed)
         configuration.allowsInlineMediaPlayback = true
         configuration.mediaTypesRequiringUserActionForPlayback = .all
         webView = WKWebView(frame: .zero, configuration: configuration)
@@ -18,7 +17,7 @@ final class GenUIYouTubePlayer: NSObject, WKScriptMessageHandler {
         webView.isOpaque = false
         webView.backgroundColor = .black
         webView.isUserInteractionEnabled = !poster
-        let identifier = Bundle.main.bundleIdentifier ?? "com.porarri.yamabikochat.ios"
+        let identifier = Bundle.main.bundleIdentifier ?? "org.example.yamabikochat.ios"
         let baseURL = URL(string: "https://\(identifier)")!
         // Google documents the app Bundle ID as the WebView embedding identity:
         // https://developers.google.com/youtube/terms/required-minimum-functionality#embedded-player-api-client-identity

@@ -208,6 +208,29 @@ final class ShortcutRunTests: XCTestCase {
         }
     }
 
+    func testRunShortcutAcceptsEveryShortcutProviderOption() async throws {
+        let fixture = try makeFixture()
+        let options = ShortcutModelOptionsBuilder.providerOptions(catalogProviders: [
+            ShortcutModelOptionsTests.catalogProvider(id: "opencode-go", name: "OpenCode Go", modelIDs: ["beam-free"])
+        ])
+        let unknownProvider = L10n.text("Shortcuts: 不明なプロバイダです。")
+
+        for option in options {
+            do {
+                _ = try await fixture.repository.runShortcut(
+                    prompt: "hello",
+                    provider: option.key,
+                    model: "model-id",
+                    saveToNewConversation: false
+                )
+            } catch let ProviderClientError.parseFailure(message) where message == unknownProvider {
+                XCTFail("Shortcut provider option \(option.key) was rejected as unknown")
+            } catch {
+                // Credential or model resolution failures are expected here; only provider validation is under test.
+            }
+        }
+    }
+
     func testRunShortcutPropagatesProviderHTTPError() async throws {
         let runtime = PiStreamSpy { _, _ in
             throw ProviderClientError.httpStatus(500, "provider failed")
@@ -232,25 +255,113 @@ final class ShortcutRunTests: XCTestCase {
         }
     }
 
-    func testSiriUsesSavedModelAndPiExecutionAndOptionallySaves() async throws {
+    func testRunShortcutAppliesReasoningEffortForThisRunOnly() async throws {
         let runtime = successRuntime()
         let fixture = try makeFixture(runtime: runtime) { settings in
-            settings.apiProvider = "OPENROUTER"
-            settings.defaultModel = "openai/gpt-4o-mini"
+            settings.geminiThinkingEnabled = true
+            settings.geminiThinkingLevel = "high"
+        }
+        try fixture.credentials.setCredential("gemini-key", for: .gemini)
+
+        _ = try await fixture.repository.runShortcut(
+            prompt: "think lightly",
+            provider: "GEMINI",
+            model: "gemini-3-flash-preview",
+            reasoningEffort: "low",
+            saveToNewConversation: false
+        )
+
+        XCTAssertEqual(runtime.calls.last?.request.metadata["geminiThinkingLevel"], "low")
+        XCTAssertEqual(try fixture.repository.loadSettings().geminiThinkingLevel, "high")
+    }
+
+    func testRunShortcutRejectsReasoningEffortTheModelDoesNotOffer() async throws {
+        let runtime = successRuntime()
+        let fixture = try makeFixture(runtime: runtime)
+        try fixture.credentials.setCredential("gemini-key", for: .gemini)
+
+        do {
+            _ = try await fixture.repository.runShortcut(
+                prompt: "hello",
+                provider: "GEMINI",
+                model: "gemini-3-pro-preview",
+                reasoningEffort: "minimal",
+                saveToNewConversation: false
+            )
+            XCTFail("Expected unsupported effort to throw")
+        } catch let ProviderClientError.parseFailure(message) {
+            XCTAssertEqual(message, L10n.text("このモデルでは推論エフォートを変更できません。"))
+        }
+        XCTAssertTrue(runtime.calls.isEmpty)
+    }
+
+    func testRunShortcutAllowedToolsDefineTheAppToolsForThisRun() async throws {
+        let runtime = successRuntime()
+        let fixture = try makeFixture(runtime: runtime) { settings in
+            settings.clientWebSearchToolEnabled = true
+            settings.pythonToolEnabled = false
+            settings.genUIToolEnabled = true
         }
         try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
-        let settings = try SettingsRepository(dbQueue: fixture.dbQueue).load()
-        let reply = try await SiriConversationService.ask(
-            prompt: "Siri question", save: false, settings: settings, repository: fixture.repository)
-        XCTAssertEqual(reply.text, "shortcut answer")
-        XCTAssertNil(reply.conversationId)
-        XCTAssertEqual(runtime.calls.last?.request.model, settings.currentModel())
-        XCTAssertEqual(runtime.calls.last?.request.messages.last?.content, "Siri question")
-        let saved = try await SiriConversationService.ask(
-            prompt: "Save this question", save: true, settings: settings, repository: fixture.repository)
-        let conversationID = try XCTUnwrap(saved.conversationId)
-        XCTAssertEqual(try fixture.conversations.fetchConversation(id: conversationID)?.apiProvider, settings.apiProvider)
-        XCTAssertEqual(try fixture.conversations.fetchMessages(conversationId: conversationID).count, 2)
+
+        _ = try await fixture.repository.runShortcut(
+            prompt: "calculate",
+            provider: "OPENROUTER",
+            model: "openai/gpt-4o-mini",
+            allowedTools: [.python],
+            saveToNewConversation: false
+        )
+
+        let request = try XCTUnwrap(runtime.calls.last?.request)
+        XCTAssertEqual(functionToolNames(request), [PythonExecuteTool.name])
+        let saved = try fixture.repository.loadSettings()
+        XCTAssertTrue(saved.clientWebSearchToolEnabled)
+        XCTAssertFalse(saved.pythonToolEnabled)
+    }
+
+    func testRunShortcutEmptyAllowedToolsSendsNoAppTools() async throws {
+        let runtime = successRuntime()
+        let fixture = try makeFixture(runtime: runtime) { settings in
+            settings.clientWebSearchToolEnabled = true
+            settings.genUIToolEnabled = true
+        }
+        try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
+
+        _ = try await fixture.repository.runShortcut(
+            prompt: "no tools",
+            provider: "OPENROUTER",
+            model: "openai/gpt-4o-mini",
+            allowedTools: [],
+            saveToNewConversation: false
+        )
+
+        XCTAssertEqual(functionToolNames(try XCTUnwrap(runtime.calls.last?.request)), [])
+    }
+
+    func testRunShortcutWithoutAllowedToolsKeepsAppToolSettings() async throws {
+        let runtime = successRuntime()
+        let fixture = try makeFixture(runtime: runtime) { settings in
+            settings.clientWebSearchToolEnabled = true
+            settings.pythonToolEnabled = false
+            settings.genUIToolEnabled = false
+        }
+        try fixture.credentials.setCredential("openrouter-key", for: .openRouter)
+
+        _ = try await fixture.repository.runShortcut(
+            prompt: "default tools",
+            provider: "OPENROUTER",
+            model: "openai/gpt-4o-mini",
+            saveToNewConversation: false
+        )
+
+        XCTAssertEqual(
+            functionToolNames(try XCTUnwrap(runtime.calls.last?.request)),
+            [WebSearchTool.name, FetchUrlTool.name, StrReplaceEditorTool.name]
+        )
+    }
+
+    private func functionToolNames(_ request: ProviderRequest) -> Set<String> {
+        Set(request.tools.filter { $0.type == "function" }.compactMap { $0.payload["name"] })
     }
 
     private func makeFixture(

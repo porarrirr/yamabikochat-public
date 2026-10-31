@@ -143,6 +143,8 @@ final class ChatTimelineStore: ObservableObject {
     private var rowsByID: [String: ChatTimelineRowStore] = [:]
     private var messageRowIDByDatabaseID: [Int64: String] = [:]
     private var pendingStreamingSnapshotsByMessageID: [Int64: ChatStreamingSnapshot] = [:]
+    private var pendingUserMessage: FullChatMessage?
+    private var userMessageIDsBeforeSend: Set<String> = []
     private var latestMessages: [FullChatMessage] = []
     private var latestDualMessages: [DualChatMessage] = []
 
@@ -159,6 +161,26 @@ final class ChatTimelineStore: ObservableObject {
 
     func update(dualMessages: [DualChatMessage]) {
         latestDualMessages = dualMessages
+        rebuild()
+    }
+
+    // Presentation only: persistence and provider validation remain in the repository.
+    func showPendingUserMessage(conversationID: Int64, text: String, attachments: [String]) {
+        userMessageIDsBeforeSend = Set(orderedIDs)
+        let attachmentsJSON = String(decoding: try! JSONEncoder().encode(attachments), as: UTF8.self)
+        pendingUserMessage = FullChatMessage(
+            id: -1,
+            message: ChatMessage(id: -1, conversationId: conversationID, role: "user",
+                                 text: text, attachmentsJSON: attachmentsJSON),
+            thinkingStream: nil, variants: []
+        )
+        rebuild()
+    }
+
+    func clearPendingUserMessage() {
+        guard pendingUserMessage != nil else { return }
+        pendingUserMessage = nil
+        userMessageIDsBeforeSend = []
         rebuild()
     }
 
@@ -212,6 +234,8 @@ final class ChatTimelineStore: ObservableObject {
     }
 
     func clearAll() {
+        pendingUserMessage = nil
+        userMessageIDsBeforeSend = []
         latestMessages = []
         latestDualMessages = []
         pendingStreamingSnapshotsByMessageID.removeAll(keepingCapacity: false)
@@ -219,8 +243,23 @@ final class ChatTimelineStore: ObservableObject {
     }
 
     private func rebuild() {
+        if let pending = pendingUserMessage {
+            let committed = latestMessages.contains {
+                !userMessageIDsBeforeSend.contains("m-\($0.id)")
+                    && $0.message.role == "user" && $0.message.text == pending.message.text
+                    && $0.message.attachmentsJSON == pending.message.attachmentsJSON
+            } || latestDualMessages.contains {
+                !userMessageIDsBeforeSend.contains("d-\($0.id ?? $0.createdAtMs)")
+                    && $0.role == "user" && $0.userText == pending.message.text
+                    && $0.attachmentsJSON == pending.message.attachmentsJSON
+            }
+            if committed {
+                pendingUserMessage = nil
+                userMessageIDsBeforeSend = []
+            }
+        }
         let snapshot = ChatTimelineSnapshot(
-            messages: latestMessages,
+            messages: latestMessages + (pendingUserMessage.map { [$0] } ?? []),
             dualMessages: latestDualMessages
         )
         let nextIDs = snapshot.items.map(\.id)

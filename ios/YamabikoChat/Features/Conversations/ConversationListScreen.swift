@@ -13,12 +13,16 @@ struct ConversationListScreen: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.appAccent) private var appAccent
+    @Environment(\.windowControlsLeadingInset) private var windowControlsLeadingInset
 
     var onSelect: (Int64) -> Void
     var onOpenSettings: () -> Void
     var onClose: (() -> Void)? = nil
     var allowsRowSwipeActions = true
+    var onNavigationStateChange: ((NavigationState) -> Void)? = nil
 
+    @State private var isSearchPresented = false
+    @FocusState private var isSearchFocused: Bool
     @State private var navigationState: NavigationState = .conversations
     @State private var isDeleteConfirmationPresented = false
     @State private var conversationPendingDeletion: Int64?
@@ -56,12 +60,13 @@ struct ConversationListScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .toolbar(.hidden, for: .navigationBar)
-        .background(Color(uiColor: .amoledSystemGroupedBackground))
+        .background(Color(uiColor: .amoledSystemBackground))
         .onAppear {
             if AppStoreScreenshotRouting.launchConfiguration()?.scene == .project,
                navigationState == .conversations {
                 navigationState = .projectList
             }
+            onNavigationStateChange?(navigationState)
         }
         .safeAreaInset(edge: .bottom) {
             if let error = viewModel.visibleErrorMessage {
@@ -112,33 +117,44 @@ struct ConversationListScreen: View {
                     navigate(to: .projectList)
                 }
                 .padding(.horizontal, 16)
-                .padding(.bottom, 0)
+                .padding(.bottom, 12)
+
+                Divider()
+                    .padding(.horizontal, 20)
             }
 
             List {
                 if viewModel.filteredConversations.isEmpty {
                     Section {
                         VStack(spacing: 12) {
-                            Image(systemName: "bubble.left.and.bubble.right")
+                            Image(systemName: viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "bubble.left.and.bubble.right" : "magnifyingglass")
                                 .font(.system(size: 28))
                                 .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
 
-                            Text(L10n.text("会話がありません"))
+                            Text(L10n.text(viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "会話がありません" : "該当する会話がありません"))
                                 .font(.subheadline.weight(.medium))
                                 .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
 
-                            Button {
-                                createConversation(secret: false)
-                            } label: {
-                                // Keep the button content centered instead of inheriting
-                                // the surrounding List's leading icon column.
-                                HStack(spacing: 8) {
-                                    Image(systemName: "square.and.pencil")
-                                    Text(L10n.text("新しいチャット"))
+                            if viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Button {
+                                    createConversation(secret: false)
+                                } label: {
+                                    // Keep the button content centered instead of inheriting
+                                    // the surrounding List's leading icon column.
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "square.and.pencil")
+                                        Text(L10n.text("新しいチャット"))
+                                    }
                                 }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            } else {
+                                Button(L10n.text("検索を消去")) {
+                                    viewModel.searchQuery = ""
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 24)
@@ -151,10 +167,10 @@ struct ConversationListScreen: View {
                             conversationRow(entry)
                                 .listRowInsets(
                                     EdgeInsets(
-                                        top: 4,
-                                        leading: 16,
-                                        bottom: 4,
-                                        trailing: 16
+                                        top: 1,
+                                        leading: 12,
+                                        bottom: 1,
+                                        trailing: 12
                                     )
                                 )
                                 .listRowSeparator(.hidden)
@@ -166,8 +182,8 @@ struct ConversationListScreen: View {
                                 .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
                                 .textCase(nil)
                                 .padding(.leading, 4)
-                                .padding(.top, 4)
-                                .padding(.bottom, 4)
+                                .padding(.top, 12)
+                                .padding(.bottom, 6)
                         }
                     }
                 }
@@ -185,7 +201,12 @@ struct ConversationListScreen: View {
             if viewModel.isSelectionMode {
                 selectionActionBar
             } else {
-                settingsFooter
+                HStack(spacing: 12) {
+                    settingsFooter
+                    createConversationButton
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
             }
         }
     }
@@ -193,13 +214,12 @@ struct ConversationListScreen: View {
     // MARK: - Top Header
 
     private var topHeader: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             HStack(spacing: 8) {
-                if viewModel.isSelectionMode {
-                    Text(L10n.text("会話を選択"))
-                        .font(.largeTitle.weight(.bold))
-                        .lineLimit(1)
-                }
+                Text(L10n.text(viewModel.isSelectionMode ? "会話を選択" : "会話"))
+                    .font(.title2.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
 
                 Spacer(minLength: 8)
 
@@ -208,13 +228,27 @@ struct ConversationListScreen: View {
                         viewModel.exitSelectionMode()
                     } label: {
                         Text(L10n.text("完了"))
-                            .font(.body.weight(.semibold))
+                            .font(.subheadline.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("conversation-selection-done")
                 } else {
+                    Button {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                            isSearchPresented.toggle()
+                        }
+                        isSearchFocused = isSearchPresented
+                        if !isSearchPresented { viewModel.searchQuery = "" }
+                    } label: {
+                        Image(systemName: isSearchPresented ? "xmark" : "magnifyingglass")
+                            .font(.system(size: 18, weight: .medium))
+                            .frame(width: 44, height: 44)
+                            .background(Color(uiColor: .amoledSecondarySystemFill), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text(L10n.text(isSearchPresented ? "検索を消去" : "会話を検索")))
+                    .accessibilityIdentifier("conversation-search-toggle")
                     selectionButton
-                    createConversationButton
                 }
 
                 if let onClose {
@@ -230,11 +264,12 @@ struct ConversationListScreen: View {
                 }
             }
 
-            if !viewModel.isSelectionMode {
+            if !viewModel.isSelectionMode && isSearchPresented {
                 searchField
             }
         }
         .padding(.horizontal, 16)
+        .padding(.leading, windowControlsLeadingInset)
         .padding(.top, 12)
         .padding(.bottom, 14)
     }
@@ -250,6 +285,7 @@ struct ConversationListScreen: View {
                 prompt: Text(L10n.text("会話を検索"))
                     .foregroundStyle(Color(uiColor: .amoledPlaceholderText))
             )
+                .focused($isSearchFocused)
                 .textInputAutocapitalization(.never)
                 .disableAutocorrection(true)
 
@@ -277,8 +313,8 @@ struct ConversationListScreen: View {
         Button {
             viewModel.toggleSelectionMode()
         } label: {
-            Text(L10n.text("選択"))
-                .font(.subheadline.weight(.medium))
+            Image(systemName: "checklist")
+                .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
@@ -292,14 +328,17 @@ struct ConversationListScreen: View {
         Button {
             createConversation(secret: false)
         } label: {
-            Image(systemName: "square.and.pencil")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(appAccent.onAccentColor)
-                .frame(width: 44, height: 44)
-                .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(appAccent.color)
-                )
+            HStack(spacing: 10) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 16, weight: .medium))
+                Text(L10n.text("新しいチャット"))
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(appAccent.onAccentColor)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: 200, minHeight: 44)
+            .background(appAccent.color, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Text(L10n.text("新しいチャット")))
@@ -345,29 +384,17 @@ struct ConversationListScreen: View {
         Button {
             onOpenSettings()
         } label: {
-            HStack(spacing: 12) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
-
-                Text(L10n.text("設定"))
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.primary)
-
-                Spacer()
-
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color(uiColor: .amoledTertiaryLabel))
-            }
-            .padding(.horizontal, 22)
-            .frame(minHeight: 56)
+            Image(systemName: "gearshape")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+            .frame(width: 48, height: 48)
+            .background(Color(uiColor: .amoledSecondarySystemFill), in: Circle())
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(Text("設定"))
         .accessibilityIdentifier("open-settings")
-        .background(Color(uiColor: .amoledSystemGroupedBackground))
+        .background(Color(uiColor: .amoledSystemBackground))
     }
 
     // MARK: - Selection Action Bar
@@ -406,7 +433,7 @@ struct ConversationListScreen: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-        .background(Color(uiColor: .amoledSystemGroupedBackground))
+        .background(Color(uiColor: .amoledSystemBackground))
     }
 
     // MARK: - Drawer Action Row
@@ -423,8 +450,7 @@ struct ConversationListScreen: View {
                 Image(systemName: systemImage)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(appAccent.color)
-                    .frame(width: 36, height: 36)
-                    .background(appAccent.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+                    .frame(width: 24, height: 28)
 
                 Text(title)
                     .font(.subheadline.weight(.medium))
@@ -450,8 +476,7 @@ struct ConversationListScreen: View {
                     .foregroundStyle(Color(uiColor: .amoledTertiaryLabel))
             }
             .padding(.horizontal, 12)
-            .frame(minHeight: 56)
-            .background(Color(uiColor: .amoledSecondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -480,8 +505,8 @@ struct ConversationListScreen: View {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 10) {
                         Text(entry.title)
-                            .font(.body.weight(.semibold))
-                            .lineLimit(1)
+                            .font(.body)
+                            .lineLimit(2)
                             .foregroundStyle(.primary)
 
                         if entry.isSecret {
@@ -499,9 +524,12 @@ struct ConversationListScreen: View {
                         }
 
                         Spacer(minLength: 4)
-                        Text(Date(timeIntervalSince1970: Double(entry.updatedAtMs) / 1000), style: .time)
-                            .font(.caption)
-                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
+                        if selection == entry.id && !viewModel.isSelectionMode {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(appAccent.color)
+                                .accessibilityHidden(true)
+                        }
                     }
 
                     if let projectTitle = entry.projectTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !projectTitle.isEmpty {
@@ -513,17 +541,11 @@ struct ConversationListScreen: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(project.map { Color(hex: $0.colorHex) } ?? Color(uiColor: .amoledSecondaryLabel))
                     }
-                    if let preview = entry.lastMessagePreview, !preview.isEmpty, !entry.isSecret {
-                        Text(preview.conversationPreview)
-                            .font(.subheadline)
-                            .foregroundStyle(Color(uiColor: .amoledSecondaryLabel))
-                            .lineLimit(1)
-                    }
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
             .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -533,6 +555,7 @@ struct ConversationListScreen: View {
         .siriConversationContext(id: entry.id, isSecret: entry.isSecret)
         .buttonStyle(.plain)
         .accessibilityIdentifier("conversation-row-\(entry.id)")
+        .accessibilityAddTraits(selection == entry.id && !viewModel.isSelectionMode ? .isSelected : [])
         // Anchor the popover to this row, not the entire sidebar.
         .confirmationDialog(
             L10n.text("この会話を削除しますか？"),
@@ -611,7 +634,7 @@ struct ConversationListScreen: View {
     }
 
     private func rowBackgroundColor(for id: Int64) -> Color {
-        guard selection == id else { return Color(uiColor: .amoledSecondarySystemGroupedBackground) }
+        guard selection == id else { return .clear }
         return appAccent.color.opacity(0.12)
     }
 
@@ -633,5 +656,6 @@ struct ConversationListScreen: View {
                 navigationState = destination
             }
         }
+        onNavigationStateChange?(destination)
     }
 }

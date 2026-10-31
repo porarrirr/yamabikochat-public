@@ -78,6 +78,11 @@ final class AgentSkillRepository: @unchecked Sendable {
 
     @discardableResult
     func install(_ preview: AgentSkillInstallPreview, trusted: Bool, allowReplacement: Bool) throws -> InstalledAgentSkill {
+        try install(preview, trusted: trusted, allowReplacement: allowReplacement, publish: true)
+    }
+
+    @discardableResult
+    private func install(_ preview: AgentSkillInstallPreview, trusted: Bool, allowReplacement: Bool, publish: Bool) throws -> InstalledAgentSkill {
         guard trusted else { throw AgentSkillError.trustRequired }
         let destination = skillURL(named: preview.manifest.name)
         let existing = installedSkills.first { $0.manifest.name == preview.manifest.name }
@@ -108,7 +113,7 @@ final class AgentSkillRepository: @unchecked Sendable {
             isEnabled: state.isEnabled,
             installedAt: state.installedAt
         )
-        reloadLocked()
+        if publish { reloadLocked() }
         DiagnosticsLogger.log("Agent Skill installed", category: .settings, metadata: ["skill": installed.manifest.name])
         return installed
     }
@@ -123,13 +128,23 @@ final class AgentSkillRepository: @unchecked Sendable {
         let sources = try fileManager.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]
         ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var installedAny = false
+        // Publish once, including when a later bundled skill fails to install.
+        defer { if installedAny { reload() } }
         for source in sources {
+            // Seeded skills need only their manifest: staging and hashing every resource
+            // on each launch does no work because user replacements/deletions are preserved.
+            if !seeded.isEmpty {
+                let markdown = try readUTF8(url: source.appendingPathComponent("SKILL.md"), limit: AgentSkillLimits.skillFileBytes)
+                if seeded.contains(try Self.parseManifest(markdown).name) { continue }
+            }
             let preview = try inspect(sourceURL: source)
             defer { discard(preview) }
             let name = preview.manifest.name
             guard !seeded.contains(name) else { continue }
             if !fileManager.fileExists(atPath: skillURL(named: name).path) {
-                _ = try install(preview, trusted: true, allowReplacement: false)
+                _ = try install(preview, trusted: true, allowReplacement: false, publish: false)
+                installedAny = true
             }
             seeded.insert(name)
             try JSONEncoder().encode(seeded).write(to: marker, options: .atomic)
@@ -239,7 +254,7 @@ final class AgentSkillRepository: @unchecked Sendable {
         let directories = (try? fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
         let skills = directories.compactMap { url -> InstalledAgentSkill? in
             guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
-            guard let parsed = try? parseAndInventory(root: url),
+            guard let parsed = try? parseAndInventory(root: url, collectExternalURLs: false),
                   let stateData = try? Data(contentsOf: url.appendingPathComponent("state.json")),
                   let state = try? JSONDecoder.agentSkill.decode(PersistedState.self, from: stateData),
                   state.contentHash == parsed.hash else { return nil }
@@ -346,7 +361,7 @@ final class AgentSkillRepository: @unchecked Sendable {
         return match.deletingLastPathComponent()
     }
 
-    private func parseAndInventory(root: URL) throws -> (manifest: AgentSkillManifest, files: [AgentSkillFile], hash: String, externalURLs: [String]) {
+    private func parseAndInventory(root: URL, collectExternalURLs: Bool = true) throws -> (manifest: AgentSkillManifest, files: [AgentSkillFile], hash: String, externalURLs: [String]) {
         let skillURL = root.appendingPathComponent("SKILL.md")
         let markdown = try readUTF8(url: skillURL, limit: AgentSkillLimits.skillFileBytes)
         let manifest = try Self.parseManifest(markdown)
@@ -356,7 +371,7 @@ final class AgentSkillRepository: @unchecked Sendable {
         var files: [AgentSkillFile] = []
         var hashParts: [String] = []
         var urls = Set<String>()
-        let urlRegex = try? NSRegularExpression(pattern: #"https?://[^\s)\]>\"']+"#)
+        let urlRegex = collectExternalURLs ? try? NSRegularExpression(pattern: #"https?://[^\s)\]>\"']+"#) : nil
         while let url = enumerator.nextObject() as? URL {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
             if values.isSymbolicLink == true { throw AgentSkillError.symbolicLink("シンボリックリンクは使用できません。") }
@@ -367,7 +382,7 @@ final class AgentSkillRepository: @unchecked Sendable {
             let script = Self.isScript(path: relative, data: data)
             files.append(AgentSkillFile(path: relative, size: Int64(data.count), isScript: script))
             hashParts.append(relative + ":" + SHA256.hash(data: data).hex)
-            if data.count <= Int(AgentSkillLimits.textResourceBytes), let text = String(data: data, encoding: .utf8), let urlRegex {
+            if let urlRegex, data.count <= Int(AgentSkillLimits.textResourceBytes), let text = String(data: data, encoding: .utf8) {
                 let range = NSRange(text.startIndex..., in: text)
                 for match in urlRegex.matches(in: text, range: range) {
                     if let matchRange = Range(match.range, in: text) { urls.insert(String(text[matchRange])) }

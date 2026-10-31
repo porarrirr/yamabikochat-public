@@ -1,7 +1,23 @@
+import Combine
 import XCTest
 @testable import YamabikoChat
 
 final class SpeechRecognitionSessionStateTests: XCTestCase {
+    @MainActor
+    func testStoppingUnusedServiceDoesNotPublishRecordingChanges() {
+        let service = SpeechRecognitionService()
+        var recordingChanges: [Bool] = []
+        let observation = service.$isRecording.dropFirst().sink { recordingChanges.append($0) }
+        defer { observation.cancel() }
+
+        service.stopRecording()
+        service.stopRecording()
+
+        XCTAssertFalse(service.isRecording)
+        XCTAssertNil(service.error)
+        XCTAssertTrue(recordingChanges.isEmpty, "Keyboard sends must not perform audio-session teardown")
+    }
+
     func testEndInvalidatesCallbacksFromStoppedSession() {
         var state = SpeechRecognitionSessionState()
         let stoppedSessionID = state.begin()

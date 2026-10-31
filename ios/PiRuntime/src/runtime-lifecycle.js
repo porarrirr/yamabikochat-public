@@ -65,7 +65,7 @@ export function createRuntimeListener({ createServer, port, log }) {
 export function installRuntimeLifecycle(options) {
   const transition = createRuntimeListener(options);
   if (options.commandFD === undefined) {
-    transition("resume"); // Android has no iOS lifecycle pipe.
+    transition("resume"); // No lifecycle pipe: start resumed.
     return;
   }
   const commandFD = Number(options.commandFD);
